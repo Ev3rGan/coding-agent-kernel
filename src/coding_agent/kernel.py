@@ -115,7 +115,10 @@ class AgentKernel:
     def _register_extension(self, extension: Extension) -> None:
         """Register one Extension and surface its contributed Tools on the runtime."""
         self._extension_runtime.register(extension)
-        self._extension_context_needed = self._extension_runtime.has_handler(HookName.CONTEXT)
+        # 首轮若需要跑 CONTEXT 或 PROVIDER_REQUEST 钩子，就跳过 first_request 快速路径。
+        self._extension_context_needed = self._extension_runtime.has_handler(
+            HookName.CONTEXT
+        ) or self._extension_runtime.has_handler(HookName.PROVIDER_REQUEST)
         if self._tool_runtime is not None:
             for declared in self._extension_runtime.declared_tools_of(extension.name):
                 self._tool_runtime.register(declared.tool)
@@ -331,6 +334,7 @@ class AgentKernel:
                 yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
                 return
             failure: ProviderError | None = None
+            await self._run_hook(HookName.INPUT, run_id=run_id, turn_id=turn_id, message=message)
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 accumulator = AssistantMessageAccumulator()
                 message = accumulator.message
@@ -413,12 +417,15 @@ class AgentKernel:
                 message=message,
             )
             history.append(message)
+            await self._run_hook(
+                HookName.MESSAGE, run_id=run_id, turn_id=turn_id, message=message
+            )
 
             if message.tool_calls and self._tool_runtime is not None:
                 resolved, blocked = await self._resolve_tool_calls(
                     message.tool_calls, run_id=run_id, turn_id=turn_id
                 )
-                blocked_results: list[ToolResult] = []
+                blocked_results: dict[str, ToolResult] = {}
                 for call, reason in blocked:
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_EXECUTION_START,
@@ -434,7 +441,7 @@ class AgentKernel:
                         None,
                         ToolError("extension_blocked", reason),
                     )
-                    blocked_results.append(result)
+                    blocked_results[call.call_id] = result
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_EXECUTION_END,
                         run_id=run_id,
@@ -443,7 +450,7 @@ class AgentKernel:
                         batch_mode="sequential",
                     )
                 if not resolved:
-                    results = tuple(blocked_results)
+                    executor = blocked_results
                 else:
                     batch_mode = self._tool_runtime.batch_mode(resolved)
                     for call in resolved:
@@ -453,6 +460,13 @@ class AgentKernel:
                             turn_id=turn_id,
                             tool_call=call,
                             batch_mode=batch_mode,
+                        )
+                    for call in resolved:
+                        await self._run_hook(
+                            HookName.TOOL_EXECUTION,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_call=call,
                         )
                     progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
                     batch_task = asyncio.create_task(
@@ -501,7 +515,20 @@ class AgentKernel:
                             tool_result=result,
                             batch_mode=batch.mode,
                         )
-                    results = (*blocked_results, *batch.results)
+                    executor = {**blocked_results, **results_by_id}
+                # 结果按模型生成的 tool_calls 原始顺序对齐，blocked 的用 error 占位。
+                results = tuple(
+                    executor[call.call_id] for call in message.tool_calls
+                    if call.call_id in executor
+                )
+                for call in message.tool_calls:
+                    if call.call_id in executor:
+                        await self._run_hook(
+                            HookName.TOOL_RESULT,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_result=executor[call.call_id],
+                        )
                 tool_results = ToolResultMessage(results=results)
                 history.append(tool_results)
                 next_injected = (tool_results,)
@@ -626,7 +653,6 @@ class AgentKernel:
                 raise RuntimeError("Compaction requires a durable Session.")
             self._session.record_compaction(result.compaction, run_id=run_id)
         request = result.context.provider_request
-        self._model_contexts.append(result.context)
         maybe_block, _ = await self._run_hook(
             HookName.PROVIDER_REQUEST,
             run_id=run_id,
@@ -638,6 +664,7 @@ class AgentKernel:
                 f"Provider request blocked by an Extension: {maybe_block.get('reason')}",
                 stage="provider-request",
             )
+        self._model_contexts.append(result.context)
         return request
 
     async def _resolve_tool_calls(

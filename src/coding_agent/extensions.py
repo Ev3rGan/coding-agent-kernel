@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Literal, Protocol, TypeAlias
 
@@ -226,6 +226,7 @@ class ExtensionRuntime:
         """
         decision: dict[str, object] = {"hook": hook.value}
         emitted: list[ExtensionEvent] = []
+        current = input_
         for order, extension, handler in self._handlers[hook]:
             start = ExtensionEvent(
                 ExtensionEventKind.HOOK_START, hook.value, extension, str(order)
@@ -233,11 +234,16 @@ class ExtensionRuntime:
             emitted.append(start)
             self._event_log.append(start)
             try:
-                raw = handler(input_)
+                raw = handler(current)
                 result = await raw if isinstance(raw, Awaitable) else raw
                 accepted, applied = self._apply_outcome(
                     hook, extension, result, decision, input_
                 )
+                # transform 顺序合成：后续 handler 看到前序已接受的 tool_call，实现真正的链式合成。
+                if accepted and hook is HookName.TOOL_CALL:
+                    transformed = decision.get("tool_call")
+                    if isinstance(transformed, ToolCall):
+                        current = replace(current, tool_call=transformed)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

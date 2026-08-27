@@ -217,7 +217,7 @@ def test_extension_events_are_separate_from_public_session_stream() -> None:
         kernel = AgentKernel(provider, extensions=[SampleExtension()])
         run = kernel.create_run("separation")
         events = await _collect(run)
-        session_kinds = {event.kind for event in events}
+        session_kinds = {event.kind.value for event in events}
         assert all(kind not in session_kinds for kind in ("hook_start", "registered"))
         assert any(event.extension == "sample" for event in kernel.extension_events)
 
@@ -250,3 +250,79 @@ class _Second:
     def _context(self, input_: HookInput) -> HookResult:
         del input_
         return HookResult.supplement_context(ContextSupplement(("SECOND_RESOURCE",)))
+
+
+class _ProviderRequestBlocker:
+    """An Extension that blocks every Provider request, even on the first turn."""
+
+    @property
+    def name(self) -> str:
+        return "provider-blocker"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.PROVIDER_REQUEST, self._block)
+
+    def _block(self, input_: HookInput) -> HookResult:
+        del input_
+        return HookResult.block("provider policy")
+
+
+class _ChainObserver:
+    """An Extension that records the tool_call it actually observes in the chain."""
+
+    def __init__(self) -> None:
+        self.seen: str | None = None
+
+    @property
+    def name(self) -> str:
+        return "chain"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_CALL, self._observe)
+
+    def _observe(self, input_: HookInput) -> HookResult:
+        self.seen = None if input_.tool_call is None else input_.tool_call.tool_name
+        return HookResult.observe()
+
+
+def test_provider_request_hook_runs_on_first_turn() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider(((ProviderTextDelta("x"), ProviderDone()),))
+        kernel = AgentKernel(provider, extensions=[_ProviderRequestBlocker()])
+        run = kernel.create_run("first-turn block")
+        await _collect(run)
+        # 首轮 provider_request 就被拦截，未发出任何 Provider 请求。
+        assert len(provider.requests) == 0
+        assert any(
+            event.kind.value == "hook_blocked" and event.extension == "provider-blocker"
+            for event in kernel.extension_events
+        )
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_transform_composes_in_registration_order(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        runtime.register(ShoutTool())
+        runtime.enable("shout")
+        provider = FakeProvider(
+            [
+                _tool_call_script("chain-1", "read", {"path": "x.py"}),
+                (ProviderTextDelta("done"), ProviderDone()),
+            ]
+        )
+        observer = _ChainObserver()
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_TransformingExtension(), observer],
+        )
+        run = kernel.create_run("transform chain")
+        await _collect(run)
+        # rewriter 先把 read 改成 shout，observer 作为后续 handler 应看到改写后的结果。
+        assert observer.seen == "shout"
+
+    asyncio.run(scenario())
