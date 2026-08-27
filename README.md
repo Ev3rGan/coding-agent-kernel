@@ -20,10 +20,35 @@ Active Branch 和可检查的 JSONL 路径及记录。失败场景以结构化�
 parent，退出码为 1，不静默改写历史或选择其他 branch。
 
 Session 是持久、权威的树；Agent Run 是一次活跃执行；Active Branch 是当前
-选择的可恢复历史；Model Context 则是未来 Ticket 04 为单次 Provider 请求组装
-的投影。本实现借鉴 Pi 的 tree 语义，但使用独立 Python 文件格式，并通过双
-SessionStore seam 强化恢复性与可测性。本 Ticket 不实现 Model Context、
-Compaction、branch summary、长期记忆、向量检索或自动记忆。
+选择的可恢复历史；Model Context 是为单次 Provider 请求构造的有界投影。
+本实现借鉴 Pi 的 tree 与确定性投影语义，但使用独立 Python 文件格式，并通过
+双 SessionStore seam 强化恢复性与可测性。
+
+## 确定性 Model Context 与 Compaction
+
+每次 Provider 调用都经过唯一的 Context pipeline，固定按 system prompt、active
+Tool 描述/guideline、项目资源、Active Branch 投影、当前 injected messages 和
+ProviderRequest conversion 组装。`ModelContext` 是不可变值，不持有完整 Session
+或 mutable queue。sibling branch 与尚未注入的 pending message 不进入请求。
+
+运行成功与确定性摘要失败场景：
+
+```console
+python -m coding_agent demo context-compaction
+python -m coding_agent demo context-compaction --case summary-error
+```
+
+成功场景展示 compaction 前后以 canonical JSON characters 计量的预算（不是精确
+token 数）、持久化 checkpoint、`compaction_succeeded` 事件、两条 sibling
+branches、pending/injected 排除与包含证据，以及仍保留的原始 entries。Active
+Branch 使用最近有效 checkpoint 的 summary 加 checkpoint 后 entries；checkpoint
+记录版本、覆盖范围和 summary，不删除旧历史。
+
+失败场景在 Provider 调用前发出结构化 `compaction_failed`，退出码为 1；它不写入
+无效 checkpoint、不删除或改写原始 entries，也不会降级到第二套 builder。Session
+仍可关闭、恢复和导航。这里借鉴 Pi 的确定性投影与 compaction 语义，简化
+provider-specific prompt 优化，并深化为可观察的 Python Context seam。长期记忆、
+向量检索、Extension registration 与 run-control queue lifecycle 仍不在本能力内。
 
 ## English
 
@@ -118,9 +143,9 @@ async def observe_run() -> None:
 
 `AgentRun.state` is one of `active`, `settled`, `cancelled`, or `failed`.
 `AgentRun.cancel()` cancels active Provider or Tool Execution work. Model
-Context, real Providers, Permission Policy, and Extensions remain later-ticket
-work; the implemented Session projection exposes only the selected Active
-Branch and deliberately does not assemble Provider context early.
+Real Providers, Permission Policy, and Extensions remain later-ticket work.
+The implemented Context pipeline projects only the selected Active Branch and
+explicitly injected messages before every Provider call.
 
 The Run/Turn and layered event semantics follow the selected Pi behavioral
 baseline. This project keeps only a thin CLI product shell, while the
@@ -134,6 +159,18 @@ forks from an old entry, and prints both sibling branches plus the selected
 Active Branch. The `--case invalid-entry` case rejects an illegal parent with a
 structured error. Session is durable authoritative history; Agent Run is one
 active execution; Active Branch is one recoverable root-to-leaf path; Model
-Context remains a later projection. The design borrows Pi's tree semantics,
-uses an independent Python persistence format, and deepens recoverability and
-testability through matching in-memory and JSONL store seams.
+Context is one bounded Provider projection. The design borrows Pi's tree
+semantics, uses an independent Python persistence format, and deepens
+recoverability and testability through matching in-memory and JSONL store
+seams.
+
+## Deterministic Model Context and Compaction
+
+`python -m coding_agent demo context-compaction` shows the single Context
+pipeline, a character-count budget, a persisted versioned checkpoint, two
+sibling branches, pending-message exclusion, explicit injection, and preserved
+raw history. The final Fake Provider request contains only the bounded Active
+Branch projection. The `--case summary-error` case fails before the Provider,
+emits a structured compaction failure, writes no invalid checkpoint, and leaves
+the Session resumable. The estimator counts canonical JSON characters and does
+not claim tokenizer-exact token counts.

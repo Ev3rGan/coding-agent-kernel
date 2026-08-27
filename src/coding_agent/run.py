@@ -98,6 +98,9 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
             for event in initial_events:
                 await self._events.put(event)
             async for agent_event in source:
+                if self._session is not None:
+                    for session_event in self._session.drain_events():
+                        await self._events.put(session_event)
                 await self._events.put(AgentSessionEvent.from_agent_event(agent_event))
                 if agent_event.kind is AgentEventKind.MESSAGE_END:
                     authoritative_message = agent_event.message

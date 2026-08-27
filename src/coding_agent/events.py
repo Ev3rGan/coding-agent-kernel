@@ -474,6 +474,9 @@ class AgentSessionEventKind(StrEnum):
     ACTIVE_BRANCH = "active_branch"
     SESSION_RESUMED = "session_resumed"
     SESSION_CONFIGURATION = "session_configuration"
+    COMPACTION_SUCCEEDED = "compaction_succeeded"
+    COMPACTION_FAILED = "compaction_failed"
+    CONTEXT_FAILED = "context_failed"
 
 
 _TERMINAL_EVENT_KINDS = {
@@ -487,6 +490,9 @@ _SESSION_EVENT_KINDS = {
     AgentSessionEventKind.ACTIVE_BRANCH,
     AgentSessionEventKind.SESSION_RESUMED,
     AgentSessionEventKind.SESSION_CONFIGURATION,
+    AgentSessionEventKind.COMPACTION_SUCCEEDED,
+    AgentSessionEventKind.COMPACTION_FAILED,
+    AgentSessionEventKind.CONTEXT_FAILED,
 }
 
 
@@ -502,6 +508,8 @@ class AgentSessionEvent:
     session_entry: SessionEntry | None = None
     active_branch: tuple[str, ...] | None = None
     configuration_json: str | None = None
+    context_error: AgentError | None = None
+    context_stage: str | None = None
 
     def __post_init__(self) -> None:
         terminal = self.kind in _TERMINAL_EVENT_KINDS
@@ -509,15 +517,34 @@ class AgentSessionEvent:
         if session_event:
             if self.session_id is None or self.agent_event is not None or self.result is not None:
                 raise ValueError("Session events require session data only")
-            if self.kind is AgentSessionEventKind.SESSION_ENTRY and self.session_entry is None:
+            if (
+                self.kind
+                in {
+                    AgentSessionEventKind.SESSION_ENTRY,
+                    AgentSessionEventKind.COMPACTION_SUCCEEDED,
+                }
+                and self.session_entry is None
+            ):
                 raise ValueError("session_entry requires a SessionEntry")
-            if self.kind is AgentSessionEventKind.ACTIVE_BRANCH and self.active_branch is None:
+            if (
+                self.kind
+                in {
+                    AgentSessionEventKind.ACTIVE_BRANCH,
+                    AgentSessionEventKind.COMPACTION_SUCCEEDED,
+                }
+                and self.active_branch is None
+            ):
                 raise ValueError("active_branch requires the selected path")
             if (
                 self.kind is AgentSessionEventKind.SESSION_CONFIGURATION
                 and self.configuration_json is None
             ):
                 raise ValueError("session_configuration requires configuration")
+            if self.kind in {
+                AgentSessionEventKind.COMPACTION_FAILED,
+                AgentSessionEventKind.CONTEXT_FAILED,
+            } and (self.context_error is None or self.active_branch is None):
+                raise ValueError("Context failure events require error and branch state")
             return
         if terminal != (self.result is not None):
             raise ValueError("terminal events require only a final result")
@@ -585,6 +612,46 @@ class AgentSessionEvent:
             configuration_json=configuration_json,
         )
 
+    @classmethod
+    def from_compaction_succeeded(
+        cls,
+        entry: SessionEntry,
+        active_branch: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.COMPACTION_SUCCEEDED,
+            run_id=run_id,
+            session_id=entry.session_id,
+            session_entry=entry,
+            active_branch=active_branch,
+        )
+
+    @classmethod
+    def from_context_failure(
+        cls,
+        session_id: str,
+        active_branch: tuple[str, ...],
+        error: AgentError,
+        *,
+        stage: str,
+        run_id: str | None = None,
+    ) -> AgentSessionEvent:
+        kind = (
+            AgentSessionEventKind.COMPACTION_FAILED
+            if stage == "compaction"
+            else AgentSessionEventKind.CONTEXT_FAILED
+        )
+        return cls(
+            kind=kind,
+            run_id=run_id,
+            session_id=session_id,
+            active_branch=active_branch,
+            context_error=error,
+            context_stage=stage,
+        )
+
     @property
     def message(self) -> AssistantMessage | None:
         """Expose the cumulative or authoritative message, when present."""
@@ -603,6 +670,8 @@ class AgentSessionEvent:
 
         if self.agent_event is not None:
             return self.agent_event.error
+        if self.context_error is not None:
+            return self.context_error
         return None if self.result is None else self.result.error
 
     @property

@@ -13,12 +13,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from coding_agent.context import ContextInput, ContextPipeline, ContextSettings
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
     AgentRunResult,
     AgentRunState,
     AgentSessionEvent,
+    AssistantMessage,
     ProviderDone,
     ProviderStreamEvent,
     ProviderTextDelta,
@@ -26,8 +28,8 @@ from coding_agent.events import (
     assistant_message_record,
 )
 from coding_agent.kernel import AgentKernel
-from coding_agent.provider import FakeProvider
-from coding_agent.session import JsonlSessionStore, SessionError
+from coding_agent.provider import FakeProvider, ModelMessage, UserMessage
+from coding_agent.session import JsonlSessionStore, Session, SessionError
 from coding_agent.tool_runtime import ToolRuntime
 
 
@@ -70,6 +72,8 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
         }
     if event.active_branch is not None:
         record["active_branch"] = list(event.active_branch)
+    if event.context_stage is not None:
+        record["context_stage"] = event.context_stage
     if event.configuration_json is not None:
         record["configuration"] = json.loads(event.configuration_json)
     if event.agent_event is not None:
@@ -362,6 +366,175 @@ async def _session_tree_demo(case: str) -> int:
     return 0
 
 
+class _DemoFailingSummarizer:
+    def summarize(self, messages: tuple[ModelMessage, ...]) -> str:
+        raise RuntimeError("deterministic summary failure")
+
+
+def _context_demo_session(path: Path) -> tuple[Session, tuple[str, ...]]:
+    ids = iter(
+        (
+            "entry-root",
+            "entry-sibling-user",
+            "entry-sibling-answer",
+            "entry-active-user",
+            "entry-active-answer",
+            "entry-checkpoint",
+            "entry-current-user",
+            "entry-current-answer",
+        )
+    )
+    session = Session.create(
+        JsonlSessionStore(path),
+        session_id="session-context-demo",
+        configuration={"provider": "fake", "schema_version": 1},
+        entry_id_factory=lambda: next(ids),
+    )
+    root = session.active_leaf_id
+    session.record_user_message("SIBLING_MARKER")
+    session.record_authoritative_message(AssistantMessage(text="sibling answer"))
+    session.fork(root)
+    session.record_user_message("ACTIVE_BRANCH_HISTORY " * 90)
+    session.record_authoritative_message(AssistantMessage(text="active answer " * 90))
+    original_ids = tuple(
+        sorted({entry.entry_id for branch in session.branches for entry in branch})
+    )
+    session.drain_events()
+    return session, original_ids
+
+
+def _context_record(
+    context: Any,
+    *,
+    pending_marker: str | None = None,
+    injected_marker: str | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "estimated_characters": context.estimated_characters,
+        "max_characters": context.max_characters,
+        "bounded": context.bounded,
+        "estimator": "canonical_json_characters",
+        "assembly_order": list(context.assembly_order),
+        "message_roles": [message.role for message in context.provider_request.messages],
+    }
+    request_text = repr(context.provider_request)
+    if pending_marker is not None:
+        record["pending_provided"] = True
+        record["request_contains_pending_marker"] = pending_marker in request_text
+    if injected_marker is not None:
+        record["injected_provided"] = True
+        record["request_contains_injected_marker"] = injected_marker in request_text
+    return record
+
+
+async def _context_compaction_demo(case: str) -> int:
+    with tempfile.TemporaryDirectory(prefix="coding-agent-context-") as temporary:
+        jsonl_path = Path(temporary) / "session.jsonl"
+        session, original_ids = _context_demo_session(jsonl_path)
+        injected = UserMessage(text="INJECTED_MARKER")
+        pending = UserMessage(text="PENDING_MARKER")
+        before = (
+            ContextPipeline()
+            .build(
+                ContextInput(
+                    settings=ContextSettings(max_characters=100_000),
+                    active_branch=session.active_branch,
+                    injected_messages=(injected,),
+                    pending_messages=(pending,),
+                )
+            )
+            .context
+        )
+        _print_record(
+            {
+                "context_before": _context_record(
+                    before,
+                    pending_marker=pending.text,
+                    injected_marker=injected.text,
+                )
+            }
+        )
+
+        pipeline = (
+            ContextPipeline(_DemoFailingSummarizer())
+            if case == "summary-error"
+            else ContextPipeline()
+        )
+        provider = FakeProvider(((ProviderTextDelta("bounded context accepted"), ProviderDone()),))
+        kernel = AgentKernel(
+            provider,
+            session=session,
+            context_pipeline=pipeline,
+            context_settings=ContextSettings(
+                project_context=("PROJECT_RESOURCE",),
+                max_characters=650,
+            ),
+        )
+        run = kernel.create_run(injected.text)
+        async for event in run:
+            _print_record(_event_record(event))
+        result = await run.result()
+        _print_record(_result_record(result))
+
+        all_entries = {entry.entry_id for branch in session.branches for entry in branch}
+        checkpoint_count = sum(
+            entry.kind == "compaction" for branch in session.branches for entry in branch
+        )
+        originals_preserved = set(original_ids).issubset(all_entries)
+
+        if case == "summary-error":
+            session.close()
+            resumable = False
+            try:
+                Session.resume(JsonlSessionStore(jsonl_path), session.session_id)
+                resumable = True
+            except SessionError:
+                pass
+            _print_record(
+                {
+                    "context_failure": {
+                        "code": None if result.error is None else result.error.code,
+                        "provider_calls": len(provider.requests),
+                        "checkpoint_count": checkpoint_count,
+                        "original_entries_preserved": originals_preserved,
+                        "session_resumable": resumable,
+                    }
+                }
+            )
+            return 1
+
+        after = kernel.model_contexts[-1]
+        _print_record({"context_after": _context_record(after)})
+        request_text = repr(provider.requests[-1])
+        _print_record(
+            {
+                "provider_request": {
+                    "provider_calls": len(provider.requests),
+                    "contains_sibling_marker": "SIBLING_MARKER" in request_text,
+                    "contains_pending_marker": pending.text in request_text,
+                    "contains_injected_marker": injected.text in request_text,
+                    "message_roles": [message.role for message in provider.requests[-1].messages],
+                    "estimated_characters": after.estimated_characters,
+                }
+            }
+        )
+        _print_record(
+            {
+                "session_tree": {
+                    "branches": [
+                        [entry.entry_id for entry in branch] for branch in session.branches
+                    ],
+                    "active_branch": [entry.entry_id for entry in session.active_branch],
+                    "original_entry_ids": list(original_ids),
+                    "original_entries_preserved": originals_preserved,
+                    "checkpoint_count": checkpoint_count,
+                    "jsonl_path": str(jsonl_path),
+                }
+            }
+        )
+        return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m coding_agent")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -390,6 +563,16 @@ def _parser() -> argparse.ArgumentParser:
         default="success",
         help="scripted Session persistence outcome",
     )
+    context_compaction = demos.add_parser(
+        "context-compaction",
+        help="project and compact one deterministic Active Branch",
+    )
+    context_compaction.add_argument(
+        "--case",
+        choices=("success", "summary-error"),
+        default="success",
+        help="scripted Context construction outcome",
+    )
     return parser
 
 
@@ -403,4 +586,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_tool_loop_demo(args.case))
     if args.command == "demo" and args.demo == "session-tree":
         return asyncio.run(_session_tree_demo(args.case))
+    if args.command == "demo" and args.demo == "context-compaction":
+        return asyncio.run(_context_compaction_demo(args.case))
     raise AssertionError("argparse accepted an unsupported command")

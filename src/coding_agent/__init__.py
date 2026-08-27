@@ -1,5 +1,19 @@
 """Public interface for the headless Coding Agent Kernel."""
 
+from coding_agent.context import (
+    BranchSummarizer,
+    CompactionPlan,
+    ContextBuildResult,
+    ContextConstructionError,
+    ContextHookInput,
+    ContextHookOutput,
+    ContextInput,
+    ContextPipeline,
+    ContextSettings,
+    DeterministicBranchSummarizer,
+    ModelContext,
+    estimate_provider_request_characters,
+)
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
@@ -39,6 +53,7 @@ from coding_agent.events import (
 )
 from coding_agent.kernel import AgentKernel
 from coding_agent.provider import (
+    BranchSummaryMessage,
     FakeProvider,
     ModelMessage,
     ModelProvider,
@@ -73,8 +88,20 @@ __all__ = [
     "AgentSessionEventKind",
     "AssistantMessage",
     "AssistantMessageAccumulator",
+    "BranchSummarizer",
+    "BranchSummaryMessage",
+    "CompactionPlan",
+    "ContextBuildResult",
+    "ContextConstructionError",
+    "ContextHookInput",
+    "ContextHookOutput",
+    "ContextInput",
+    "ContextPipeline",
+    "ContextSettings",
+    "DeterministicBranchSummarizer",
     "FakeProvider",
     "ModelProvider",
+    "ModelContext",
     "ModelMessage",
     "LocalCodingEnvironment",
     "ProviderDone",
@@ -120,4 +147,5 @@ __all__ = [
     "ToolRuntime",
     "ToolSpec",
     "UserMessage",
+    "estimate_provider_request_characters",
 ]

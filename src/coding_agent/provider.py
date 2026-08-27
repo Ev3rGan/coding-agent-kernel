@@ -30,13 +30,24 @@ class ToolResultMessage:
     results: tuple[ToolResult, ...] = ()
 
 
-ModelMessage: TypeAlias = UserMessage | AssistantMessage | ToolResultMessage
+@dataclass(frozen=True, slots=True)
+class BranchSummaryMessage:
+    """A provider-neutral summary of an older Active Branch prefix."""
+
+    role: Literal["summary"] = "summary"
+    text: str = ""
+
+
+ModelMessage: TypeAlias = UserMessage | AssistantMessage | ToolResultMessage | BranchSummaryMessage
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderRequest:
     messages: tuple[ModelMessage, ...]
     tools: tuple[dict[str, object], ...] = ()
+    system_prompt: str = ""
+    tool_guidelines: str = ""
+    project_context: tuple[str, ...] = ()
 
 
 class ModelProvider(Protocol):
