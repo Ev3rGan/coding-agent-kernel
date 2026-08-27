@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Final, cast
 
+from coding_agent.control import RunControl
 from coding_agent.events import (
     AgentError,
     AgentEvent,
@@ -13,11 +14,16 @@ from coding_agent.events import (
     AgentRunResult,
     AgentRunState,
     AgentSessionEvent,
+    AgentSessionEventKind,
     AssistantMessage,
+    PendingMessage,
+    PendingMessageKind,
 )
 from coding_agent.session import Session
 
 _STREAM_END: Final = object()
+RunSourceEvent = AgentEvent | AgentSessionEvent
+RunSourceFactory = Callable[[RunControl], AsyncIterator[RunSourceEvent]]
 
 
 class AgentRun(AsyncIterator[AgentSessionEvent]):
@@ -26,7 +32,7 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
     def __init__(
         self,
         run_id: str,
-        source: AsyncIterator[AgentEvent],
+        source_factory: RunSourceFactory,
         *,
         session: Session | None = None,
         initial_events: tuple[AgentSessionEvent, ...] = (),
@@ -39,8 +45,11 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         self._iterator_claimed = False
         self._stream_exhausted = False
         self._session = session
+        self._control = RunControl(run_id)
+        self._terminal_lock = asyncio.Lock()
+        self._cancel_requested = False
         self._worker = loop.create_task(
-            self._drive(source, initial_events), name=f"agent-run:{run_id}"
+            self._drive(source_factory(self._control), initial_events), name=f"agent-run:{run_id}"
         )
 
     @property
@@ -83,13 +92,52 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
     async def cancel(self) -> AgentRunResult:
         """Cancel active Provider or Tool Execution work and await settlement."""
 
-        if self._state is AgentRunState.ACTIVE:
-            self._worker.cancel()
+        async with self._terminal_lock:
+            if self._state is AgentRunState.ACTIVE and not self._cancel_requested:
+                self._cancel_requested = True
+                self._control.cancel_event.set()
+                for message in self._control.drop_all():
+                    self._events.put_nowait(
+                        AgentSessionEvent.from_pending_message(
+                            AgentSessionEventKind.MESSAGE_DROPPED,
+                            self._run_id,
+                            message,
+                            0,
+                        )
+                    )
+                self._worker.cancel()
         return await self.result()
+
+    async def steer(self, text: str) -> PendingMessage:
+        """Queue a Steering Message for the next authoritative drain point."""
+
+        return await self._enqueue(PendingMessageKind.STEERING, text)
+
+    async def follow_up(self, text: str) -> PendingMessage:
+        """Queue a Follow-up Message for the next natural settled boundary."""
+
+        return await self._enqueue(PendingMessageKind.FOLLOW_UP, text)
+
+    async def _enqueue(self, kind: PendingMessageKind, text: str) -> PendingMessage:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{kind.value} message must not be blank")
+        async with self._terminal_lock:
+            if self._state is not AgentRunState.ACTIVE or self._cancel_requested:
+                raise RuntimeError(f"cannot queue {kind.value} message when AgentRun is not active")
+            message = self._control.enqueue(kind, text)
+            self._events.put_nowait(
+                AgentSessionEvent.from_pending_message(
+                    AgentSessionEventKind.MESSAGE_QUEUED,
+                    self._run_id,
+                    message,
+                    self._control.queue_size(kind),
+                )
+            )
+            return message
 
     async def _drive(
         self,
-        source: AsyncIterator[AgentEvent],
+        source: AsyncIterator[RunSourceEvent],
         initial_events: tuple[AgentSessionEvent, ...],
     ) -> None:
         authoritative_message = None
@@ -97,7 +145,11 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         try:
             for event in initial_events:
                 await self._events.put(event)
-            async for agent_event in source:
+            async for source_event in source:
+                if isinstance(source_event, AgentSessionEvent):
+                    await self._events.put(source_event)
+                    continue
+                agent_event = source_event
                 if self._session is not None:
                     for session_event in self._session.drain_events():
                         await self._events.put(session_event)
@@ -152,16 +204,17 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         message: AssistantMessage | None = None,
         error: AgentError | None = None,
     ) -> None:
-        if self._state is not AgentRunState.ACTIVE:
-            return
+        async with self._terminal_lock:
+            if self._state is not AgentRunState.ACTIVE:
+                return
 
-        result = AgentRunResult(
-            run_id=self._run_id,
-            state=state,
-            message=message,
-            error=error,
-        )
-        self._state = state
-        await self._events.put(AgentSessionEvent.from_result(result))
-        self._result.set_result(result)
-        await self._events.put(_STREAM_END)
+            result = AgentRunResult(
+                run_id=self._run_id,
+                state=state,
+                message=message,
+                error=error,
+            )
+            self._state = state
+            self._events.put_nowait(AgentSessionEvent.from_result(result))
+            self._result.set_result(result)
+            self._events.put_nowait(_STREAM_END)

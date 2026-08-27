@@ -88,10 +88,16 @@ class ToolRuntime:
                 completion.append(call.call_id)
         else:
             tasks = [asyncio.create_task(execute(index, call)) for index, call in enumerate(calls)]
-            for completed in asyncio.as_completed(tasks):
-                index, result = await completed
-                indexed.append((index, result))
-                completion.append(result.call_id)
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    index, result = await completed
+                    indexed.append((index, result))
+                    completion.append(result.call_id)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         ordered = tuple(result for _, result in sorted(indexed, key=lambda item: item[0]))
         return ToolBatchResult(mode, ordered, tuple(completion))

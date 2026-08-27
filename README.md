@@ -48,7 +48,30 @@ Branch 使用最近有效 checkpoint 的 summary 加 checkpoint 后 entries；ch
 无效 checkpoint、不删除或改写原始 entries，也不会降级到第二套 builder。Session
 仍可关闭、恢复和导航。这里借鉴 Pi 的确定性投影与 compaction 语义，简化
 provider-specific prompt 优化，并深化为可观察的 Python Context seam。长期记忆、
-向量检索、Extension registration 与 run-control queue lifecycle 仍不在本能力内。
+向量检索与 Extension registration 仍不在本能力内。
+
+## 控制进行中的 Agent Run
+
+`AgentRun` 是 steering、follow-up、cancel、result/wait 与 Event Stream 的唯一公开
+入口。Steering Message 与 Follow-up Message 使用两个独立的 run-scoped FIFO queue：
+steering 在完整 Tool batch 之后、下一次 Context/Provider request 之前注入；follow-up
+在当前 agent work 自然结束且 steering 已清空后启动后续工作。pending message 不是
+Session history，只有实际 injection 才产生权威 user `SessionEntry`。
+
+```console
+python -m coding_agent demo run-control --case steering
+python -m coding_agent demo run-control --case follow-up
+python -m coding_agent demo run-control --case cancel
+python -m coding_agent demo run-control --case retry-success
+python -m coding_agent demo run-control --case retry-failure
+```
+
+JSON Lines 会显示 queue、injection/drop、Provider retry、Session 和唯一终态证据。
+取消传播到 Provider、Tool Execution 与 retry wait，并丢弃尚未注入的消息。有限 retry
+只处理明确分类为 retryable 的 Provider failure，复用同一 ProviderRequest，失败 attempt
+的 partial delta 不会成为权威 Session message。本实现直接借鉴 Pi 的 inner steering、
+outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表达；不增加 Step、
+第二 AgentLoop、多 Agent 或长期后台服务。
 
 ## English
 
@@ -174,3 +197,12 @@ Branch projection. The `--case summary-error` case fails before the Provider,
 emits a structured compaction failure, writes no invalid checkpoint, and leaves
 the Session resumable. The estimator counts canonical JSON characters and does
 not claim tokenizer-exact token counts.
+
+## Controlling an active Agent Run
+
+`python -m coding_agent demo run-control --case <case>` exposes five deterministic
+steering, follow-up, cancellation, retry-recovery, and retry-exhaustion scenarios.
+The thin CLI observes the public Event Stream and invokes only `AgentRun` controls.
+Pending messages stay in two run-scoped FIFO queues and enter Session history only
+when injected at their authoritative drain point. Cancellation drops uninjected
+messages and converges Provider, Tool, and retry work on one terminal result.

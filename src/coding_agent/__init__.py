@@ -14,6 +14,7 @@ from coding_agent.context import (
     ModelContext,
     estimate_provider_request_characters,
 )
+from coding_agent.control import RetryPolicy
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
@@ -25,6 +26,8 @@ from coding_agent.events import (
     AgentSessionEventKind,
     AssistantMessage,
     AssistantMessageAccumulator,
+    PendingMessage,
+    PendingMessageKind,
     ProviderAbort,
     ProviderCancelled,
     ProviderContentEnd,
@@ -104,6 +107,8 @@ __all__ = [
     "ModelContext",
     "ModelMessage",
     "LocalCodingEnvironment",
+    "PendingMessage",
+    "PendingMessageKind",
     "ProviderDone",
     "ProviderAbort",
     "ProviderCancelled",
@@ -125,6 +130,7 @@ __all__ = [
     "ProviderToolCallStart",
     "ProviderUsage",
     "ProviderRequest",
+    "RetryPolicy",
     "InMemorySessionStore",
     "JsonlSessionStore",
     "Session",
