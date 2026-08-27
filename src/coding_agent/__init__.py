@@ -47,6 +47,17 @@ from coding_agent.provider import (
     UserMessage,
 )
 from coding_agent.run import AgentRun
+from coding_agent.session import (
+    InMemorySessionStore,
+    JsonlSessionStore,
+    Session,
+    SessionCorruptionError,
+    SessionEntry,
+    SessionError,
+    SessionRelationError,
+    SessionStateError,
+    SessionStore,
+)
 from coding_agent.tool_runtime import ToolBatchResult, ToolRuntime
 from coding_agent.tools import Tool, ToolMode, ToolOutput, ToolSpec
 
@@ -87,6 +98,15 @@ __all__ = [
     "ProviderToolCallStart",
     "ProviderUsage",
     "ProviderRequest",
+    "InMemorySessionStore",
+    "JsonlSessionStore",
+    "Session",
+    "SessionCorruptionError",
+    "SessionEntry",
+    "SessionError",
+    "SessionRelationError",
+    "SessionStateError",
+    "SessionStore",
     "TokenUsage",
     "ToolCall",
     "Tool",

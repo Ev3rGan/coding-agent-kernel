@@ -80,3 +80,44 @@ def test_failure_tool_loop_cli_returns_structured_errors_then_settles(capsys: An
         "process_failed",
     ]
     assert records[-2]["result"]["state"] == "settled"
+
+
+def test_session_tree_cli_reloads_forks_and_exposes_jsonl_without_transient_history(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "session-tree"])
+    records = _records(capsys.readouterr().out)
+    summary = next(record["session_tree"] for record in records if "session_tree" in record)
+    jsonl = next(record["jsonl"] for record in records if "jsonl" in record)
+
+    assert exit_code == 0
+    assert summary["session_id"] == "session-demo"
+    assert summary["branches"] == [
+        ["entry-0001", "entry-0002", "entry-0003"],
+        ["entry-0001", "entry-0004", "entry-0005"],
+    ]
+    assert summary["active_branch"] == ["entry-0001", "entry-0004", "entry-0005"]
+    assert summary["active_messages"] == [
+        "Continue the deterministic Session.",
+        "alternate route",
+    ]
+    assert len(jsonl["records"]) >= 9
+    serialized = json.dumps(jsonl["records"])
+    assert "original route" in serialized
+    assert "alternate route" in serialized
+    assert "message_update" not in serialized
+    assert "thinking_delta" not in serialized
+    assert "tool_progress" not in serialized
+
+
+def test_invalid_session_entry_cli_returns_structured_rejection_without_traceback(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "session-tree", "--case", "invalid-entry"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert records[-1]["session_rejected"]["code"] == "session_illegal_relation"
+    assert "parent" in records[-1]["session_rejected"]["message"].lower()

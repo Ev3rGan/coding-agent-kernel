@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+
+if TYPE_CHECKING:
+    from coding_agent.session import SessionEntry
 
 
 class ProviderEventKind(StrEnum):
@@ -263,6 +266,32 @@ class AssistantMessage:
         return accumulator.apply(event)
 
 
+def assistant_message_record(message: AssistantMessage) -> dict[str, Any]:
+    """Return the canonical JSON-ready representation of an authoritative message."""
+
+    return {
+        "role": message.role,
+        "thinking": message.thinking,
+        "text": message.text,
+        "tool_calls": [
+            {
+                "call_id": call.call_id,
+                "tool_name": call.tool_name,
+                "arguments": call.arguments,
+            }
+            for call in message.tool_calls
+        ],
+        "usage": None
+        if message.usage is None
+        else {
+            "input_tokens": message.usage.input_tokens,
+            "output_tokens": message.usage.output_tokens,
+        },
+        "stop_reason": message.stop_reason,
+        "response_id": message.response_id,
+    }
+
+
 @dataclass(slots=True)
 class _PartialToolCall:
     call_id: str = ""
@@ -441,6 +470,10 @@ class AgentSessionEventKind(StrEnum):
     RUN_SETTLED = "run_settled"
     RUN_CANCELLED = "run_cancelled"
     RUN_FAILED = "run_failed"
+    SESSION_ENTRY = "session_entry"
+    ACTIVE_BRANCH = "active_branch"
+    SESSION_RESUMED = "session_resumed"
+    SESSION_CONFIGURATION = "session_configuration"
 
 
 _TERMINAL_EVENT_KINDS = {
@@ -449,18 +482,43 @@ _TERMINAL_EVENT_KINDS = {
     AgentSessionEventKind.RUN_FAILED,
 }
 
+_SESSION_EVENT_KINDS = {
+    AgentSessionEventKind.SESSION_ENTRY,
+    AgentSessionEventKind.ACTIVE_BRANCH,
+    AgentSessionEventKind.SESSION_RESUMED,
+    AgentSessionEventKind.SESSION_CONFIGURATION,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionEvent:
     """A public event wrapping AgentLoop activity or a run terminal state."""
 
     kind: AgentSessionEventKind
-    run_id: str
+    run_id: str | None = None
     agent_event: AgentEvent | None = None
     result: AgentRunResult | None = None
+    session_id: str | None = None
+    session_entry: SessionEntry | None = None
+    active_branch: tuple[str, ...] | None = None
+    configuration_json: str | None = None
 
     def __post_init__(self) -> None:
         terminal = self.kind in _TERMINAL_EVENT_KINDS
+        session_event = self.kind in _SESSION_EVENT_KINDS
+        if session_event:
+            if self.session_id is None or self.agent_event is not None or self.result is not None:
+                raise ValueError("Session events require session data only")
+            if self.kind is AgentSessionEventKind.SESSION_ENTRY and self.session_entry is None:
+                raise ValueError("session_entry requires a SessionEntry")
+            if self.kind is AgentSessionEventKind.ACTIVE_BRANCH and self.active_branch is None:
+                raise ValueError("active_branch requires the selected path")
+            if (
+                self.kind is AgentSessionEventKind.SESSION_CONFIGURATION
+                and self.configuration_json is None
+            ):
+                raise ValueError("session_configuration requires configuration")
+            return
         if terminal != (self.result is not None):
             raise ValueError("terminal events require only a final result")
         if not terminal and self.agent_event is None:
@@ -486,6 +544,46 @@ class AgentSessionEvent:
             AgentRunState.FAILED: AgentSessionEventKind.RUN_FAILED,
         }[result.state]
         return cls(kind=kind, run_id=result.run_id, result=result)
+
+    @classmethod
+    def from_session_entry(
+        cls, entry: SessionEntry, *, run_id: str | None = None
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.SESSION_ENTRY,
+            run_id=run_id,
+            session_id=entry.session_id,
+            session_entry=entry,
+        )
+
+    @classmethod
+    def from_active_branch(
+        cls,
+        session_id: str,
+        entry_ids: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.ACTIVE_BRANCH,
+            run_id=run_id,
+            session_id=session_id,
+            active_branch=entry_ids,
+        )
+
+    @classmethod
+    def from_session_resumed(cls, session_id: str) -> AgentSessionEvent:
+        return cls(kind=AgentSessionEventKind.SESSION_RESUMED, session_id=session_id)
+
+    @classmethod
+    def from_session_configuration(
+        cls, session_id: str, configuration_json: str
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.SESSION_CONFIGURATION,
+            session_id=session_id,
+            configuration_json=configuration_json,
+        )
 
     @property
     def message(self) -> AssistantMessage | None:

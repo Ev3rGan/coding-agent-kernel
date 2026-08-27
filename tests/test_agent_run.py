@@ -10,6 +10,7 @@ from coding_agent import (
     AgentSessionEvent,
     AgentSessionEventKind,
     FakeProvider,
+    InMemorySessionStore,
     ProviderDone,
     ProviderError,
     ProviderTextDelta,
@@ -113,3 +114,43 @@ def test_run_state_space_names_all_required_states() -> None:
     }
     assert AgentRunState.ACTIVE.terminal is False
     assert all(state.terminal for state in AgentRunState if state is not AgentRunState.ACTIVE)
+
+
+def test_agent_run_persists_only_the_authoritative_message_end() -> None:
+    store = InMemorySessionStore()
+    ids = iter(("configuration", "user-message", "authoritative-message"))
+    kernel = AgentKernel.with_new_session(
+        FakeProvider.streamed_run(),
+        store,
+        session_id="session-run",
+        configuration={"provider": "fake"},
+        entry_id_factory=lambda: next(ids),
+    )
+    kernel.drain_session_events()
+
+    async def collect() -> list[AgentSessionEvent]:
+        run = kernel.create_run("test input")
+        return [event async for event in run]
+
+    events = asyncio.run(collect())
+    kinds = _kinds(events)
+    message_end_index = kinds.index(AgentSessionEventKind.MESSAGE_END)
+
+    assert kinds[:2] == [
+        AgentSessionEventKind.SESSION_ENTRY,
+        AgentSessionEventKind.ACTIVE_BRANCH,
+    ]
+    assert kinds[message_end_index + 1 : message_end_index + 3] == [
+        AgentSessionEventKind.SESSION_ENTRY,
+        AgentSessionEventKind.ACTIVE_BRANCH,
+    ]
+    messages = [entry for entry in kernel.session_active_branch if entry.kind == "message"]
+    assert [(entry.payload["role"], entry.payload["text"]) for entry in messages] == [
+        ("user", "test input"),
+        ("assistant", "Hello from the Fake Provider."),
+    ]
+    assert messages[1].entry_id == "authoritative-message"
+    persisted_json = messages[1].payload_json
+    assert "message_update" not in persisted_json
+    assert "thinking_delta" not in persisted_json
+    assert "tool_progress" not in persisted_json
