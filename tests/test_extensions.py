@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+from coding_agent import (
+    AgentKernel,
+    AgentRunState,
+    AgentSessionEvent,
+    AgentSessionEventKind,
+    ContextSupplement,
+    ExtensionRuntime,
+    FakeProvider,
+    HookInput,
+    HookName,
+    HookResult,
+    LocalCodingEnvironment,
+    ProviderDone,
+    ProviderStreamEvent,
+    ProviderTextDelta,
+    ProviderToolCallDelta,
+    ProviderToolCallEnd,
+    ProviderToolCallStart,
+    ToolCall,
+    ToolResultSupplement,
+    ToolRuntime,
+)
+from coding_agent.extensions_example import SampleExtension, ShoutTool
+
+
+class _TransformingExtension:
+    """A Tool Handler that rewrites a ToolCall's arguments before execution."""
+
+    @property
+    def name(self) -> str:
+        return "rewriter"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_CALL, self._rewrite)
+
+    def _rewrite(self, input_: HookInput) -> HookResult:
+        call = input_.tool_call
+        if call is not None and call.tool_name == "read":
+            rewritten = ToolCall(call.call_id, "shout", {"text": "rewritten"})
+            return HookResult.transform_tool_call(rewritten)
+        return HookResult.observe()
+
+
+class _BlockingExtension:
+    """A Tool Handler that blocks one deterministic ToolCall id."""
+
+    @property
+    def name(self) -> str:
+        return "blocker"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_CALL, self._block)
+
+    def _block(self, input_: HookInput) -> HookResult:
+        call = input_.tool_call
+        if call is not None and call.call_id == "forbidden-1":
+            return HookResult.block("extension policy says no")
+        return HookResult.observe()
+
+
+class _BrokenExtension:
+    """An Extension whose handler returns an illegal mutation."""
+
+    @property
+    def name(self) -> str:
+        return "broken"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.CONTEXT, self._context)
+
+    def _context(self, input_: HookInput) -> HookResult:
+        del input_
+        return HookResult.supplement_tool_result(ToolResultSupplement("bad"))
+
+
+def _tool_call_script(
+    call_id: str, name: str, arguments: dict[str, object]
+) -> tuple[ProviderStreamEvent, ...]:
+    return (
+        ProviderToolCallStart(index=0),
+        ProviderToolCallDelta(
+            index=0,
+            call_id_delta=call_id,
+            tool_name_delta=name,
+            arguments_delta=json.dumps(arguments),
+        ),
+        ProviderToolCallEnd(index=0),
+        ProviderDone(stop_reason="tool_use"),
+    )
+
+
+async def _collect(run: object) -> list[AgentSessionEvent]:
+    events: list[AgentSessionEvent] = []
+    async for event in run:  # type: ignore[attr-defined]
+        events.append(event)
+    return events
+
+
+def test_context_supplement_lines_merge_in_registration_order() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider(((ProviderTextDelta("done"), ProviderDone()),))
+        kernel = AgentKernel(provider, extensions=[SampleExtension(), _Second()])
+        run = kernel.create_run("context supplement")
+        await _collect(run)
+        request = provider.requests[0]
+        assert list(request.project_context) == ["EXTENSION_RESOURCE", "SECOND_RESOURCE"]
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_transform_revalidated_and_executed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        runtime.register(ShoutTool())
+        runtime.enable("shout")
+        provider = FakeProvider(
+            [
+                _tool_call_script("rewrite-1", "read", {"path": "x.py"}),
+                (ProviderTextDelta("rewrote"), ProviderDone()),
+            ]
+        )
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_TransformingExtension()],
+        )
+        run = kernel.create_run("transform")
+        events = await _collect(run)
+        result = await run.result()
+        assert result.state is AgentRunState.SETTLED
+        tool_results = [
+            event.tool_result
+            for event in events
+            if event.kind is AgentSessionEventKind.TOOL_EXECUTION_END
+            and event.tool_result is not None
+        ]
+        assert len(tool_results) == 1
+        assert tool_results[0].tool_name == "shout"
+        assert tool_results[0].status == "success"
+        assert tool_results[0].output == {"content": "REWRITTEN"}
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_block_produces_error_result_without_executing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        provider = FakeProvider(
+            [
+                _tool_call_script("forbidden-1", "read", {"path": "x.py"}),
+                (ProviderTextDelta("blocked handled"), ProviderDone()),
+            ]
+        )
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_BlockingExtension()],
+        )
+        run = kernel.create_run("block")
+        events = await _collect(run)
+        result = await run.result()
+        assert result.state is AgentRunState.SETTLED
+        tool_results = [
+            event.tool_result
+            for event in events
+            if event.kind is AgentSessionEventKind.TOOL_EXECUTION_END
+            and event.tool_result is not None
+        ]
+        assert len(tool_results) == 1
+        assert tool_results[0].status == "error"
+        assert tool_results[0].error is not None
+        assert tool_results[0].error.code == "extension_blocked"
+        assert tool_results[0].error.message == "extension policy says no"
+        blocked_events = [
+            event.kind.value == "hook_blocked"
+            and event.extension == "blocker"
+            for event in kernel.extension_events
+        ]
+        assert any(blocked_events)
+
+    asyncio.run(scenario())
+
+
+def test_illegal_mutation_is_rejected_and_run_survives() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider(((ProviderTextDelta("ok"), ProviderDone()),))
+        kernel = AgentKernel(provider, extensions=[_BrokenExtension()])
+        run = kernel.create_run("broken")
+        await _collect(run)
+        result = await run.result()
+        assert result.state is AgentRunState.SETTLED
+        error_events = [
+            event
+            for event in kernel.extension_events
+            if event.kind.value == "hook_error"
+        ]
+        assert len(error_events) == 1
+        assert "does not match hook" in error_events[0].message
+        assert all(
+            event is not None
+            and event.extension == "broken"
+            for event in [item for item in error_events if item]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_extension_events_are_separate_from_public_session_stream() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider(((ProviderTextDelta("hi"), ProviderDone()),))
+        kernel = AgentKernel(provider, extensions=[SampleExtension()])
+        run = kernel.create_run("separation")
+        events = await _collect(run)
+        session_kinds = {event.kind for event in events}
+        assert all(kind not in session_kinds for kind in ("hook_start", "registered"))
+        assert any(event.extension == "sample" for event in kernel.extension_events)
+
+    asyncio.run(scenario())
+
+
+def test_declared_tool_is_registered_and_session_entry_kind_declared() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider(((ProviderTextDelta("x"), ProviderDone()),))
+        kernel = AgentKernel(provider, extensions=[SampleExtension()])
+        await _collect(kernel.create_run("declarations"))
+        assert "sample" in kernel.extension_names
+        # A fresh SampleExtension, registered through a probe runtime, declares its kind.
+        probe = ExtensionRuntime()
+        sample = SampleExtension()
+        probe.register(sample)
+        assert "extension_note" in probe.session_entry_kinds
+
+    asyncio.run(scenario())
+
+
+class _Second:
+    @property
+    def name(self) -> str:
+        return "second"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.CONTEXT, self._context)
+
+    def _context(self, input_: HookInput) -> HookResult:
+        del input_
+        return HookResult.supplement_context(ContextSupplement(("SECOND_RESOURCE",)))
