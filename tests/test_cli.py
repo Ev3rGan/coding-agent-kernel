@@ -121,3 +121,56 @@ def test_invalid_session_entry_cli_returns_structured_rejection_without_tracebac
     assert captured.err == ""
     assert records[-1]["session_rejected"]["code"] == "session_illegal_relation"
     assert "parent" in records[-1]["session_rejected"]["message"].lower()
+
+
+def test_context_compaction_cli_shows_bounded_active_branch_without_leakage(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "context-compaction"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    before = next(record["context_before"] for record in records if "context_before" in record)
+    after = next(record["context_after"] for record in records if "context_after" in record)
+    provider = next(
+        record["provider_request"] for record in records if "provider_request" in record
+    )
+    tree = next(record["session_tree"] for record in records if "session_tree" in record)
+
+    assert before["estimated_characters"] > after["estimated_characters"]
+    assert before["pending_provided"] is True
+    assert before["request_contains_pending_marker"] is False
+    assert before["injected_provided"] is True
+    assert before["request_contains_injected_marker"] is True
+    assert after["bounded"] is True
+    assert provider["provider_calls"] == 1
+    assert provider["contains_injected_marker"] is True
+    assert provider["contains_pending_marker"] is False
+    assert provider["contains_sibling_marker"] is False
+    assert any(record.get("event") == "compaction_succeeded" for record in records)
+    assert len(tree["branches"]) == 2
+    assert tree["original_entries_preserved"] is True
+    assert tree["checkpoint_count"] == 1
+
+
+def test_context_compaction_summary_error_cli_fails_before_provider_and_recovers(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "context-compaction", "--case", "summary-error"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    failure = next(record["context_failure"] for record in records if "context_failure" in record)
+    assert failure == {
+        "code": "compaction_summary_failed",
+        "provider_calls": 0,
+        "checkpoint_count": 0,
+        "original_entries_preserved": True,
+        "session_resumable": True,
+    }
+    assert any(record.get("event") == "compaction_failed" for record in records)
+    assert not any(record.get("event") == "message_start" for record in records)

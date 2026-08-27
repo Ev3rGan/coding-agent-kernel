@@ -6,15 +6,23 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
 
-from coding_agent.events import AgentSessionEvent, AssistantMessage, assistant_message_record
+from coding_agent.events import (
+    AgentError,
+    AgentSessionEvent,
+    AssistantMessage,
+    assistant_message_record,
+)
+
+if TYPE_CHECKING:
+    from coding_agent.context import CompactionPlan
 
 SESSION_SCHEMA = "coding-agent-session"
 SESSION_SCHEMA_VERSION = 1
 
-SessionEntryKind = Literal["configuration", "message"]
+SessionEntryKind = Literal["configuration", "message", "compaction"]
 SessionRecordKind = Literal["entry", "active_leaf", "closed", "resumed"]
 
 
@@ -130,6 +138,27 @@ def _canonical_payload(payload: Mapping[str, object]) -> str:
         raise SessionCorruptionError("SessionEntry payload must be JSON serializable.") from exc
 
 
+def _validate_compaction_values(
+    *,
+    version: object,
+    summary: object,
+    covered_entry_ids: object,
+    expected_entry_ids: tuple[str, ...],
+    checkpoint_label: str,
+) -> None:
+    if (
+        version != 1
+        or not isinstance(summary, str)
+        or not summary
+        or not isinstance(covered_entry_ids, (list, tuple))
+        or not all(isinstance(item, str) for item in covered_entry_ids)
+        or tuple(covered_entry_ids) != expected_entry_ids
+    ):
+        raise SessionRelationError(
+            f"Compaction checkpoint {checkpoint_label} has illegal coverage."
+        )
+
+
 def _encode_record(record: PersistenceRecord) -> str:
     value: dict[str, object] = {
         "schema": SESSION_SCHEMA,
@@ -185,7 +214,7 @@ def _decode_record(line: str, *, line_number: int) -> PersistenceRecord:
         if parent_id is not None and not isinstance(parent_id, str):
             raise SessionCorruptionError(f"Invalid parent at line {line_number}.")
         entry_kind = raw_entry.get("kind")
-        if entry_kind not in {"configuration", "message"}:
+        if entry_kind not in {"configuration", "message", "compaction"}:
             raise SessionCorruptionError(f"Invalid SessionEntry kind at line {line_number}.")
         payload = raw_entry.get("payload")
         if not isinstance(payload, dict):
@@ -315,6 +344,56 @@ class Session:
             run_id=run_id,
         )
 
+    def record_compaction(self, plan: CompactionPlan, *, run_id: str | None = None) -> SessionEntry:
+        """Persist one validated Active Branch checkpoint without rewriting history."""
+
+        expected = tuple(
+            entry.entry_id for entry in self.active_branch if entry.kind != "configuration"
+        )
+        _validate_compaction_values(
+            version=plan.version,
+            summary=plan.summary,
+            covered_entry_ids=plan.covered_entry_ids,
+            expected_entry_ids=expected,
+            checkpoint_label="proposal",
+        )
+        entry = self._append_entry(
+            "compaction",
+            {
+                "version": plan.version,
+                "covered_entry_ids": list(plan.covered_entry_ids),
+                "summary": plan.summary,
+            },
+            run_id=run_id,
+        )
+        self._events.append(
+            AgentSessionEvent.from_compaction_succeeded(
+                entry,
+                tuple(item.entry_id for item in self.active_branch),
+                run_id=run_id,
+            )
+        )
+        return entry
+
+    def record_context_failure(
+        self,
+        error: AgentError,
+        *,
+        stage: str,
+        run_id: str | None = None,
+    ) -> None:
+        """Queue an observable failure without appending an invalid checkpoint."""
+
+        self._events.append(
+            AgentSessionEvent.from_context_failure(
+                self.session_id,
+                tuple(entry.entry_id for entry in self.active_branch),
+                error,
+                stage=stage,
+                run_id=run_id,
+            )
+        )
+
     def drain_events(self) -> tuple[AgentSessionEvent, ...]:
         """Return pending Host observations exactly once."""
 
@@ -434,6 +513,8 @@ class Session:
                     raise SessionRelationError(
                         f"SessionEntry {entry.entry_id!r} has an unknown parent."
                     )
+                if entry.kind == "compaction":
+                    self._validate_compaction_entry(entry)
                 self._entries[entry.entry_id] = entry
                 self._active_leaf_id = entry.entry_id
             elif record.kind == "active_leaf":
@@ -453,3 +534,22 @@ class Session:
         if self._active_leaf_id is None:
             raise SessionCorruptionError("Session has no recoverable active leaf.")
         self._next_sequence = len(records) + 1
+
+    def _validate_compaction_entry(self, entry: SessionEntry) -> None:
+        if entry.parent_id is None:
+            raise SessionRelationError("Compaction checkpoint cannot be the Session root.")
+        payload = entry.payload
+        raw_coverage = payload.get("covered_entry_ids")
+        summary = payload.get("summary")
+        expected = tuple(
+            item.entry_id
+            for item in self._branch_to(entry.parent_id)
+            if item.kind != "configuration"
+        )
+        _validate_compaction_values(
+            version=payload.get("version"),
+            summary=summary,
+            covered_entry_ids=raw_coverage,
+            expected_entry_ids=expected,
+            checkpoint_label=repr(entry.entry_id),
+        )

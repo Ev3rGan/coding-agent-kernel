@@ -7,6 +7,13 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from functools import partial
 from itertools import count
 
+from coding_agent.context import (
+    ContextConstructionError,
+    ContextInput,
+    ContextPipeline,
+    ContextSettings,
+    ModelContext,
+)
 from coding_agent.events import (
     AgentError,
     AgentEvent,
@@ -74,10 +81,15 @@ class AgentKernel:
         *,
         tool_runtime: ToolRuntime | None = None,
         session: Session | None = None,
+        context_pipeline: ContextPipeline | None = None,
+        context_settings: ContextSettings | None = None,
     ) -> None:
         self._provider = provider
         self._tool_runtime = tool_runtime
         self._session = session
+        self._context_pipeline = context_pipeline or ContextPipeline()
+        self._context_settings = context_settings or ContextSettings()
+        self._model_contexts: list[ModelContext] = []
         self._run_numbers = count(1)
 
     @classmethod
@@ -90,6 +102,8 @@ class AgentKernel:
         session_id: str | None = None,
         entry_id_factory: Callable[[], str] | None = None,
         tool_runtime: ToolRuntime | None = None,
+        context_pipeline: ContextPipeline | None = None,
+        context_settings: ContextSettings | None = None,
     ) -> AgentKernel:
         """Create a Kernel that owns a new durable Session."""
 
@@ -99,7 +113,13 @@ class AgentKernel:
             session_id=session_id,
             entry_id_factory=entry_id_factory,
         )
-        return cls(provider, tool_runtime=tool_runtime, session=session)
+        return cls(
+            provider,
+            tool_runtime=tool_runtime,
+            session=session,
+            context_pipeline=context_pipeline,
+            context_settings=context_settings,
+        )
 
     @classmethod
     def with_resumed_session(
@@ -110,6 +130,8 @@ class AgentKernel:
         *,
         entry_id_factory: Callable[[], str] | None = None,
         tool_runtime: ToolRuntime | None = None,
+        context_pipeline: ContextPipeline | None = None,
+        context_settings: ContextSettings | None = None,
     ) -> AgentKernel:
         """Create a Kernel after validating and resuming persisted Session history."""
 
@@ -118,7 +140,13 @@ class AgentKernel:
             session_id,
             entry_id_factory=entry_id_factory,
         )
-        return cls(provider, tool_runtime=tool_runtime, session=session)
+        return cls(
+            provider,
+            tool_runtime=tool_runtime,
+            session=session,
+            context_pipeline=context_pipeline,
+            context_settings=context_settings,
+        )
 
     @property
     def session_id(self) -> str:
@@ -135,6 +163,12 @@ class AgentKernel:
     @property
     def session_branches(self) -> tuple[tuple[SessionEntry, ...], ...]:
         return self._require_session().branches
+
+    @property
+    def model_contexts(self) -> tuple[ModelContext, ...]:
+        """Expose immutable Context values already used or prepared by this Kernel."""
+
+        return tuple(self._model_contexts)
 
     def drain_session_events(self) -> tuple[AgentSessionEvent, ...]:
         """Expose pending Session observations to a Host exactly once."""
@@ -156,20 +190,38 @@ class AgentKernel:
         """Start one Agent Run for the supplied user input."""
 
         run_id = f"run-{next(self._run_numbers)}"
-        initial_events: tuple[AgentSessionEvent, ...] = ()
-        if self._session is not None:
-            self._session.record_user_message(prompt, run_id=run_id)
-            initial_events = self._session.drain_events()
+        first_request: ProviderRequest | None = None
+        context_error: AgentError | None = None
+        try:
+            first_request = self._build_context((UserMessage(text=prompt),), run_id=run_id)
+            if self._session is not None:
+                self._session.record_user_message(prompt, run_id=run_id)
+        except ContextConstructionError as exc:
+            context_error = self._record_context_failure(exc, run_id=run_id)
+        initial_events = () if self._session is None else self._session.drain_events()
         return AgentRun(
             run_id,
-            self._agent_events(run_id=run_id, prompt=prompt),
+            self._agent_events(
+                run_id=run_id,
+                prompt=prompt,
+                first_request=first_request,
+                context_error=context_error,
+            ),
             session=self._session,
             initial_events=initial_events,
         )
 
-    async def _agent_events(self, *, run_id: str, prompt: str) -> AsyncIterator[AgentEvent]:
+    async def _agent_events(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        first_request: ProviderRequest | None,
+        context_error: AgentError | None,
+    ) -> AsyncIterator[AgentEvent]:
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
+        next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
 
         for turn_number in range(1, 21):
             turn_id = f"{run_id}-turn-{turn_number}"
@@ -179,6 +231,16 @@ class AgentKernel:
             done_seen = False
 
             yield AgentEvent(kind=AgentEventKind.TURN_START, run_id=run_id, turn_id=turn_id)
+            if context_error is not None:
+                yield AgentEvent(
+                    kind=AgentEventKind.ERROR,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    error=context_error,
+                )
+                yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
+                return
             yield AgentEvent(
                 kind=AgentEventKind.MESSAGE_START,
                 run_id=run_id,
@@ -186,7 +248,27 @@ class AgentKernel:
                 message_id=message_id,
                 message=message,
             )
-            request = ProviderRequest(tuple(history), self._tool_schemas())
+            if turn_number == 1:
+                if first_request is None:  # pragma: no cover - guarded by context_error
+                    raise RuntimeError("First Provider request was not prepared.")
+                request = first_request
+            else:
+                try:
+                    injected = next_injected if self._session is not None else tuple(history)
+                    request = self._build_context(injected, run_id=run_id)
+                except ContextConstructionError as exc:
+                    context_failure = self._record_context_failure(exc, run_id=run_id)
+                    yield AgentEvent(
+                        kind=AgentEventKind.ERROR,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        message_id=message_id,
+                        message=message,
+                        error=context_failure,
+                    )
+                    yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                    yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
+                    return
             failure: ProviderError | None = None
             try:
                 async for provider_event in self._provider.stream(request):
@@ -307,6 +389,7 @@ class AgentKernel:
                         batch_mode=batch.mode,
                     )
                 history.append(ToolResultMessage(results=batch.results))
+                next_injected = (ToolResultMessage(results=batch.results),)
                 yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
                 continue
 
@@ -323,6 +406,39 @@ class AgentKernel:
             provider_error=error,
         ):
             yield failure_event
+
+    def _build_context(
+        self,
+        injected_messages: tuple[ModelMessage, ...],
+        *,
+        run_id: str,
+    ) -> ProviderRequest:
+        result = self._context_pipeline.build(
+            ContextInput(
+                settings=self._context_settings,
+                active_branch=(() if self._session is None else self._session.active_branch),
+                active_tools=self._tool_schemas(),
+                injected_messages=injected_messages,
+            )
+        )
+        if result.compaction is not None:
+            if self._session is None:  # pragma: no cover - no branch can produce a plan
+                raise RuntimeError("Compaction requires a durable Session.")
+            self._session.record_compaction(result.compaction, run_id=run_id)
+        self._model_contexts.append(result.context)
+        return result.context.provider_request
+
+    def _record_context_failure(
+        self, error: ContextConstructionError, *, run_id: str
+    ) -> AgentError:
+        normalized = AgentError(code=error.code, message=str(error), source="kernel")
+        if self._session is not None:
+            self._session.record_context_failure(
+                normalized,
+                stage=error.stage,
+                run_id=run_id,
+            )
+        return normalized
 
     def _tool_schemas(self) -> tuple[dict[str, object], ...]:
         if self._tool_runtime is None:
