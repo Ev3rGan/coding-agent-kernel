@@ -435,6 +435,22 @@ class AgentRunState(StrEnum):
         return self is not AgentRunState.ACTIVE
 
 
+class PendingMessageKind(StrEnum):
+    """The two independently drained Agent Run input queues."""
+
+    STEERING = "steering"
+    FOLLOW_UP = "follow_up"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingMessage:
+    """One immutable Host message accepted by an active Agent Run."""
+
+    message_id: str
+    kind: PendingMessageKind
+    text: str
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRunResult:
     """The final, awaitable result of an Agent Run."""
@@ -477,6 +493,10 @@ class AgentSessionEventKind(StrEnum):
     COMPACTION_SUCCEEDED = "compaction_succeeded"
     COMPACTION_FAILED = "compaction_failed"
     CONTEXT_FAILED = "context_failed"
+    MESSAGE_QUEUED = "message_queued"
+    MESSAGE_INJECTED = "message_injected"
+    MESSAGE_DROPPED = "message_dropped"
+    PROVIDER_RETRY = "provider_retry"
 
 
 _TERMINAL_EVENT_KINDS = {
@@ -495,6 +515,13 @@ _SESSION_EVENT_KINDS = {
     AgentSessionEventKind.CONTEXT_FAILED,
 }
 
+_CONTROL_EVENT_KINDS = {
+    AgentSessionEventKind.MESSAGE_QUEUED,
+    AgentSessionEventKind.MESSAGE_INJECTED,
+    AgentSessionEventKind.MESSAGE_DROPPED,
+    AgentSessionEventKind.PROVIDER_RETRY,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionEvent:
@@ -510,10 +537,29 @@ class AgentSessionEvent:
     configuration_json: str | None = None
     context_error: AgentError | None = None
     context_stage: str | None = None
+    pending_message: PendingMessage | None = None
+    queue_size: int | None = None
+    retry_attempt: int | None = None
+    retry_remaining: int | None = None
+    retry_error: AgentError | None = None
 
     def __post_init__(self) -> None:
         terminal = self.kind in _TERMINAL_EVENT_KINDS
         session_event = self.kind in _SESSION_EVENT_KINDS
+        control_event = self.kind in _CONTROL_EVENT_KINDS
+        if control_event:
+            if self.agent_event is not None or self.result is not None:
+                raise ValueError("Control events cannot wrap AgentEvent or a result")
+            if self.kind is AgentSessionEventKind.PROVIDER_RETRY:
+                if (
+                    self.retry_attempt is None
+                    or self.retry_remaining is None
+                    or self.retry_error is None
+                ):
+                    raise ValueError("provider_retry requires attempt, remaining, and error")
+            elif self.pending_message is None or self.queue_size is None:
+                raise ValueError("Message control events require a message and queue size")
+            return
         if session_event:
             if self.session_id is None or self.agent_event is not None or self.result is not None:
                 raise ValueError("Session events require session data only")
@@ -550,6 +596,44 @@ class AgentSessionEvent:
             raise ValueError("terminal events require only a final result")
         if not terminal and self.agent_event is None:
             raise ValueError("non-terminal events require an AgentEvent")
+
+    @classmethod
+    def from_pending_message(
+        cls,
+        kind: AgentSessionEventKind,
+        run_id: str,
+        message: PendingMessage,
+        queue_size: int,
+    ) -> AgentSessionEvent:
+        if kind not in {
+            AgentSessionEventKind.MESSAGE_QUEUED,
+            AgentSessionEventKind.MESSAGE_INJECTED,
+            AgentSessionEventKind.MESSAGE_DROPPED,
+        }:
+            raise ValueError("kind must describe a pending-message transition")
+        return cls(
+            kind=kind,
+            run_id=run_id,
+            pending_message=message,
+            queue_size=queue_size,
+        )
+
+    @classmethod
+    def from_provider_retry(
+        cls,
+        run_id: str,
+        *,
+        attempt: int,
+        remaining: int,
+        error: AgentError,
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.PROVIDER_RETRY,
+            run_id=run_id,
+            retry_attempt=attempt,
+            retry_remaining=remaining,
+            retry_error=error,
+        )
 
     @classmethod
     def from_agent_event(cls, event: AgentEvent) -> AgentSessionEvent:

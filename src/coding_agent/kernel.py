@@ -14,13 +14,16 @@ from coding_agent.context import (
     ContextSettings,
     ModelContext,
 )
+from coding_agent.control import RetryPolicy, RunControl
 from coding_agent.events import (
     AgentError,
     AgentEvent,
     AgentEventKind,
     AgentSessionEvent,
+    AgentSessionEventKind,
     AssistantMessage,
     AssistantMessageAccumulator,
+    PendingMessage,
     ProviderAbort,
     ProviderCancelled,
     ProviderDone,
@@ -83,12 +86,14 @@ class AgentKernel:
         session: Session | None = None,
         context_pipeline: ContextPipeline | None = None,
         context_settings: ContextSettings | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._provider = provider
         self._tool_runtime = tool_runtime
         self._session = session
         self._context_pipeline = context_pipeline or ContextPipeline()
         self._context_settings = context_settings or ContextSettings()
+        self._retry_policy = retry_policy or RetryPolicy()
         self._model_contexts: list[ModelContext] = []
         self._run_numbers = count(1)
 
@@ -104,6 +109,7 @@ class AgentKernel:
         tool_runtime: ToolRuntime | None = None,
         context_pipeline: ContextPipeline | None = None,
         context_settings: ContextSettings | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> AgentKernel:
         """Create a Kernel that owns a new durable Session."""
 
@@ -119,6 +125,7 @@ class AgentKernel:
             session=session,
             context_pipeline=context_pipeline,
             context_settings=context_settings,
+            retry_policy=retry_policy,
         )
 
     @classmethod
@@ -132,6 +139,7 @@ class AgentKernel:
         tool_runtime: ToolRuntime | None = None,
         context_pipeline: ContextPipeline | None = None,
         context_settings: ContextSettings | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> AgentKernel:
         """Create a Kernel after validating and resuming persisted Session history."""
 
@@ -146,6 +154,7 @@ class AgentKernel:
             session=session,
             context_pipeline=context_pipeline,
             context_settings=context_settings,
+            retry_policy=retry_policy,
         )
 
     @property
@@ -201,7 +210,8 @@ class AgentKernel:
         initial_events = () if self._session is None else self._session.drain_events()
         return AgentRun(
             run_id,
-            self._agent_events(
+            lambda control: self._agent_events(
+                control=control,
                 run_id=run_id,
                 prompt=prompt,
                 first_request=first_request,
@@ -214,14 +224,16 @@ class AgentKernel:
     async def _agent_events(
         self,
         *,
+        control: RunControl,
         run_id: str,
         prompt: str,
         first_request: ProviderRequest | None,
         context_error: AgentError | None,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
         next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
+        next_active_branch: tuple[SessionEntry, ...] | None = None
 
         for turn_number in range(1, 21):
             turn_id = f"{run_id}-turn-{turn_number}"
@@ -255,7 +267,13 @@ class AgentKernel:
             else:
                 try:
                     injected = next_injected if self._session is not None else tuple(history)
-                    request = self._build_context(injected, run_id=run_id)
+                    request = self._build_context(
+                        injected,
+                        run_id=run_id,
+                        pending_messages=control.pending_messages(),
+                        active_branch=next_active_branch,
+                    )
+                    next_active_branch = None
                 except ContextConstructionError as exc:
                     context_failure = self._record_context_failure(exc, run_id=run_id)
                     yield AgentEvent(
@@ -270,48 +288,67 @@ class AgentKernel:
                     yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
                     return
             failure: ProviderError | None = None
-            try:
-                async for provider_event in self._provider.stream(request):
-                    message = accumulator.apply(provider_event)
+            for attempt in range(1, self._retry_policy.max_attempts + 1):
+                accumulator = AssistantMessageAccumulator()
+                message = accumulator.message
+                done_seen = False
+                failure = None
+                try:
+                    async for provider_event in self._provider.stream(request):
+                        message = accumulator.apply(provider_event)
+                        yield AgentEvent(
+                            kind=AgentEventKind.MESSAGE_UPDATE,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            message_id=message_id,
+                            message=message,
+                            provider_event=provider_event,
+                        )
+                        if isinstance(provider_event, ProviderDone):
+                            done_seen = True
+                        elif isinstance(provider_event, ProviderError):
+                            failure = provider_event
+                            break
+                        elif isinstance(provider_event, ProviderAbort):
+                            failure = ProviderError(
+                                code="provider_aborted", message=provider_event.reason
+                            )
+                            break
+                        elif isinstance(provider_event, ProviderCancelled):
+                            raise asyncio.CancelledError(provider_event.reason)
+                except Exception as exc:
+                    failure = ProviderError(
+                        code="provider_exception",
+                        message=f"{type(exc).__name__}: {exc}",
+                    )
+
+                if failure is None and not done_seen:
+                    failure = ProviderError(
+                        code="provider_stream_incomplete",
+                        message="Provider stream ended without done or error.",
+                    )
                     yield AgentEvent(
                         kind=AgentEventKind.MESSAGE_UPDATE,
                         run_id=run_id,
                         turn_id=turn_id,
                         message_id=message_id,
                         message=message,
-                        provider_event=provider_event,
+                        provider_event=failure,
                     )
-                    if isinstance(provider_event, ProviderDone):
-                        done_seen = True
-                    elif isinstance(provider_event, ProviderError):
-                        failure = provider_event
-                        break
-                    elif isinstance(provider_event, ProviderAbort):
-                        failure = ProviderError(
-                            code="provider_aborted", message=provider_event.reason
-                        )
-                        break
-                    elif isinstance(provider_event, ProviderCancelled):
-                        raise asyncio.CancelledError(provider_event.reason)
-            except Exception as exc:
-                failure = ProviderError(
-                    code="provider_exception",
-                    message=f"{type(exc).__name__}: {exc}",
-                )
 
-            if failure is None and not done_seen:
-                failure = ProviderError(
-                    code="provider_stream_incomplete",
-                    message="Provider stream ended without done or error.",
+                if failure is None:
+                    break
+                remaining = self._retry_policy.max_attempts - attempt
+                if remaining == 0 or not self._retry_policy.is_retryable(failure.code):
+                    break
+                retry_error = AgentError(failure.code, failure.message, "provider")
+                yield AgentSessionEvent.from_provider_retry(
+                    run_id,
+                    attempt=attempt,
+                    remaining=remaining,
+                    error=retry_error,
                 )
-                yield AgentEvent(
-                    kind=AgentEventKind.MESSAGE_UPDATE,
-                    run_id=run_id,
-                    turn_id=turn_id,
-                    message_id=message_id,
-                    message=message,
-                    provider_event=failure,
-                )
+                await self._wait_for_retry(control)
 
             if failure is not None:
                 for failure_event in _provider_failure_events(
@@ -348,6 +385,7 @@ class AgentKernel:
                 batch_task = asyncio.create_task(
                     self._tool_runtime.execute_batch(
                         message.tool_calls,
+                        control.cancel_event,
                         on_progress=partial(_put_progress, progress_queue),
                     )
                 )
@@ -389,8 +427,40 @@ class AgentKernel:
                         batch_mode=batch.mode,
                     )
                 history.append(ToolResultMessage(results=batch.results))
-                next_injected = (ToolResultMessage(results=batch.results),)
+                tool_results = ToolResultMessage(results=batch.results)
+                next_injected = (tool_results,)
+                steering = control.drain_steering()
+                if steering:
+                    next_injected, next_active_branch = self._prepare_control_injection(
+                        history,
+                        steering,
+                        prefix=(tool_results,),
+                    )
+                    async for control_event in self._inject_messages(run_id, steering):
+                        yield control_event
                 yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                continue
+
+            steering = control.drain_steering()
+            if steering:
+                next_injected, next_active_branch = self._prepare_control_injection(
+                    history, steering
+                )
+                async for control_event in self._inject_messages(run_id, steering):
+                    yield control_event
+                yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                continue
+
+            follow_up = control.drain_follow_up()
+            if follow_up:
+                next_injected, next_active_branch = self._prepare_control_injection(
+                    history, follow_up
+                )
+                yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
+                async for control_event in self._inject_messages(run_id, follow_up):
+                    yield control_event
+                yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
                 continue
 
             yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
@@ -412,13 +482,22 @@ class AgentKernel:
         injected_messages: tuple[ModelMessage, ...],
         *,
         run_id: str,
+        pending_messages: tuple[ModelMessage, ...] = (),
+        active_branch: tuple[SessionEntry, ...] | None = None,
     ) -> ProviderRequest:
         result = self._context_pipeline.build(
             ContextInput(
                 settings=self._context_settings,
-                active_branch=(() if self._session is None else self._session.active_branch),
+                active_branch=(
+                    ()
+                    if self._session is None
+                    else self._session.active_branch
+                    if active_branch is None
+                    else active_branch
+                ),
                 active_tools=self._tool_schemas(),
                 injected_messages=injected_messages,
+                pending_messages=pending_messages,
             )
         )
         if result.compaction is not None:
@@ -427,6 +506,52 @@ class AgentKernel:
             self._session.record_compaction(result.compaction, run_id=run_id)
         self._model_contexts.append(result.context)
         return result.context.provider_request
+
+    async def _inject_messages(
+        self, run_id: str, messages: tuple[PendingMessage, ...]
+    ) -> AsyncIterator[AgentSessionEvent]:
+        for message in messages:
+            yield AgentSessionEvent.from_pending_message(
+                AgentSessionEventKind.MESSAGE_INJECTED,
+                run_id,
+                message,
+                0,
+            )
+            if self._session is not None:
+                self._session.record_user_message(message.text, run_id=run_id)
+                for event in self._session.drain_events():
+                    yield event
+
+    def _prepare_control_injection(
+        self,
+        history: list[ModelMessage],
+        messages: tuple[PendingMessage, ...],
+        *,
+        prefix: tuple[ModelMessage, ...] = (),
+    ) -> tuple[tuple[ModelMessage, ...], tuple[SessionEntry, ...] | None]:
+        branch_before_injection = None if self._session is None else self._session.active_branch
+        injected_users = tuple(UserMessage(text=message.text) for message in messages)
+        history.extend(injected_users)
+        return (*prefix, *injected_users), branch_before_injection
+
+    async def _wait_for_retry(self, control: RunControl) -> None:
+        delay = self._retry_policy.delay_seconds
+        if delay == 0:
+            await asyncio.sleep(0)
+            return
+        delay_task = asyncio.create_task(asyncio.sleep(delay))
+        cancel_task = asyncio.create_task(control.cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {delay_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancel_task in done:
+                raise asyncio.CancelledError
+        finally:
+            for task in (delay_task, cancel_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(delay_task, cancel_task, return_exceptions=True)
 
     def _record_context_failure(
         self, error: ContextConstructionError, *, run_id: str

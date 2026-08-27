@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from coding_agent.cli import main
 
 
@@ -174,3 +176,59 @@ def test_context_compaction_summary_error_cli_fails_before_provider_and_recovers
     }
     assert any(record.get("event") == "compaction_failed" for record in records)
     assert not any(record.get("event") == "message_start" for record in records)
+
+
+@pytest.mark.parametrize(
+    ("case", "terminal"),
+    [
+        ("steering", "run_settled"),
+        ("follow-up", "run_settled"),
+        ("cancel", "run_cancelled"),
+        ("retry-success", "run_settled"),
+        ("retry-failure", "run_failed"),
+    ],
+)
+def test_run_control_cli_cases_expose_one_expected_terminal(
+    case: str, terminal: str, capsys: Any
+) -> None:
+    exit_code = main(["demo", "run-control", "--case", case])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    terminals = [
+        record
+        for record in records
+        if record.get("event") in {"run_settled", "run_cancelled", "run_failed"}
+    ]
+    assert [record["event"] for record in terminals] == [terminal]
+    evidence = records[-1]["run_control"]
+    assert evidence["case"] == case
+    assert evidence["terminal_count"] == 1
+    assert evidence["provider_request_count"] >= 1
+
+
+def test_run_control_cli_renders_queue_retry_and_session_evidence(capsys: Any) -> None:
+    assert main(["demo", "run-control", "--case", "steering"]) == 0
+    steering = _records(capsys.readouterr().out)
+    assert any(record.get("event") == "message_queued" for record in steering)
+    assert any(record.get("event") == "message_injected" for record in steering)
+    evidence = steering[-1]["run_control"]
+    assert evidence["injected_messages"] == ["inspect the tool result"]
+    assert evidence["session_user_messages"].count("inspect the tool result") == 1
+
+    assert main(["demo", "run-control", "--case", "cancel"]) == 0
+    cancelled = _records(capsys.readouterr().out)
+    assert sum(record.get("event") == "message_dropped" for record in cancelled) == 2
+    cancel_evidence = cancelled[-1]["run_control"]
+    assert "queued steering" not in cancel_evidence["session_user_messages"]
+    assert "queued follow-up" not in cancel_evidence["session_user_messages"]
+
+    assert main(["demo", "run-control", "--case", "retry-success"]) == 0
+    retried = _records(capsys.readouterr().out)
+    retry = next(record for record in retried if record.get("event") == "provider_retry")
+    assert retry["attempt"] == 1
+    assert retry["remaining"] == 1
+    retry_evidence = retried[-1]["run_control"]
+    assert retry_evidence["same_request_retried"] is True

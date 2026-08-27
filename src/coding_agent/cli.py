@@ -14,14 +14,17 @@ from pathlib import Path
 from typing import Any
 
 from coding_agent.context import ContextInput, ContextPipeline, ContextSettings
+from coding_agent.control import RetryPolicy
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
     AgentRunResult,
     AgentRunState,
     AgentSessionEvent,
+    AgentSessionEventKind,
     AssistantMessage,
     ProviderDone,
+    ProviderError,
     ProviderStreamEvent,
     ProviderTextDelta,
     ToolResult,
@@ -106,6 +109,17 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
         record["batch_mode"] = event.agent_event.batch_mode
     if event.result is not None:
         record["state"] = event.result.state.value
+    if event.pending_message is not None:
+        record["pending_message"] = {
+            "message_id": event.pending_message.message_id,
+            "kind": event.pending_message.kind.value,
+            "text": event.pending_message.text,
+        }
+        record["queue_size"] = event.queue_size
+    if event.retry_error is not None:
+        record["attempt"] = event.retry_attempt
+        record["remaining"] = event.retry_remaining
+        record["error"] = _error_record(event.retry_error)
     return record
 
 
@@ -141,6 +155,138 @@ async def _streamed_run_demo(case: str) -> int:
     result = await run.result()
     _print_record(_result_record(result))
     return 0 if result.state is AgentRunState.SETTLED else 1
+
+
+def _run_control_script(case: str) -> tuple[tuple[ProviderStreamEvent, ...], ...]:
+    if case == "steering":
+        return (
+            (
+                *_scripted_tool_call_events(0, "read-control", "read", {"path": "state.txt"}),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderTextDelta("Steering applied after the tool result."), ProviderDone()),
+        )
+    if case == "follow-up":
+        return (
+            (ProviderTextDelta("Initial work complete."), ProviderDone()),
+            (ProviderTextDelta("Follow-up work complete."), ProviderDone()),
+        )
+    if case == "cancel":
+        return (
+            (
+                ProviderTextDelta("Provider work is in flight."),
+                ProviderTextDelta("This delta must not be observed."),
+                ProviderDone(),
+            ),
+        )
+    if case == "retry-success":
+        return (
+            (
+                ProviderTextDelta("Discarded partial attempt."),
+                ProviderError("provider_unavailable", "Temporary scripted failure."),
+            ),
+            (ProviderTextDelta("Retry recovered."), ProviderDone()),
+        )
+    return ((ProviderError("provider_unavailable", "Scripted retry exhaustion."),),)
+
+
+async def _run_control_demo(case: str) -> int:
+    with tempfile.TemporaryDirectory(prefix="coding-agent-run-control-") as directory:
+        workspace = Path(directory)
+        (workspace / "state.txt").write_text("ready\n", encoding="utf-8")
+        provider = FakeProvider(_run_control_script(case))
+        store = JsonlSessionStore(workspace / "session.jsonl")
+        runtime = ToolRuntime(LocalCodingEnvironment(workspace))
+        kernel = AgentKernel.with_new_session(
+            provider,
+            store,
+            configuration={"provider": "fake", "demo": "run-control"},
+            session_id="run-control-demo",
+            tool_runtime=runtime,
+            retry_policy=RetryPolicy(max_attempts=2 if case == "retry-success" else 3),
+        )
+        run = kernel.create_run("Demonstrate deterministic Agent Run control.")
+        controlled = False
+        if case == "cancel":
+            await run.steer("queued steering")
+            await run.follow_up("queued follow-up")
+
+        events: list[AgentSessionEvent] = []
+        async for event in run:
+            events.append(event)
+            _print_record(_event_record(event))
+            if (
+                case == "steering"
+                and not controlled
+                and event.kind is AgentSessionEventKind.TOOL_EXECUTION_START
+            ):
+                await run.steer("inspect the tool result")
+                controlled = True
+            elif (
+                case == "follow-up"
+                and not controlled
+                and event.kind is AgentSessionEventKind.MESSAGE_UPDATE
+            ):
+                await run.follow_up("continue with follow-up work")
+                controlled = True
+            elif (
+                case == "cancel"
+                and not controlled
+                and event.kind is AgentSessionEventKind.MESSAGE_UPDATE
+            ):
+                await run.cancel()
+                controlled = True
+
+        result = await run.result()
+        _print_record(_result_record(result))
+        terminal_kinds = {
+            AgentSessionEventKind.RUN_SETTLED,
+            AgentSessionEventKind.RUN_CANCELLED,
+            AgentSessionEventKind.RUN_FAILED,
+        }
+        requests = provider.requests
+        session_user_messages = [
+            entry.payload.get("text")
+            for entry in kernel.session_active_branch
+            if entry.kind == "message" and entry.payload.get("role") == "user"
+        ]
+        _print_record(
+            {
+                "run_control": {
+                    "case": case,
+                    "provider_request_count": len(requests),
+                    "provider_request_messages": [
+                        [
+                            {
+                                "role": message.role,
+                                "text": getattr(message, "text", None),
+                            }
+                            for message in request.messages
+                        ]
+                        for request in requests
+                    ],
+                    "same_request_retried": len(requests) > 1
+                    and all(request is requests[0] for request in requests[1:]),
+                    "session_user_messages": session_user_messages,
+                    "injected_messages": [
+                        event.pending_message.text
+                        for event in events
+                        if event.kind is AgentSessionEventKind.MESSAGE_INJECTED
+                        and event.pending_message is not None
+                    ],
+                    "terminal_count": sum(event.kind in terminal_kinds for event in events),
+                    "result_state": result.state.value,
+                }
+            }
+        )
+        expected = {
+            "steering": AgentRunState.SETTLED,
+            "follow-up": AgentRunState.SETTLED,
+            "cancel": AgentRunState.CANCELLED,
+            "retry-success": AgentRunState.SETTLED,
+            "retry-failure": AgentRunState.FAILED,
+        }[case]
+        return 0 if result.state is expected else 1
 
 
 def _scripted_tool_call_events(
@@ -573,6 +719,15 @@ def _parser() -> argparse.ArgumentParser:
         default="success",
         help="scripted Context construction outcome",
     )
+    run_control = demos.add_parser(
+        "run-control", help="observe steering, follow-up, cancellation, and Provider retry"
+    )
+    run_control.add_argument(
+        "--case",
+        choices=("steering", "follow-up", "cancel", "retry-success", "retry-failure"),
+        default="steering",
+        help="deterministic Agent Run control scenario",
+    )
     return parser
 
 
@@ -588,4 +743,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_session_tree_demo(args.case))
     if args.command == "demo" and args.demo == "context-compaction":
         return asyncio.run(_context_compaction_demo(args.case))
+    if args.command == "demo" and args.demo == "run-control":
+        return asyncio.run(_run_control_demo(args.case))
     raise AssertionError("argparse accepted an unsupported command")
