@@ -69,6 +69,13 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
 
         return await self.result()
 
+    async def cancel(self) -> AgentRunResult:
+        """Cancel active Provider or Tool Execution work and await settlement."""
+
+        if self._state is AgentRunState.ACTIVE:
+            self._worker.cancel()
+        return await self.result()
+
     async def _drive(self, source: AsyncIterator[AgentEvent]) -> None:
         authoritative_message = None
         failure = None
