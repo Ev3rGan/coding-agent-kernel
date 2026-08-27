@@ -15,6 +15,7 @@ from coding_agent.events import (
     AgentSessionEvent,
     AssistantMessage,
 )
+from coding_agent.session import Session
 
 _STREAM_END: Final = object()
 
@@ -22,7 +23,14 @@ _STREAM_END: Final = object()
 class AgentRun(AsyncIterator[AgentSessionEvent]):
     """Own one run's event stream, lifecycle state, and final result."""
 
-    def __init__(self, run_id: str, source: AsyncIterator[AgentEvent]) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        source: AsyncIterator[AgentEvent],
+        *,
+        session: Session | None = None,
+        initial_events: tuple[AgentSessionEvent, ...] = (),
+    ) -> None:
         loop = asyncio.get_running_loop()
         self._run_id = run_id
         self._state = AgentRunState.ACTIVE
@@ -30,7 +38,10 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         self._result: asyncio.Future[AgentRunResult] = loop.create_future()
         self._iterator_claimed = False
         self._stream_exhausted = False
-        self._worker = loop.create_task(self._drive(source), name=f"agent-run:{run_id}")
+        self._session = session
+        self._worker = loop.create_task(
+            self._drive(source, initial_events), name=f"agent-run:{run_id}"
+        )
 
     @property
     def run_id(self) -> str:
@@ -76,14 +87,26 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
             self._worker.cancel()
         return await self.result()
 
-    async def _drive(self, source: AsyncIterator[AgentEvent]) -> None:
+    async def _drive(
+        self,
+        source: AsyncIterator[AgentEvent],
+        initial_events: tuple[AgentSessionEvent, ...],
+    ) -> None:
         authoritative_message = None
         failure = None
         try:
+            for event in initial_events:
+                await self._events.put(event)
             async for agent_event in source:
                 await self._events.put(AgentSessionEvent.from_agent_event(agent_event))
                 if agent_event.kind is AgentEventKind.MESSAGE_END:
                     authoritative_message = agent_event.message
+                    if self._session is not None and authoritative_message is not None:
+                        self._session.record_authoritative_message(
+                            authoritative_message, run_id=self._run_id
+                        )
+                        for session_event in self._session.drain_events():
+                            await self._events.put(session_event)
                 elif agent_event.kind is AgentEventKind.ERROR:
                     failure = agent_event.error
 

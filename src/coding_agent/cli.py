@@ -19,39 +19,16 @@ from coding_agent.events import (
     AgentRunResult,
     AgentRunState,
     AgentSessionEvent,
-    AssistantMessage,
     ProviderDone,
     ProviderStreamEvent,
     ProviderTextDelta,
     ToolResult,
+    assistant_message_record,
 )
 from coding_agent.kernel import AgentKernel
 from coding_agent.provider import FakeProvider
+from coding_agent.session import JsonlSessionStore, SessionError
 from coding_agent.tool_runtime import ToolRuntime
-
-
-def _message_record(message: AssistantMessage) -> dict[str, Any]:
-    return {
-        "role": message.role,
-        "thinking": message.thinking,
-        "text": message.text,
-        "tool_calls": [
-            {
-                "call_id": call.call_id,
-                "tool_name": call.tool_name,
-                "arguments": call.arguments,
-            }
-            for call in message.tool_calls
-        ],
-        "usage": None
-        if message.usage is None
-        else {
-            "input_tokens": message.usage.input_tokens,
-            "output_tokens": message.usage.output_tokens,
-        },
-        "stop_reason": message.stop_reason,
-        "response_id": message.response_id,
-    }
 
 
 def _provider_record(event: ProviderStreamEvent) -> dict[str, Any]:
@@ -79,14 +56,29 @@ def _tool_result_record(result: ToolResult) -> dict[str, Any]:
 
 
 def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
-    record: dict[str, Any] = {"event": event.kind.value, "run_id": event.run_id}
+    record: dict[str, Any] = {"event": event.kind.value}
+    if event.run_id is not None:
+        record["run_id"] = event.run_id
+    if event.session_id is not None:
+        record["session_id"] = event.session_id
+    if event.session_entry is not None:
+        record["session_entry"] = {
+            "entry_id": event.session_entry.entry_id,
+            "parent_id": event.session_entry.parent_id,
+            "kind": event.session_entry.kind,
+            "payload": event.session_entry.payload,
+        }
+    if event.active_branch is not None:
+        record["active_branch"] = list(event.active_branch)
+    if event.configuration_json is not None:
+        record["configuration"] = json.loads(event.configuration_json)
     if event.agent_event is not None:
         if event.agent_event.turn_id is not None:
             record["turn_id"] = event.agent_event.turn_id
         if event.agent_event.message_id is not None:
             record["message_id"] = event.agent_event.message_id
     if event.message is not None:
-        record["message"] = _message_record(event.message)
+        record["message"] = assistant_message_record(event.message)
     if event.provider_event is not None:
         record["provider_event"] = _provider_record(event.provider_event)
     if event.error is not None:
@@ -122,7 +114,7 @@ def _result_record(result: AgentRunResult) -> dict[str, Any]:
     }
     result_record = record["result"]
     if result.message is not None:
-        result_record["message"] = _message_record(result.message)
+        result_record["message"] = assistant_message_record(result.message)
     if result.error is not None:
         result_record["error"] = _error_record(result.error)
     return record
@@ -250,6 +242,126 @@ async def _tool_loop_demo(case: str) -> int:
         return 0 if result.state is AgentRunState.SETTLED else 1
 
 
+async def _run_session_message(kernel: AgentKernel) -> None:
+    run = kernel.create_run("Continue the deterministic Session.")
+    async for event in run:
+        _print_record(_event_record(event))
+    _print_record(_result_record(await run.result()))
+
+
+def _invalid_session_records() -> list[dict[str, object]]:
+    common: dict[str, object] = {
+        "schema": "coding-agent-session",
+        "version": 1,
+        "session_id": "session-invalid",
+    }
+    return [
+        {
+            **common,
+            "sequence": 1,
+            "record_type": "entry",
+            "entry": {
+                "entry_id": "root",
+                "parent_id": None,
+                "kind": "configuration",
+                "payload": {"provider": "fake"},
+            },
+        },
+        {
+            **common,
+            "sequence": 2,
+            "record_type": "entry",
+            "entry": {
+                "entry_id": "orphan",
+                "parent_id": "missing-parent",
+                "kind": "message",
+                "payload": {"role": "assistant", "text": "invalid"},
+            },
+        },
+        {**common, "sequence": 3, "record_type": "closed"},
+    ]
+
+
+async def _session_tree_demo(case: str) -> int:
+    workspace = Path(tempfile.mkdtemp(prefix="coding-agent-session-tree-"))
+    jsonl_path = workspace / "session.jsonl"
+    if case == "invalid-entry":
+        jsonl_path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in _invalid_session_records()
+            ),
+            encoding="utf-8",
+        )
+        try:
+            AgentKernel.with_resumed_session(
+                FakeProvider(()), JsonlSessionStore(jsonl_path), "session-invalid"
+            )
+        except SessionError as exc:
+            _print_record(
+                {
+                    "session_rejected": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "jsonl_path": str(jsonl_path),
+                    }
+                }
+            )
+            return 1
+        raise AssertionError("invalid Session history was accepted")
+
+    ids = iter(("entry-0001", "entry-0002", "entry-0003"))
+    first_provider = FakeProvider(((ProviderTextDelta("original route"), ProviderDone()),))
+    kernel = AgentKernel.with_new_session(
+        first_provider,
+        JsonlSessionStore(jsonl_path),
+        session_id="session-demo",
+        configuration={"provider": "fake", "schema_version": 1},
+        entry_id_factory=lambda: next(ids),
+    )
+    for event in kernel.drain_session_events():
+        _print_record(_event_record(event))
+    fork_parent = kernel.session_active_leaf_id
+    await _run_session_message(kernel)
+    kernel.close_session()
+
+    reloaded_store = JsonlSessionStore(jsonl_path)
+    second_provider = FakeProvider(((ProviderTextDelta("alternate route"), ProviderDone()),))
+    resumed = AgentKernel.with_resumed_session(
+        second_provider,
+        reloaded_store,
+        "session-demo",
+        entry_id_factory=iter(("entry-0004", "entry-0005")).__next__,
+    )
+    for event in resumed.drain_session_events():
+        _print_record(_event_record(event))
+    resumed.fork_session(fork_parent)
+    for event in resumed.drain_session_events():
+        _print_record(_event_record(event))
+    await _run_session_message(resumed)
+    resumed.close_session()
+
+    _print_record(
+        {
+            "session_tree": {
+                "session_id": resumed.session_id,
+                "branches": [
+                    [entry.entry_id for entry in branch] for branch in resumed.session_branches
+                ],
+                "active_branch": [entry.entry_id for entry in resumed.session_active_branch],
+                "active_messages": [
+                    str(entry.payload["text"])
+                    for entry in resumed.session_active_branch
+                    if entry.kind == "message"
+                ],
+            }
+        }
+    )
+    records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    _print_record({"jsonl": {"path": str(jsonl_path), "records": records}})
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m coding_agent")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -269,6 +381,15 @@ def _parser() -> argparse.ArgumentParser:
         default="success",
         help="scripted tool-loop scenario",
     )
+    session_tree = demos.add_parser(
+        "session-tree", help="create, reload, resume, and fork an inspectable Session tree"
+    )
+    session_tree.add_argument(
+        "--case",
+        choices=("success", "invalid-entry"),
+        default="success",
+        help="scripted Session persistence outcome",
+    )
     return parser
 
 
@@ -280,4 +401,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_streamed_run_demo(args.case))
     if args.command == "demo" and args.demo == "tool-loop":
         return asyncio.run(_tool_loop_demo(args.case))
+    if args.command == "demo" and args.demo == "session-tree":
+        return asyncio.run(_session_tree_demo(args.case))
     raise AssertionError("argparse accepted an unsupported command")

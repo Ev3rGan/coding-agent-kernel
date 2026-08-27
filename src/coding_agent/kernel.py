@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 from functools import partial
 from itertools import count
 
@@ -11,6 +11,7 @@ from coding_agent.events import (
     AgentError,
     AgentEvent,
     AgentEventKind,
+    AgentSessionEvent,
     AssistantMessage,
     AssistantMessageAccumulator,
     ProviderAbort,
@@ -27,6 +28,7 @@ from coding_agent.provider import (
     UserMessage,
 )
 from coding_agent.run import AgentRun
+from coding_agent.session import Session, SessionEntry, SessionStore
 from coding_agent.tool_runtime import ToolRuntime
 
 
@@ -66,16 +68,104 @@ def _provider_failure_events(
 class AgentKernel:
     """Create AgentRun handles while keeping AgentLoop state behind one seam."""
 
-    def __init__(self, provider: ModelProvider, *, tool_runtime: ToolRuntime | None = None) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        tool_runtime: ToolRuntime | None = None,
+        session: Session | None = None,
+    ) -> None:
         self._provider = provider
         self._tool_runtime = tool_runtime
+        self._session = session
         self._run_numbers = count(1)
+
+    @classmethod
+    def with_new_session(
+        cls,
+        provider: ModelProvider,
+        store: SessionStore,
+        *,
+        configuration: Mapping[str, object],
+        session_id: str | None = None,
+        entry_id_factory: Callable[[], str] | None = None,
+        tool_runtime: ToolRuntime | None = None,
+    ) -> AgentKernel:
+        """Create a Kernel that owns a new durable Session."""
+
+        session = Session.create(
+            store,
+            configuration=configuration,
+            session_id=session_id,
+            entry_id_factory=entry_id_factory,
+        )
+        return cls(provider, tool_runtime=tool_runtime, session=session)
+
+    @classmethod
+    def with_resumed_session(
+        cls,
+        provider: ModelProvider,
+        store: SessionStore,
+        session_id: str,
+        *,
+        entry_id_factory: Callable[[], str] | None = None,
+        tool_runtime: ToolRuntime | None = None,
+    ) -> AgentKernel:
+        """Create a Kernel after validating and resuming persisted Session history."""
+
+        session = Session.resume(
+            store,
+            session_id,
+            entry_id_factory=entry_id_factory,
+        )
+        return cls(provider, tool_runtime=tool_runtime, session=session)
+
+    @property
+    def session_id(self) -> str:
+        return self._require_session().session_id
+
+    @property
+    def session_active_leaf_id(self) -> str:
+        return self._require_session().active_leaf_id
+
+    @property
+    def session_active_branch(self) -> tuple[SessionEntry, ...]:
+        return self._require_session().active_branch
+
+    @property
+    def session_branches(self) -> tuple[tuple[SessionEntry, ...], ...]:
+        return self._require_session().branches
+
+    def drain_session_events(self) -> tuple[AgentSessionEvent, ...]:
+        """Expose pending Session observations to a Host exactly once."""
+
+        return self._require_session().drain_events()
+
+    def fork_session(self, entry_id: str) -> None:
+        self._require_session().fork(entry_id)
+
+    def close_session(self) -> None:
+        self._require_session().close()
+
+    def _require_session(self) -> Session:
+        if self._session is None:
+            raise RuntimeError("This AgentKernel does not own a Session.")
+        return self._session
 
     def create_run(self, prompt: str) -> AgentRun:
         """Start one Agent Run for the supplied user input."""
 
         run_id = f"run-{next(self._run_numbers)}"
-        return AgentRun(run_id, self._agent_events(run_id=run_id, prompt=prompt))
+        initial_events: tuple[AgentSessionEvent, ...] = ()
+        if self._session is not None:
+            self._session.record_user_message(prompt, run_id=run_id)
+            initial_events = self._session.drain_events()
+        return AgentRun(
+            run_id,
+            self._agent_events(run_id=run_id, prompt=prompt),
+            session=self._session,
+            initial_events=initial_events,
+        )
 
     async def _agent_events(self, *, run_id: str, prompt: str) -> AsyncIterator[AgentEvent]:
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
