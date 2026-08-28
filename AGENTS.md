@@ -2,7 +2,7 @@
 
 ## Repository identity
 
-- Work only in the independent Git repository rooted at `D:\AgentDev\coding-agent-dev`.
+- Work only in the independent Git repository whose root contains this `AGENTS.md`.
 - The canonical GitHub repository is `Ev3rGan/coding-agent-kernel`.
 - The default branch is `main`.
 - The canonical `origin` is `git@github.com:Ev3rGan/coding-agent-kernel.git`; keep Git operations on SSH rather than replacing it with an HTTPS remote.
@@ -12,7 +12,7 @@
 
 Before any Git or GitHub mutation:
 
-1. Run `git rev-parse --show-toplevel` and require the exact repository root above. The parent directory `D:\AgentDev` is a separate Git repository and is outside this project's scope.
+1. Run `git rev-parse --show-toplevel`, resolve the result to a physical path, and require it to equal the directory containing this root `AGENTS.md`. A parent directory may be a separate Git repository and remains outside this project's scope.
 2. Run `git status --short --branch` and inspect all existing changes without assuming the worktree is clean.
 3. Run `git remote -v` and confirm the canonical SSH remote before fetching, pushing, or publishing.
 4. For GitHub-side changes, run `gh auth status` and confirm the active account is `Ev3rGan`.
@@ -26,6 +26,10 @@ The preflight is complete only when the physical root, current branch, existing 
 - Treat commits, pushes, pull requests, releases, visibility changes, repository settings, branch deletion, history rewrites, and force pushes as explicit user-authorized actions.
 - Prefer non-destructive, non-interactive Git commands. Never use `git reset --hard`, `git clean`, or force-push as a recovery shortcut.
 - Keep secrets and machine-specific credentials out of commits and command output.
+- Before creating a local commit, require `git config --get user.email` to be a GitHub-provided `@users.noreply.github.com` address.
+- Repository-local Git configuration controls command-line commits only. Before a GitHub-generated merge commit, keep the account setting **Keep my email addresses private** enabled so GitHub uses the account's `noreply` commit address.
+- Do not put developer-specific absolute workspace paths in tracked documentation; use `<repo-root>` or derive the root with `git rev-parse --show-toplevel`.
+- Do not rewrite published history only to normalize a non-secret historical author email unless the user separately authorizes the rewrite after all affected refs, pull requests, and worktrees have been audited.
 
 ## Connection and verification
 
