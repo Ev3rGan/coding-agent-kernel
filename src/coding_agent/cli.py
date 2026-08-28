@@ -58,7 +58,7 @@ def _error_record(error: AgentError) -> dict[str, str]:
 
 
 def _tool_result_record(result: ToolResult) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "call_id": result.call_id,
         "tool_name": result.tool_name,
         "status": result.status,
@@ -67,6 +67,9 @@ def _tool_result_record(result: ToolResult) -> dict[str, Any]:
         if result.error is None
         else {"code": result.error.code, "message": result.error.message},
     }
+    if result.note:
+        record["note"] = result.note
+    return record
 
 
 def _event_record(event: AgentSessionEvent) -> dict[str, Any]:

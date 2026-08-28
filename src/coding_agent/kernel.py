@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from itertools import count
 
@@ -427,12 +428,13 @@ class AgentKernel:
                 )
                 blocked_results: dict[str, ToolResult] = {}
                 for call, reason in blocked:
+                    call_mode = self._tool_runtime.batch_mode((call,))
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_EXECUTION_START,
                         run_id=run_id,
                         turn_id=turn_id,
                         tool_call=call,
-                        batch_mode="sequential",
+                        batch_mode=call_mode,
                     )
                     result = ToolResult(
                         call.call_id,
@@ -447,7 +449,7 @@ class AgentKernel:
                         run_id=run_id,
                         turn_id=turn_id,
                         tool_result=result,
-                        batch_mode="sequential",
+                        batch_mode=call_mode,
                     )
                 if not resolved:
                     executor = blocked_results
@@ -516,19 +518,24 @@ class AgentKernel:
                             batch_mode=batch.mode,
                         )
                     executor = {**blocked_results, **results_by_id}
-                # 结果按模型生成的 tool_calls 原始顺序对齐，blocked 的用 error 占位。
-                results = tuple(
-                    executor[call.call_id] for call in message.tool_calls
-                    if call.call_id in executor
-                )
                 for call in message.tool_calls:
                     if call.call_id in executor:
-                        await self._run_hook(
+                        decision, _ = await self._run_hook(
                             HookName.TOOL_RESULT,
                             run_id=run_id,
                             turn_id=turn_id,
                             tool_result=executor[call.call_id],
                         )
+                        note = decision.get("tool_result_supplement")
+                        if isinstance(note, str) and note:
+                            executor[call.call_id] = replace(
+                                executor[call.call_id], note=note
+                            )
+                # 结果按模型生成的 tool_calls 原始顺序对齐，blocked 的用 error 占位。
+                results = tuple(
+                    executor[call.call_id] for call in message.tool_calls
+                    if call.call_id in executor
+                )
                 tool_results = ToolResultMessage(results=results)
                 history.append(tool_results)
                 next_injected = (tool_results,)

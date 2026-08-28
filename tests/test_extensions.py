@@ -326,3 +326,97 @@ def test_tool_call_transform_composes_in_registration_order(
         assert observer.seen == "shout"
 
     asyncio.run(scenario())
+
+
+class _NoteExtension:
+    """An Extension that attaches a model-visible note to every ToolResult."""
+
+    @property
+    def name(self) -> str:
+        return "note"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_RESULT, self._note)
+
+    def _note(self, input_: HookInput) -> HookResult:
+        if input_.tool_result is None:
+            return HookResult.observe()
+        return HookResult.supplement_tool_result(
+            ToolResultSupplement(f"reviewed:{input_.tool_result.tool_name}")
+        )
+
+
+class _CallIdMutatorExtension:
+    """An Extension that illegally rewrites a ToolCall's call_id."""
+
+    @property
+    def name(self) -> str:
+        return "id-mutator"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_CALL, self._mutate)
+
+    def _mutate(self, input_: HookInput) -> HookResult:
+        call = input_.tool_call
+        if call is not None and call.tool_name == "read":
+            return HookResult.transform_tool_call(
+                ToolCall("different-id", "shout", {"text": "x"})
+            )
+        return HookResult.observe()
+
+
+def test_tool_result_supplement_becomes_model_visible_note(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        runtime.register(ShoutTool())
+        runtime.enable("shout")
+        provider = FakeProvider(
+            [
+                _tool_call_script("note-1", "shout", {"text": "hi"}),
+                (ProviderTextDelta("done"), ProviderDone()),
+            ]
+        )
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_NoteExtension()],
+        )
+        run = kernel.create_run("note")
+        await _collect(run)
+        asserted = False
+        for request in provider.requests:
+            for message in request.messages:
+                if getattr(message, "role", None) == "tool":
+                    for result in message.results:
+                        if result.note:
+                            assert result.note == "reviewed:shout"
+                            asserted = True
+        assert asserted
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_transform_may_not_change_call_id(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        provider = FakeProvider(
+            [
+                _tool_call_script("mutate-1", "read", {"path": "x.py"}),
+                (ProviderTextDelta("done"), ProviderDone()),
+            ]
+        )
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_CallIdMutatorExtension()],
+        )
+        run = kernel.create_run("mutate")
+        await _collect(run)
+        result = await run.result()
+        assert result.state is AgentRunState.SETTLED
+        assert any(
+            event.kind.value == "hook_error" and event.extension == "id-mutator"
+            for event in kernel.extension_events
+        )
+
+    asyncio.run(scenario())

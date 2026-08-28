@@ -300,6 +300,10 @@ class ExtensionRuntime:
             if input_.tool_call is None:
                 raise ExtensionError("tool_call transform requires a ToolCall input")
             call = result.tool_call
+            if call.call_id != input_.tool_call.call_id:
+                raise ExtensionError(
+                    f"{extension} must preserve the original call_id in a ToolCall transform"
+                )
             if not call.call_id or not call.tool_name or type(call.arguments) is not dict:
                 raise ExtensionError(f"{extension} produced an invalid ToolCall transform")
             decision["tool_call"] = call
