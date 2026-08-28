@@ -1,5 +1,34 @@
 # Coding Agent Kernel
 
+## 固定 Extension 合约
+
+`AgentKernel` 接受调用方按顺序显式构造的普通 Python Extension 实例。Extension
+只能通过固定 registry 注册 Tool、Provider、custom `SessionEntry` type 与 Hook
+handler；没有目录扫描、entry point、自动发现或热重载。Hook 只接收不可变的类型化
+快照，合法的 transform/supplement 会在交给下一 handler 前由 Kernel 重新验证。
+Extension Tool 继续使用既有 `ToolRuntime` 的 schema、调度、取消与 structured
+`ToolResult` 路径；custom entry 继续使用 append-only Session/Store 路径。
+
+运行三个确定性场景：
+
+```console
+python -m coding_agent demo extensions
+python -m coding_agent demo extensions --case ordering
+python -m coding_agent demo extensions --case invalid-mutation
+```
+
+默认场景显式加载示例 Extension，执行自定义 Tool、向 canonical Model Context
+补充资源、确定性阻断一个 ToolCall，并持久化已注册的 custom SessionEntry。
+`ordering` 展示两个 Extension 按实例顺序和 handler 顺序组合，以及每次改变后的
+revalidation；`invalid-mutation` 将 handler 异常转换为明确失败，不调用 Provider、
+不污染 Session，也不打印 traceback。
+
+`ExtensionEvent` 通过 `AgentKernel.drain_extension_events()` 独立消费；它记录
+registration、dispatch、outcome/revalidation、block/rejection/failure，但绝不会自动
+混入 `AgentRun` 的公开 `AgentSessionEvent` Event Stream。本能力借鉴 Pi/Tau 的
+registration 与 Hook 思路，简化自动发现、TUI 与热重载，并深化固定状态所有权、
+确定性组合和逐次重验证规则。
+
 ## 可恢复、可分支的 Session
 
 Kernel 现在提供持久化的 append-only Session tree。每个不可变
@@ -77,6 +106,21 @@ outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表�
 
 An independently implemented Python kernel for coding agents, focused on
 runtime semantics, tool execution, sessions, and observable event streams.
+
+## Fixed Extension contract
+
+Callers pass explicitly constructed Python Extension instances to `AgentKernel` in a
+defined order. The fixed registry accepts Tools, Providers, custom SessionEntry types,
+and Hook handlers only. Every transform or supplement is revalidated before the next
+handler, custom Tools remain inside ToolRuntime, and custom entries remain inside the
+append-only Session/Store path. `ExtensionEvent` is drained independently from the
+Kernel and is never inserted into the public AgentSessionEvent stream.
+
+Run `python -m coding_agent demo extensions`, then use `--case ordering` and
+`--case invalid-mutation` to inspect successful capability use, deterministic
+composition, and explicit rejection without state damage. The design borrows the
+registration and Hook ideas from Pi/Tau, omits discovery/TUI/hot reload, and deepens
+Kernel-owned state and deterministic revalidation.
 
 The Kernel now provides a deterministic, observable model-tool-model loop. A
 thin Terminal CLI drives the same public `AgentKernel`/`AgentRun` seam that
@@ -166,7 +210,7 @@ async def observe_run() -> None:
 
 `AgentRun.state` is one of `active`, `settled`, `cancelled`, or `failed`.
 `AgentRun.cancel()` cancels active Provider or Tool Execution work. Model
-Real Providers, Permission Policy, and Extensions remain later-ticket work.
+Real Providers and Permission Policy remain later-ticket work.
 The implemented Context pipeline projects only the selected Active Branch and
 explicitly injected messages before every Provider call.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from coding_agent import (
     SessionStore,
     UserMessage,
 )
+from coding_agent.session import PersistenceRecord
 
 
 @pytest.fixture(params=("memory", "jsonl"))
@@ -117,7 +119,7 @@ def test_session_operations_expose_configuration_entry_resume_and_active_branch_
 
 def test_jsonl_rejects_corrupt_illegal_and_incomplete_recovery(tmp_path: Path) -> None:
     corrupt_path = tmp_path / "corrupt.jsonl"
-    corrupt_path.write_text('{"schema":', encoding="utf-8")
+    corrupt_path.write_text('{"schema":\n', encoding="utf-8")
     with pytest.raises(SessionCorruptionError, match="Invalid JSON"):
         Session.resume(JsonlSessionStore(corrupt_path), "broken")
 
@@ -138,6 +140,141 @@ def test_jsonl_rejects_corrupt_illegal_and_incomplete_recovery(tmp_path: Path) -
     Session.create(incomplete, session_id="active", configuration={"provider": "fake"})
     with pytest.raises(SessionStateError, match="no close record"):
         Session.resume(incomplete, "active")
+
+
+def test_jsonl_custom_entry_batch_recovers_as_all_or_nothing_after_interrupted_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "transactional-batch.jsonl"
+    store = JsonlSessionStore(path)
+    ids = iter(("root", "first", "second", "retry-first", "retry-second"))
+    session = Session.create(
+        store,
+        session_id="transactional-batch",
+        configuration={"provider": "fake"},
+        entry_id_factory=lambda: next(ids),
+        entry_types={"audit": lambda payload: None},
+    )
+    before = store.load(session.session_id)
+
+    def interrupt(payload: str) -> None:
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload[: len(payload) // 2])
+        raise OSError("injected batch interruption")
+
+    monkeypatch.setattr(store, "_append_text", interrupt, raising=False)
+    with pytest.raises(OSError, match="injected batch interruption"):
+        session.append_custom_many((("audit", {"note": "first"}), ("audit", {"note": "second"})))
+
+    assert store.load(session.session_id) == before
+    assert [entry.kind for entry in session.active_branch] == ["configuration"]
+
+    monkeypatch.undo()
+    entries = session.append_custom_many(
+        (("audit", {"note": "retry first"}), ("audit", {"note": "retry second"}))
+    )
+    assert [entry.entry_id for entry in entries] == ["retry-first", "retry-second"]
+    assert [record.sequence for record in store.load(session.session_id)] == [1, 2, 3]
+
+
+def test_jsonl_batch_fsync_failure_rolls_back_before_reporting_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "fsync-failure.jsonl"
+    store = JsonlSessionStore(path)
+    ids = iter(("root", "audit"))
+    session = Session.create(
+        store,
+        session_id="fsync-failure",
+        configuration={"provider": "fake"},
+        entry_id_factory=lambda: next(ids),
+        entry_types={"audit": lambda payload: None},
+    )
+    before = store.load(session.session_id)
+    real_fsync = os.fsync
+    call_count = 0
+
+    def fail_first_fsync(file_descriptor: int) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise OSError("injected fsync failure")
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        session.append_custom("audit", {"note": "must roll back"})
+
+    assert call_count == 2
+    assert store.load(session.session_id) == before
+    assert [entry.kind for entry in session.active_branch] == ["configuration"]
+
+
+def test_jsonl_repairs_delimiterless_interrupted_record_before_next_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "delimiterless-tail.jsonl"
+    store = JsonlSessionStore(path)
+    interrupted = PersistenceRecord("delimiterless", 1, "closed")
+    authoritative = PersistenceRecord("delimiterless", 1, "resumed")
+
+    def write_without_delimiter(payload: str) -> None:
+        path.write_text(payload.rstrip("\n"), encoding="utf-8")
+        raise OSError("injected missing delimiter")
+
+    monkeypatch.setattr(store, "_append_text", write_without_delimiter)
+    with pytest.raises(OSError, match="injected missing delimiter"):
+        store.append(interrupted)
+    assert store.load("delimiterless") == ()
+
+    monkeypatch.undo()
+    store.append(authoritative)
+    assert store.load("delimiterless") == (authoritative,)
+
+
+def test_jsonl_ignores_and_repairs_crash_truncated_tail_after_committed_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "crash-tail.jsonl"
+    store = JsonlSessionStore(path)
+    first = PersistenceRecord("crash-tail", 1, "closed")
+    second = PersistenceRecord("crash-tail", 2, "resumed")
+    store.append(first)
+    with path.open("ab") as stream:
+        stream.write(b'{"schema":')
+
+    assert store.load("crash-tail") == (first,)
+    store.append(second)
+    assert store.load("crash-tail") == (first, second)
+
+
+def test_jsonl_ignores_and_repairs_a_crash_truncated_first_frame(tmp_path: Path) -> None:
+    path = tmp_path / "first-frame-crash.jsonl"
+    path.write_bytes(b'{"schema":')
+    store = JsonlSessionStore(path)
+    authoritative = PersistenceRecord("first-frame-crash", 1, "closed")
+
+    assert store.load("first-frame-crash") == ()
+    store.append(authoritative)
+    assert store.load("first-frame-crash") == (authoritative,)
+
+
+def test_recursive_session_payload_is_rejected_without_persistence() -> None:
+    store = InMemorySessionStore()
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+
+    with pytest.raises(SessionCorruptionError, match="JSON serializable"):
+        Session.create(
+            store,
+            session_id="recursive-payload",
+            configuration=recursive,
+        )
+
+    assert store.load("recursive-payload") == ()
 
 
 def test_compaction_checkpoint_reloads_as_summary_plus_entries_after_checkpoint(

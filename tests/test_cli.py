@@ -232,3 +232,65 @@ def test_run_control_cli_renders_queue_retry_and_session_evidence(capsys: Any) -
     assert retry["remaining"] == 1
     retry_evidence = retried[-1]["run_control"]
     assert retry_evidence["same_request_retried"] is True
+
+
+def test_extensions_cli_runs_tool_block_context_and_custom_session_entry(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "extensions"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+    summary = records[-1]["extensions"]
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert summary["case"] == "success"
+    assert summary["custom_tool_result"]["status"] == "success"
+    assert summary["custom_tool_result"]["output"] == {"echo": "allowed"}
+    assert summary["blocked_tool_result"]["status"] == "error"
+    assert summary["blocked_tool_result"]["error"]["code"] == "extension_blocked"
+    assert summary["context_project_context"] == ["EXAMPLE_EXTENSION_CONTEXT"]
+    assert summary["custom_session_entries"] == [
+        {"kind": "extension_audit", "payload": {"note": "terminal:settled"}}
+    ]
+    assert summary["extension_events_separate"] is True
+    assert summary["terminal_state"] == "settled"
+
+
+def test_extensions_ordering_cli_exposes_transform_and_supplement_order(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "extensions", "--case", "ordering"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+    summary = records[-1]["extensions"]
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert summary["input"] == "ordering|ONE|TWO"
+    assert summary["context_project_context"] == ["ONE", "TWO"]
+    assert summary["ordered_outcomes"] == [
+        {"extension": "ordering-one", "hook": "input", "outcome": "transform"},
+        {"extension": "ordering-two", "hook": "input", "outcome": "transform"},
+        {"extension": "ordering-one", "hook": "context", "outcome": "supplement"},
+        {"extension": "ordering-two", "hook": "context", "outcome": "supplement"},
+    ]
+    assert summary["all_changes_revalidated"] is True
+
+
+def test_extensions_invalid_mutation_cli_rejects_without_traceback_or_damage(
+    capsys: Any,
+) -> None:
+    exit_code = main(["demo", "extensions", "--case", "invalid-mutation"])
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+    summary = records[-1]["extensions"]
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert summary["terminal_state"] == "failed"
+    assert summary["error"]["source"] == "extension"
+    assert summary["error"]["code"] == "extension_input_rejected"
+    assert summary["provider_calls"] == 0
+    assert summary["session_unchanged"] is True
+    assert summary["handler_failure_observed"] is True

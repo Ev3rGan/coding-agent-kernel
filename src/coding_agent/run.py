@@ -19,11 +19,14 @@ from coding_agent.events import (
     PendingMessage,
     PendingMessageKind,
 )
+from coding_agent.extensions import ExtensionError
 from coding_agent.session import Session
 
 _STREAM_END: Final = object()
 RunSourceEvent = AgentEvent | AgentSessionEvent
 RunSourceFactory = Callable[[RunControl], AsyncIterator[RunSourceEvent]]
+RunEventObserver = Callable[[RunSourceEvent], None]
+RunSettledObserver = Callable[[AgentRunResult], tuple[AgentSessionEvent, ...]]
 
 
 class AgentRun(AsyncIterator[AgentSessionEvent]):
@@ -36,6 +39,8 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         *,
         session: Session | None = None,
         initial_events: tuple[AgentSessionEvent, ...] = (),
+        event_observer: RunEventObserver | None = None,
+        settled_observer: RunSettledObserver | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
         self._run_id = run_id
@@ -48,6 +53,9 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         self._control = RunControl(run_id)
         self._terminal_lock = asyncio.Lock()
         self._cancel_requested = False
+        self._event_observer = event_observer
+        self._settled_observer = settled_observer
+        self._settled_observed = False
         self._worker = loop.create_task(
             self._drive(source_factory(self._control), initial_events), name=f"agent-run:{run_id}"
         )
@@ -142,17 +150,20 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
     ) -> None:
         authoritative_message = None
         failure = None
+        terminal_state = AgentRunState.FAILED
+        terminal_message: AssistantMessage | None = None
+        terminal_error: AgentError | None = None
         try:
             for event in initial_events:
                 await self._events.put(event)
             async for source_event in source:
                 if isinstance(source_event, AgentSessionEvent):
-                    await self._events.put(source_event)
+                    await self._publish_session_events((source_event,))
                     continue
                 agent_event = source_event
                 if self._session is not None:
-                    for session_event in self._session.drain_events():
-                        await self._events.put(session_event)
+                    await self._publish_session_events(self._session.drain_events())
+                self._observe(agent_event)
                 await self._events.put(AgentSessionEvent.from_agent_event(agent_event))
                 if agent_event.kind is AgentEventKind.MESSAGE_END:
                     authoritative_message = agent_event.message
@@ -160,42 +171,91 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
                         self._session.record_authoritative_message(
                             authoritative_message, run_id=self._run_id
                         )
-                        for session_event in self._session.drain_events():
-                            await self._events.put(session_event)
+                        await self._publish_session_events(self._session.drain_events())
                 elif agent_event.kind is AgentEventKind.ERROR:
                     failure = agent_event.error
 
             if failure is not None:
-                await self._finish(AgentRunState.FAILED, error=failure)
+                terminal_error = failure
             elif authoritative_message is not None:
-                await self._finish(AgentRunState.SETTLED, message=authoritative_message)
+                terminal_state = AgentRunState.SETTLED
+                terminal_message = authoritative_message
             else:
-                await self._finish(
-                    AgentRunState.FAILED,
-                    error=AgentError(
-                        code="kernel_missing_result",
-                        message="AgentLoop ended without an authoritative message or error.",
-                        source="kernel",
-                    ),
+                terminal_error = AgentError(
+                    code="kernel_missing_result",
+                    message="AgentLoop ended without an authoritative message or error.",
+                    source="kernel",
                 )
         except asyncio.CancelledError:
-            await self._finish(AgentRunState.CANCELLED)
+            terminal_state = AgentRunState.CANCELLED
         except Exception as exc:
-            error = AgentError(
-                code="kernel_exception",
+            is_extension_error = isinstance(exc, ExtensionError)
+            terminal_error = AgentError(
+                code=("extension_dispatch_error" if is_extension_error else "kernel_exception"),
                 message=f"{type(exc).__name__}: {exc}",
-                source="kernel",
+                source="extension" if is_extension_error else "kernel",
             )
             await self._events.put(
                 AgentSessionEvent.from_agent_event(
                     AgentEvent(
                         kind=AgentEventKind.ERROR,
                         run_id=self._run_id,
-                        error=error,
+                        error=terminal_error,
                     )
                 )
             )
-            await self._finish(AgentRunState.FAILED, error=error)
+        finally:
+            close_source = getattr(source, "aclose", None)
+            if callable(close_source):
+                try:
+                    await close_source()
+                except asyncio.CancelledError:
+                    terminal_state = AgentRunState.CANCELLED
+                    terminal_message = None
+                    terminal_error = None
+                except Exception as exc:
+                    is_extension_error = isinstance(exc, ExtensionError)
+                    terminal_state = AgentRunState.FAILED
+                    terminal_message = None
+                    terminal_error = AgentError(
+                        code=(
+                            "extension_dispatch_error" if is_extension_error else "kernel_exception"
+                        ),
+                        message=f"source cleanup failed: {type(exc).__name__}: {exc}",
+                        source="extension" if is_extension_error else "kernel",
+                    )
+                    await self._events.put(
+                        AgentSessionEvent.from_agent_event(
+                            AgentEvent(
+                                kind=AgentEventKind.ERROR,
+                                run_id=self._run_id,
+                                error=terminal_error,
+                            )
+                        )
+                    )
+            try:
+                await self._finish(
+                    terminal_state,
+                    message=terminal_message,
+                    error=terminal_error,
+                )
+            except Exception as exc:
+                is_extension_error = isinstance(exc, ExtensionError)
+                terminal_error = AgentError(
+                    code=("extension_dispatch_error" if is_extension_error else "kernel_exception"),
+                    message=f"{type(exc).__name__}: {exc}",
+                    source="extension" if is_extension_error else "kernel",
+                )
+                await self._events.put(
+                    AgentSessionEvent.from_agent_event(
+                        AgentEvent(
+                            kind=AgentEventKind.ERROR,
+                            run_id=self._run_id,
+                            error=terminal_error,
+                        )
+                    )
+                )
+                await self._finish(AgentRunState.FAILED, error=terminal_error)
 
     async def _finish(
         self,
@@ -214,7 +274,35 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
                 message=message,
                 error=error,
             )
+            if self._settled_observer is not None and not self._settled_observed:
+                self._settled_observed = True
+                try:
+                    await self._publish_session_events(self._settled_observer(result))
+                except ExtensionError:
+                    # agent_settled runs after the canonical result is fixed; its
+                    # separate ExtensionEvent failure cannot rewrite that terminal.
+                    pass
             self._state = state
             self._events.put_nowait(AgentSessionEvent.from_result(result))
             self._result.set_result(result)
             self._events.put_nowait(_STREAM_END)
+
+    def _observe(self, event: RunSourceEvent) -> None:
+        if self._event_observer is not None:
+            self._event_observer(event)
+
+    async def _publish_session_events(
+        self,
+        events: tuple[AgentSessionEvent, ...],
+    ) -> None:
+        """Publish and observe all post-commit events without rewriting Session state."""
+
+        for event in events:
+            await self._events.put(event)
+        for event in events:
+            try:
+                self._observe(event)
+            except ExtensionError:
+                # Session observation is post-commit. ExtensionEvent records the
+                # failure; the canonical operation and remaining Hooks continue.
+                continue

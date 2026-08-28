@@ -30,8 +30,10 @@ from coding_agent.events import (
     ToolResult,
     assistant_message_record,
 )
+from coding_agent.extensions import ExtensionEvent, ExtensionEventKind
+from coding_agent.extensions_example import ExtensionDemoCase, run_extension_demo
 from coding_agent.kernel import AgentKernel
-from coding_agent.provider import FakeProvider, ModelMessage, UserMessage
+from coding_agent.provider import FakeProvider, ModelMessage, ToolResultMessage, UserMessage
 from coding_agent.session import JsonlSessionStore, Session, SessionError
 from coding_agent.tool_runtime import ToolRuntime
 
@@ -136,6 +138,20 @@ def _result_record(result: AgentRunResult) -> dict[str, Any]:
     if result.error is not None:
         result_record["error"] = _error_record(result.error)
     return record
+
+
+def _extension_event_record(event: ExtensionEvent) -> dict[str, Any]:
+    return {
+        "sequence": event.sequence,
+        "event": event.kind.value,
+        "extension": event.extension_name,
+        "hook": None if event.hook is None else event.hook.value,
+        "capability": event.capability,
+        "outcome": event.outcome,
+        "revalidated": event.revalidated,
+        "code": event.code,
+        "message": event.message,
+    }
 
 
 def _print_record(record: dict[str, Any]) -> None:
@@ -266,7 +282,7 @@ async def _run_control_demo(case: str) -> int:
                         for request in requests
                     ],
                     "same_request_retried": len(requests) > 1
-                    and all(request is requests[0] for request in requests[1:]),
+                    and all(request == requests[0] for request in requests[1:]),
                     "session_user_messages": session_user_messages,
                     "injected_messages": [
                         event.pending_message.text
@@ -287,6 +303,98 @@ async def _run_control_demo(case: str) -> int:
             "retry-failure": AgentRunState.FAILED,
         }[case]
         return 0 if result.state is expected else 1
+
+
+async def _extensions_demo(case: ExtensionDemoCase) -> int:
+    report = await run_extension_demo(case)
+    for session_event in report.events:
+        _print_record(_event_record(session_event))
+    _print_record(_result_record(report.result))
+    for extension_event in report.extension_events:
+        _print_record({"extension_event": _extension_event_record(extension_event)})
+
+    tool_results = [
+        result
+        for request in report.provider_requests
+        for message in request.messages
+        if isinstance(message, ToolResultMessage)
+        for result in message.results
+    ]
+    by_call_id = {result.call_id: result for result in tool_results}
+    changes = [
+        event
+        for event in report.extension_events
+        if event.kind is ExtensionEventKind.HANDLER_OUTCOME
+        and event.outcome in {"transform", "supplement"}
+    ]
+    error = report.result.error
+    summary: dict[str, Any] = {
+        "case": case,
+        "terminal_state": report.result.state.value,
+        "provider_calls": len(report.provider_requests),
+        "context_project_context": (
+            []
+            if not report.provider_requests
+            else list(report.provider_requests[0].project_context)
+        ),
+        "input": (
+            None
+            if not report.provider_requests or not report.provider_requests[0].messages
+            else getattr(report.provider_requests[0].messages[-1], "text", None)
+        ),
+        "custom_tool_result": (
+            None if "allowed" not in by_call_id else _tool_result_record(by_call_id["allowed"])
+        ),
+        "blocked_tool_result": (
+            None if "blocked" not in by_call_id else _tool_result_record(by_call_id["blocked"])
+        ),
+        "custom_session_entries": [
+            {"kind": entry.kind, "payload": entry.payload}
+            for entry in report.session_entries
+            if entry.kind not in {"configuration", "message", "compaction"}
+        ],
+        "ordered_outcomes": [
+            {
+                "extension": event.extension_name,
+                "hook": None if event.hook is None else event.hook.value,
+                "outcome": event.outcome,
+            }
+            for event in changes
+        ],
+        "all_changes_revalidated": all(event.revalidated for event in changes),
+        "extension_events_separate": not any(
+            event.kind.value in {kind.value for kind in ExtensionEventKind}
+            for event in report.events
+        ),
+        "session_unchanged": [entry.kind for entry in report.session_entries] == ["configuration"],
+        "handler_failure_observed": any(
+            event.kind is ExtensionEventKind.HANDLER_FAILED for event in report.extension_events
+        ),
+        "error": None if error is None else _error_record(error),
+        "jsonl_path": str(report.jsonl_path),
+    }
+    _print_record({"extensions": summary})
+
+    if case == "success":
+        return int(
+            report.result.state is not AgentRunState.SETTLED
+            or by_call_id.get("allowed") is None
+            or by_call_id.get("blocked") is None
+            or not summary["custom_session_entries"]
+        )
+    if case == "ordering":
+        return int(
+            report.result.state is not AgentRunState.SETTLED
+            or summary["input"] != "ordering|ONE|TWO"
+            or summary["context_project_context"] != ["ONE", "TWO"]
+            or not summary["all_changes_revalidated"]
+        )
+    return int(
+        report.result.state is not AgentRunState.FAILED
+        or len(report.provider_requests) != 0
+        or not summary["session_unchanged"]
+        or not summary["handler_failure_observed"]
+    )
 
 
 def _scripted_tool_call_events(
@@ -728,6 +836,16 @@ def _parser() -> argparse.ArgumentParser:
         default="steering",
         help="deterministic Agent Run control scenario",
     )
+    extensions = demos.add_parser(
+        "extensions",
+        help="run explicit Extension registration, ordering, and rejection scenarios",
+    )
+    extensions.add_argument(
+        "--case",
+        choices=("success", "ordering", "invalid-mutation"),
+        default="success",
+        help="deterministic Extension scenario",
+    )
     return parser
 
 
@@ -745,4 +863,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_context_compaction_demo(args.case))
     if args.command == "demo" and args.demo == "run-control":
         return asyncio.run(_run_control_demo(args.case))
+    if args.command == "demo" and args.demo == "extensions":
+        return asyncio.run(_extensions_demo(args.case))
     raise AssertionError("argparse accepted an unsupported command")
