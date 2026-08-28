@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast, get_args
+
+from coding_agent.json_contract import json_object_snapshot
 
 if TYPE_CHECKING:
     from coding_agent.session import SessionEntry
@@ -209,6 +212,61 @@ ProviderStreamEvent: TypeAlias = (
 )
 
 
+def validate_provider_stream_event(value: object) -> ProviderStreamEvent:
+    """Validate and snapshot one provider-owned normalized stream event."""
+
+    if not isinstance(value, get_args(ProviderStreamEvent)):
+        raise ValueError("Provider must emit a ProviderStreamEvent")
+    if not isinstance(value.kind, ProviderEventKind):
+        raise ValueError("ProviderStreamEvent kind is invalid")
+    if (
+        isinstance(value, ProviderStreamStart)
+        and value.model is not None
+        and not isinstance(value.model, str)
+    ):
+        raise ValueError("ProviderStreamStart model must be a string or None")
+    if isinstance(value, (ProviderTextDelta, ProviderThinkingDelta)) and not isinstance(
+        value.delta, str
+    ):
+        raise ValueError("Provider delta content must be a string")
+    if isinstance(value, ProviderToolCallStart):
+        if (
+            type(value.index) is not int
+            or value.index < 0
+            or not isinstance(value.call_id, str)
+            or not isinstance(value.tool_name, str)
+        ):
+            raise ValueError("Provider ToolCall start fields are invalid")
+    if isinstance(value, ProviderToolCallDelta):
+        if (
+            type(value.index) is not int
+            or value.index < 0
+            or not isinstance(value.call_id_delta, str)
+            or not isinstance(value.tool_name_delta, str)
+            or not isinstance(value.arguments_delta, str)
+        ):
+            raise ValueError("Provider ToolCall delta fields are invalid")
+    if isinstance(value, ProviderToolCallEnd) and (type(value.index) is not int or value.index < 0):
+        raise ValueError("Provider ToolCall end index is invalid")
+    if isinstance(value, ProviderUsage) and any(
+        type(tokens) is not int or tokens < 0
+        for tokens in (value.input_tokens, value.output_tokens)
+    ):
+        raise ValueError("Provider usage values are invalid")
+    if isinstance(value, ProviderDone) and (
+        not isinstance(value.stop_reason, str)
+        or (value.response_id is not None and not isinstance(value.response_id, str))
+    ):
+        raise ValueError("Provider done fields are invalid")
+    if isinstance(value, ProviderError) and (
+        not isinstance(value.code, str) or not value.code or not isinstance(value.message, str)
+    ):
+        raise ValueError("Provider error fields are invalid")
+    if isinstance(value, (ProviderAbort, ProviderCancelled)) and not isinstance(value.reason, str):
+        raise ValueError("Provider termination reason must be a string")
+    return copy.deepcopy(cast(ProviderStreamEvent, value))
+
+
 @dataclass(frozen=True, slots=True)
 class ToolCall:
     """A complete model-authored tool request."""
@@ -328,9 +386,14 @@ class AssistantMessageAccumulator:
             partial.arguments += event.arguments_delta
         elif isinstance(event, ProviderToolCallEnd):
             partial = self._partial_tool_calls.pop(event.index)
+            if not partial.call_id or not partial.tool_name:
+                raise ValueError("ToolCall ID and tool name must be non-empty")
+            if any(call.call_id == partial.call_id for call in self._completed_tool_calls.values()):
+                raise ValueError("ToolCall IDs must be unique within one provider response")
             parsed = json.loads(partial.arguments or "{}")
             if not isinstance(parsed, dict):
                 raise ValueError("ToolCall arguments must decode to an object")
+            parsed = json_object_snapshot(parsed, label="ToolCall arguments")
             self._completed_tool_calls[event.index] = ToolCall(
                 partial.call_id, partial.tool_name, parsed
             )
@@ -369,7 +432,7 @@ class AgentError:
 
     code: str
     message: str
-    source: Literal["provider", "kernel"]
+    source: Literal["provider", "kernel", "extension"]
 
 
 class AgentEventKind(StrEnum):

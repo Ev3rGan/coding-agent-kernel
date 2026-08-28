@@ -348,7 +348,8 @@ def test_retryable_provider_failure_reuses_context_without_persisting_partial_at
         result = await run.result()
 
         assert result.state is AgentRunState.SETTLED
-        assert provider.requests[0] is provider.requests[1]
+        assert provider.requests[0] == provider.requests[1]
+        assert provider.requests[0] is not provider.requests[1]
         retries = [event for event in events if event.kind is AgentSessionEventKind.PROVIDER_RETRY]
         assert [(event.retry_attempt, event.retry_remaining) for event in retries] == [(1, 1)]
         assert retries[0].retry_error is not None

@@ -87,14 +87,14 @@ class ContextBuildResult:
 
 @dataclass(frozen=True, slots=True)
 class ContextHookInput:
-    """Future pure Extension Hook input; registration/dispatch is intentionally absent."""
+    """Immutable input for the production Context Extension Hook."""
 
     context: ModelContext
 
 
 @dataclass(frozen=True, slots=True)
 class ContextHookOutput:
-    """Future pure Extension Hook output."""
+    """Typed Context value retained for callers that wrap a transformed Context."""
 
     context: ModelContext
 

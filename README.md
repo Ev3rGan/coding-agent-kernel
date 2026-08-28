@@ -1,5 +1,62 @@
 # Coding Agent Kernel
 
+## 固定 Extension 合约
+
+`AgentKernel` 接受调用方按顺序显式构造的普通 Python Extension 实例。Extension
+只能通过固定 registry 注册 Tool、Provider、custom `SessionEntry` type 与 Hook
+handler；没有目录扫描、entry point、自动发现或热重载。Hook 只接收不可变的类型化
+快照，合法的 transform/supplement 会在交给下一 handler 前由 Kernel 重新验证。
+Extension Tool 继续使用既有 `ToolRuntime` 的 schema、调度、取消与 structured
+`ToolResult` 路径；custom entry 继续使用 append-only Session/Store 路径。
+
+### 同步 callout 与线程契约
+
+Extension 的 `register()`、Hook handler 和 custom `SessionEntry` validator 都是同步
+callout，并在独立 worker thread 中运行。它们必须在有限时间内同步返回，且必须线程
+安全：不得 `await`、不得访问或操作绑定到 Host event loop 的 asyncio 对象，也不得
+在没有自行同步的情况下读写与 Host 或其他 callback 共享的可变状态。推荐只读取
+Kernel 提供的 owned snapshot，并通过明确的 outcome 返回候选值。
+
+Kernel 会把可检测的违规确定性转换为 registration/dispatch/validation failure：返回
+awaitable、抛出 `CancelledError`、访问当前 running loop 或返回非法 outcome 都不会
+取得 Host Task 的取消权，其中 handler cancellation 使用独立的
+`handler_cancelled` 诊断码。Python thread 无法被宿主安全强制终止，因此 callback
+死锁、无限阻塞和未同步 data race 不能由该合约自动修复；callout timeout 与 process
+isolation 是后续 Host/plugin sandbox 的职责，不属于当前 Kernel 合约。
+
+### `ToolResult` 权威与快照成本
+
+`tool_result` handler 可以把已成功执行的输出降级为 `error`，用于在结果反馈给
+Provider 前执行内容或策略校验；这不会回滚 Tool 已经发生的副作用。非成功结果不能
+升级为 `success`，而 `cancelled` 是取消来源事实，handler 既不能引入也不能擦除该
+状态。
+
+为阻止别名逃逸，每个接收 Provider stream event 的 handler 都获得 request 与 event
+的独立深快照；没有对应 handler 时不会复制 request。时间和临时内存开销因此随
+`request size × handler count × event count` 线性增长。面向高频或大 Context 的 Host
+应使用代表性 payload 做容量基准；在没有明确吞吐目标前，Kernel 优先保留所有权隔离，
+不通过共享可变 request 来投机优化。
+
+运行三个确定性场景：
+
+```console
+python -m coding_agent demo extensions
+python -m coding_agent demo extensions --case ordering
+python -m coding_agent demo extensions --case invalid-mutation
+```
+
+默认场景显式加载示例 Extension，执行自定义 Tool、向 canonical Model Context
+补充资源、确定性阻断一个 ToolCall，并持久化已注册的 custom SessionEntry。
+`ordering` 展示两个 Extension 按实例顺序和 handler 顺序组合，以及每次改变后的
+revalidation；`invalid-mutation` 将 handler 异常转换为明确失败，不调用 Provider、
+不污染 Session，也不打印 traceback。
+
+`ExtensionEvent` 通过 `AgentKernel.drain_extension_events()` 独立消费；它记录
+registration、dispatch、outcome/revalidation、block/rejection/failure，但绝不会自动
+混入 `AgentRun` 的公开 `AgentSessionEvent` Event Stream。本能力借鉴 Pi/Tau 的
+registration 与 Hook 思路，简化自动发现、TUI 与热重载，并深化固定状态所有权、
+确定性组合和逐次重验证规则。
+
 ## 可恢复、可分支的 Session
 
 Kernel 现在提供持久化的 append-only Session tree。每个不可变
@@ -77,6 +134,21 @@ outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表�
 
 An independently implemented Python kernel for coding agents, focused on
 runtime semantics, tool execution, sessions, and observable event streams.
+
+## Fixed Extension contract
+
+Callers pass explicitly constructed Python Extension instances to `AgentKernel` in a
+defined order. The fixed registry accepts Tools, Providers, custom SessionEntry types,
+and Hook handlers only. Every transform or supplement is revalidated before the next
+handler, custom Tools remain inside ToolRuntime, and custom entries remain inside the
+append-only Session/Store path. `ExtensionEvent` is drained independently from the
+Kernel and is never inserted into the public AgentSessionEvent stream.
+
+Run `python -m coding_agent demo extensions`, then use `--case ordering` and
+`--case invalid-mutation` to inspect successful capability use, deterministic
+composition, and explicit rejection without state damage. The design borrows the
+registration and Hook ideas from Pi/Tau, omits discovery/TUI/hot reload, and deepens
+Kernel-owned state and deterministic revalidation.
 
 The Kernel now provides a deterministic, observable model-tool-model loop. A
 thin Terminal CLI drives the same public `AgentKernel`/`AgentRun` seam that
@@ -166,7 +238,7 @@ async def observe_run() -> None:
 
 `AgentRun.state` is one of `active`, `settled`, `cancelled`, or `failed`.
 `AgentRun.cancel()` cancels active Provider or Tool Execution work. Model
-Real Providers, Permission Policy, and Extensions remain later-ticket work.
+Real Providers and Permission Policy remain later-ticket work.
 The implemented Context pipeline projects only the selected Active Branch and
 explicitly injected messages before every Provider call.
 

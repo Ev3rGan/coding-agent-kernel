@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
+from coding_agent.callout import dispose_awaitable, invoke_sync_callout
 from coding_agent.events import (
     AgentError,
     AgentSessionEvent,
     AssistantMessage,
     assistant_message_record,
 )
+from coding_agent.json_contract import json_object_snapshot
 
 if TYPE_CHECKING:
     from coding_agent.context import CompactionPlan
@@ -22,8 +27,10 @@ if TYPE_CHECKING:
 SESSION_SCHEMA = "coding-agent-session"
 SESSION_SCHEMA_VERSION = 1
 
-SessionEntryKind = Literal["configuration", "message", "compaction"]
+SessionEntryKind: TypeAlias = str
 SessionRecordKind = Literal["entry", "active_leaf", "closed", "resumed"]
+SessionEntryValidator: TypeAlias = Callable[[Mapping[str, object]], None]
+_BUILTIN_ENTRY_KINDS = frozenset({"configuration", "message", "compaction"})
 
 
 class SessionError(ValueError):
@@ -82,9 +89,15 @@ class PersistenceRecord:
 
 
 class SessionStore(Protocol):
-    """Persistence seam shared by memory and JSONL implementations."""
+    """Persistence seam shared by memory and JSONL implementations.
+
+    ``append_many`` is a transactional capability: returning means every record is
+    durably visible to ``load``; raising means none of the records are visible.
+    """
 
     def append(self, record: PersistenceRecord) -> None: ...
+
+    def append_many(self, records: tuple[PersistenceRecord, ...]) -> None: ...
 
     def load(self, session_id: str) -> tuple[PersistenceRecord, ...]: ...
 
@@ -98,43 +111,212 @@ class InMemorySessionStore:
     def append(self, record: PersistenceRecord) -> None:
         self._records.setdefault(record.session_id, []).append(record)
 
+    def append_many(self, records: tuple[PersistenceRecord, ...]) -> None:
+        if not records:
+            return
+        session_id = records[0].session_id
+        if any(record.session_id != session_id for record in records):
+            raise SessionStateError("A SessionStore batch must target exactly one Session.")
+        updated = [*self._records.get(session_id, ()), *records]
+        self._records[session_id] = updated
+
     def load(self, session_id: str) -> tuple[PersistenceRecord, ...]:
         return tuple(self._records.get(session_id, ()))
 
 
 class JsonlSessionStore:
-    """Append Session records to an inspectable, independently versioned JSONL file."""
+    """Append Session records to an inspectable, independently versioned JSONL file.
+
+    Transactional batches use begin/commit frames. Recovery exposes a batch only
+    after its matching commit frame and ignores an interrupted tail; the next write
+    truncates that tail before appending new authoritative records.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
     def append(self, record: PersistenceRecord) -> None:
+        self._repair_interrupted_tail()
+        self._append_transactionally(f"{_encode_record(record)}\n")
+
+    def append_many(self, records: tuple[PersistenceRecord, ...]) -> None:
+        if not records:
+            return
+        session_id = records[0].session_id
+        if any(record.session_id != session_id for record in records):
+            raise SessionStateError("A SessionStore batch must target exactly one Session.")
+        encoded_records = tuple(_encode_record(record) for record in records)
+        record_payload = "".join(f"{encoded}\n" for encoded in encoded_records)
+        digest = sha256(record_payload.encode("utf-8")).hexdigest()
+        batch_id = f"batch-{uuid4().hex}"
+        begin = _encode_batch_marker(
+            "batch_begin",
+            session_id=session_id,
+            batch_id=batch_id,
+            count=len(records),
+            digest=digest,
+        )
+        commit = _encode_batch_marker(
+            "batch_commit",
+            session_id=session_id,
+            batch_id=batch_id,
+            count=len(records),
+            digest=digest,
+        )
+        payload = f"{begin}\n{record_payload}{commit}\n"
+        self._repair_interrupted_tail()
+        self._append_transactionally(payload)
+
+    def _append_transactionally(self, payload: str) -> None:
+        previous_size = self.path.stat().st_size if self.path.exists() else 0
+        try:
+            self._append_text(payload)
+        except Exception:
+            try:
+                self._truncate_to(previous_size)
+            except Exception as rollback_error:
+                raise SessionStateError(
+                    "Session persistence failed and its rollback could not be made durable."
+                ) from rollback_error
+            raise
+
+    def _append_text(self, payload: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8", newline="\n") as stream:
-            stream.write(_encode_record(record))
-            stream.write("\n")
+            written = stream.write(payload)
+            if written != len(payload):
+                raise OSError("Session JSONL append was incomplete.")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def load(self, session_id: str) -> tuple[PersistenceRecord, ...]:
+        records, _ = self._scan()
+        return tuple(record for record in records if record.session_id == session_id)
+
+    def _repair_interrupted_tail(self) -> None:
         if not self.path.exists():
-            return ()
+            return
+        _, safe_offset = self._scan()
+        if safe_offset == self.path.stat().st_size:
+            return
+        self._truncate_to(safe_offset)
+
+    def _truncate_to(self, offset: int) -> None:
+        if not self.path.exists():
+            if offset == 0:
+                return
+            raise SessionStateError("Session persistence disappeared during rollback.")
+        with self.path.open("r+b") as stream:
+            stream.truncate(offset)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _scan(self) -> tuple[list[PersistenceRecord], int]:
+        if not self.path.exists():
+            return [], 0
+        data = self.path.read_bytes()
+        lines = data.splitlines(keepends=True)
         records: list[PersistenceRecord] = []
-        try:
-            with self.path.open(encoding="utf-8") as stream:
-                for line_number, line in enumerate(stream, 1):
-                    if not line.strip():
-                        raise SessionCorruptionError(f"Blank JSONL record at line {line_number}.")
+        safe_offset = 0
+        offset = 0
+        pending: tuple[str, str, int, str, list[PersistenceRecord], int] | None = None
+        for line_number, raw_line in enumerate(lines, 1):
+            line_end = offset + len(raw_line)
+            has_newline = raw_line.endswith((b"\n", b"\r"))
+            if not has_newline:
+                return records, pending[5] if pending is not None else safe_offset
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise SessionCorruptionError("Session JSONL is not valid UTF-8.") from exc
+            if not line.strip():
+                if pending is not None:
+                    return records, safe_offset
+                raise SessionCorruptionError(f"Blank JSONL record at line {line_number}.")
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                if pending is not None:
+                    return records, safe_offset
+                raise SessionCorruptionError(f"Invalid JSON at line {line_number}.") from exc
+            if not isinstance(value, dict):
+                if pending is not None:
+                    return records, safe_offset
+                raise SessionCorruptionError(
+                    f"Session record at line {line_number} must be an object."
+                )
+            record_type = value.get("record_type")
+            if pending is None:
+                if record_type == "batch_begin":
+                    session_id, batch_id, count, digest = _decode_batch_marker(
+                        value,
+                        expected_type="batch_begin",
+                        line_number=line_number,
+                    )
+                    pending = (session_id, batch_id, count, digest, [], safe_offset)
+                elif record_type == "batch_commit":
+                    raise SessionCorruptionError(
+                        f"Unexpected Session batch commit at line {line_number}."
+                    )
+                else:
+                    if not has_newline:
+                        return records, safe_offset
+                    records.append(_decode_record(line, line_number=line_number))
+                    safe_offset = line_end
+            else:
+                session_id, batch_id, count, digest, batch_records, batch_start = pending
+                if record_type == "batch_commit":
+                    if not has_newline:
+                        return records, batch_start
+                    committed_session, committed_id, committed_count, committed_digest = (
+                        _decode_batch_marker(
+                            value,
+                            expected_type="batch_commit",
+                            line_number=line_number,
+                        )
+                    )
+                    encoded = "".join(f"{_encode_record(record)}\n" for record in batch_records)
+                    if (
+                        committed_session != session_id
+                        or committed_id != batch_id
+                        or committed_count != count
+                        or committed_digest != digest
+                        or len(batch_records) != count
+                        or sha256(encoded.encode("utf-8")).hexdigest() != digest
+                    ):
+                        raise SessionCorruptionError(
+                            f"Invalid Session batch commit at line {line_number}."
+                        )
+                    records.extend(batch_records)
+                    safe_offset = line_end
+                    pending = None
+                elif record_type == "batch_begin":
+                    raise SessionCorruptionError(f"Nested Session batch at line {line_number}.")
+                else:
                     record = _decode_record(line, line_number=line_number)
-                    if record.session_id == session_id:
-                        records.append(record)
-        except UnicodeDecodeError as exc:
-            raise SessionCorruptionError("Session JSONL is not valid UTF-8.") from exc
-        return tuple(records)
+                    if record.session_id != session_id:
+                        raise SessionCorruptionError(
+                            f"Session batch changed session_id at line {line_number}."
+                        )
+                    batch_records.append(record)
+                    pending = (session_id, batch_id, count, digest, batch_records, batch_start)
+            offset = line_end
+        if pending is not None:
+            return records, pending[5]
+        return records, safe_offset
 
 
 def _canonical_payload(payload: Mapping[str, object]) -> str:
     try:
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
+        snapshot = json_object_snapshot(payload, label="SessionEntry payload")
+        return json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except ValueError as exc:
         raise SessionCorruptionError("SessionEntry payload must be JSON serializable.") from exc
 
 
@@ -179,6 +361,61 @@ def _encode_record(record: PersistenceRecord) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _encode_batch_marker(
+    record_type: Literal["batch_begin", "batch_commit"],
+    *,
+    session_id: str,
+    batch_id: str,
+    count: int,
+    digest: str,
+) -> str:
+    return json.dumps(
+        {
+            "schema": SESSION_SCHEMA,
+            "version": SESSION_SCHEMA_VERSION,
+            "record_type": record_type,
+            "session_id": session_id,
+            "batch_id": batch_id,
+            "count": count,
+            "digest": digest,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _decode_batch_marker(
+    value: Mapping[str, object],
+    *,
+    expected_type: Literal["batch_begin", "batch_commit"],
+    line_number: int,
+) -> tuple[str, str, int, str]:
+    if (
+        value.get("schema") != SESSION_SCHEMA
+        or value.get("version") != SESSION_SCHEMA_VERSION
+        or value.get("record_type") != expected_type
+    ):
+        raise SessionCorruptionError(f"Unsupported Session batch marker at line {line_number}.")
+    session_id = value.get("session_id")
+    batch_id = value.get("batch_id")
+    count = value.get("count")
+    digest = value.get("digest")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(batch_id, str)
+        or not batch_id
+        or type(count) is not int
+        or count < 1
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise SessionCorruptionError(f"Invalid Session batch marker at line {line_number}.")
+    return session_id, batch_id, count, digest
+
+
 def _required(value: Mapping[str, object], key: str, expected: type[object]) -> object:
     item = value.get(key)
     if not isinstance(item, expected):
@@ -214,7 +451,7 @@ def _decode_record(line: str, *, line_number: int) -> PersistenceRecord:
         if parent_id is not None and not isinstance(parent_id, str):
             raise SessionCorruptionError(f"Invalid parent at line {line_number}.")
         entry_kind = raw_entry.get("kind")
-        if entry_kind not in {"configuration", "message", "compaction"}:
+        if not isinstance(entry_kind, str) or not entry_kind:
             raise SessionCorruptionError(f"Invalid SessionEntry kind at line {line_number}.")
         payload = raw_entry.get("payload")
         if not isinstance(payload, dict):
@@ -248,6 +485,7 @@ class Session:
         session_id: str,
         *,
         entry_id_factory: Callable[[], str] | None = None,
+        entry_types: Mapping[str, SessionEntryValidator] | None = None,
     ) -> None:
         self._store = store
         self.session_id = session_id
@@ -257,6 +495,8 @@ class Session:
         self._next_sequence = 1
         self._closed = False
         self._events: list[AgentSessionEvent] = []
+        self._entry_types: dict[str, SessionEntryValidator] = {}
+        self.register_entry_types(entry_types or {})
 
     @classmethod
     def create(
@@ -266,11 +506,17 @@ class Session:
         configuration: Mapping[str, object],
         session_id: str | None = None,
         entry_id_factory: Callable[[], str] | None = None,
+        entry_types: Mapping[str, SessionEntryValidator] | None = None,
     ) -> Session:
         actual_session_id = session_id or f"session-{uuid4().hex}"
         if store.load(actual_session_id):
             raise SessionStateError(f"Session {actual_session_id!r} already exists.")
-        session = cls(store, actual_session_id, entry_id_factory=entry_id_factory)
+        session = cls(
+            store,
+            actual_session_id,
+            entry_id_factory=entry_id_factory,
+            entry_types=entry_types,
+        )
         session._append_entry("configuration", configuration)
         return session
 
@@ -281,13 +527,19 @@ class Session:
         session_id: str,
         *,
         entry_id_factory: Callable[[], str] | None = None,
+        entry_types: Mapping[str, SessionEntryValidator] | None = None,
     ) -> Session:
         """Reload a closed Session, validate all history, and resume its active leaf."""
 
         records = store.load(session_id)
         if not records:
             raise SessionStateError(f"Session {session_id!r} does not exist.")
-        session = cls(store, session_id, entry_id_factory=entry_id_factory)
+        session = cls(
+            store,
+            session_id,
+            entry_id_factory=entry_id_factory,
+            entry_types=entry_types,
+        )
         session._replay(records)
         if not session._closed:
             raise SessionStateError("Session recovery is incomplete: no close record.")
@@ -344,19 +596,98 @@ class Session:
             run_id=run_id,
         )
 
+    def append_custom(
+        self,
+        kind: str,
+        payload: Mapping[str, object],
+        *,
+        run_id: str | None = None,
+    ) -> SessionEntry:
+        """Validate and append one explicitly registered custom SessionEntry."""
+
+        return self.append_custom_many(((kind, payload),), run_id=run_id)[0]
+
+    def append_custom_many(
+        self,
+        drafts: tuple[tuple[str, Mapping[str, object]], ...],
+        *,
+        run_id: str | None = None,
+    ) -> tuple[SessionEntry, ...]:
+        """Validate and persist a custom-entry batch without partial Session mutation."""
+
+        if not drafts:
+            return ()
+        if self._closed:
+            raise SessionStateError("Cannot append to a closed Session.")
+        for kind, payload in drafts:
+            self._validate_custom_payload(kind, payload, persisted=False)
+
+        prepared: list[SessionEntry] = []
+        records: list[PersistenceRecord] = []
+        used_ids = set(self._entries)
+        parent_id = self._active_leaf_id
+        for offset, (kind, payload) in enumerate(drafts):
+            entry_id = self._entry_id_factory()
+            if not entry_id or entry_id in used_ids:
+                raise SessionRelationError("SessionEntry IDs must be non-empty and unique.")
+            used_ids.add(entry_id)
+            entry = SessionEntry(
+                entry_id=entry_id,
+                session_id=self.session_id,
+                parent_id=parent_id,
+                kind=kind,
+                payload_json=_canonical_payload(payload),
+            )
+            prepared.append(entry)
+            records.append(
+                PersistenceRecord(
+                    session_id=self.session_id,
+                    sequence=self._next_sequence + offset,
+                    kind="entry",
+                    entry=entry,
+                )
+            )
+            parent_id = entry_id
+
+        self._store.append_many(tuple(records))
+        for entry in prepared:
+            self._entries[entry.entry_id] = entry
+            self._active_leaf_id = entry.entry_id
+            self._next_sequence += 1
+            self._events.append(AgentSessionEvent.from_session_entry(entry, run_id=run_id))
+            self._events.append(self._active_branch_event(run_id=run_id))
+        return tuple(prepared)
+
+    def register_entry_types(
+        self,
+        entry_types: Mapping[str, SessionEntryValidator],
+    ) -> None:
+        """Install validated custom types without partially changing the registry."""
+
+        additions = dict(entry_types)
+        if _BUILTIN_ENTRY_KINDS.intersection(additions):
+            raise SessionStateError("Custom SessionEntry types cannot replace built-in types.")
+        for kind, validator in additions.items():
+            if not isinstance(kind, str) or not kind or not callable(validator):
+                raise SessionStateError(
+                    "Custom SessionEntry registrations must be named callables."
+                )
+            if _is_async_callable(validator):
+                raise SessionStateError("Custom SessionEntry validators must be synchronous.")
+            existing = self._entry_types.get(kind)
+            if existing is not None and existing is not validator:
+                raise SessionStateError(f"Custom SessionEntry type already registered: {kind}")
+        self._entry_types.update(additions)
+
+    def validate_custom_entry(self, kind: str, payload: Mapping[str, object]) -> None:
+        """Validate a custom entry proposal without changing Session state."""
+
+        self._validate_custom_payload(kind, payload, persisted=False)
+
     def record_compaction(self, plan: CompactionPlan, *, run_id: str | None = None) -> SessionEntry:
         """Persist one validated Active Branch checkpoint without rewriting history."""
 
-        expected = tuple(
-            entry.entry_id for entry in self.active_branch if entry.kind != "configuration"
-        )
-        _validate_compaction_values(
-            version=plan.version,
-            summary=plan.summary,
-            covered_entry_ids=plan.covered_entry_ids,
-            expected_entry_ids=expected,
-            checkpoint_label="proposal",
-        )
+        self.validate_compaction(plan)
         entry = self._append_entry(
             "compaction",
             {
@@ -374,6 +705,20 @@ class Session:
             )
         )
         return entry
+
+    def validate_compaction(self, plan: CompactionPlan) -> None:
+        """Validate a checkpoint proposal without changing Session or Store state."""
+
+        expected = tuple(
+            entry.entry_id for entry in self.active_branch if entry.kind != "configuration"
+        )
+        _validate_compaction_values(
+            version=plan.version,
+            summary=plan.summary,
+            covered_entry_ids=plan.covered_entry_ids,
+            expected_entry_ids=expected,
+            checkpoint_label="proposal",
+        )
 
     def record_context_failure(
         self,
@@ -515,6 +860,8 @@ class Session:
                     )
                 if entry.kind == "compaction":
                     self._validate_compaction_entry(entry)
+                elif entry.kind not in _BUILTIN_ENTRY_KINDS:
+                    self._validate_custom_payload(entry.kind, entry.payload, persisted=True)
                 self._entries[entry.entry_id] = entry
                 self._active_leaf_id = entry.entry_id
             elif record.kind == "active_leaf":
@@ -553,3 +900,49 @@ class Session:
             expected_entry_ids=expected,
             checkpoint_label=repr(entry.entry_id),
         )
+
+    def _validate_custom_payload(
+        self,
+        kind: str,
+        payload: Mapping[str, object],
+        *,
+        persisted: bool,
+    ) -> None:
+        validator = self._entry_types.get(kind)
+        if validator is None:
+            error = f"Unregistered custom SessionEntry type: {kind}"
+            if persisted:
+                raise SessionCorruptionError(error)
+            raise SessionStateError(error)
+        try:
+            snapshot = json.loads(_canonical_payload(payload))
+            if not isinstance(snapshot, dict):  # pragma: no cover - canonical payload is an object
+                raise SessionStateError("Custom SessionEntry payload must be an object.")
+            result = invoke_sync_callout(
+                cast(Callable[[Mapping[str, object]], object], validator),
+                snapshot,
+            )
+            if inspect.isawaitable(result):
+                dispose_awaitable(result)
+                raise ValueError("Custom SessionEntry validator must return None synchronously")
+            if result is not None:
+                raise ValueError("Custom SessionEntry validator must return None synchronously")
+        except SessionError:
+            raise
+        except Exception as exc:
+            if persisted:
+                raise SessionCorruptionError(
+                    f"Custom SessionEntry {kind!r} is invalid: {type(exc).__name__}: {exc}"
+                ) from exc
+            raise ValueError(
+                f"Custom SessionEntry {kind!r} is invalid: {type(exc).__name__}: {exc}"
+            ) from exc
+
+
+def _is_async_callable(value: object) -> bool:
+    if inspect.iscoroutinefunction(value) or inspect.isasyncgenfunction(value):
+        return True
+    if not callable(value):
+        return False
+    call = type(value).__call__
+    return inspect.iscoroutinefunction(call) or inspect.isasyncgenfunction(call)
