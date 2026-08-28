@@ -231,6 +231,7 @@ class ToolResult:
     status: Literal["success", "error", "cancelled"]
     output: dict[str, Any] | None = None
     error: ToolError | None = None
+    note: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -201,26 +201,26 @@ def _message_from_entry(entry: SessionEntry) -> ModelMessage | None:
 def _request_record(request: ProviderRequest) -> dict[str, object]:
     def message_record(message: ModelMessage) -> dict[str, object]:
         if isinstance(message, ToolResultMessage):
-            return {
-                "role": message.role,
-                "results": [
-                    {
-                        "call_id": result.call_id,
-                        "tool_name": result.tool_name,
-                        "status": result.status,
-                        "output": result.output,
-                        "error": (
-                            None
-                            if result.error is None
-                            else {
-                                "code": result.error.code,
-                                "message": result.error.message,
-                            }
-                        ),
-                    }
-                    for result in message.results
-                ],
-            }
+            results: list[dict[str, object]] = []
+            for result in message.results:
+                record: dict[str, object] = {
+                    "call_id": result.call_id,
+                    "tool_name": result.tool_name,
+                    "status": result.status,
+                    "output": result.output,
+                    "error": (
+                        None
+                        if result.error is None
+                        else {
+                            "code": result.error.code,
+                            "message": result.error.message,
+                        }
+                    ),
+                }
+                if result.note:
+                    record["note"] = result.note
+                results.append(record)
+            return {"role": message.role, "results": results}
         if isinstance(message, AssistantMessage):
             return assistant_message_record(message)
         return {"role": message.role, "text": message.text}

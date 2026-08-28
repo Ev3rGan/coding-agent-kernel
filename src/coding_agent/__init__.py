@@ -54,6 +54,17 @@ from coding_agent.events import (
     ToolProgress,
     ToolResult,
 )
+from coding_agent.extensions import (
+    ContextSupplement,
+    ExtensionError,
+    ExtensionEvent,
+    ExtensionEventKind,
+    ExtensionRuntime,
+    HookInput,
+    HookName,
+    HookResult,
+    ToolResultSupplement,
+)
 from coding_agent.kernel import AgentKernel
 from coding_agent.provider import (
     BranchSummaryMessage,
@@ -101,8 +112,16 @@ __all__ = [
     "ContextInput",
     "ContextPipeline",
     "ContextSettings",
+    "ContextSupplement",
     "DeterministicBranchSummarizer",
+    "ExtensionError",
+    "ExtensionEvent",
+    "ExtensionEventKind",
+    "ExtensionRuntime",
     "FakeProvider",
+    "HookInput",
+    "HookName",
+    "HookResult",
     "ModelProvider",
     "ModelContext",
     "ModelMessage",
@@ -151,6 +170,7 @@ __all__ = [
     "ToolResult",
     "ToolResultMessage",
     "ToolRuntime",
+    "ToolResultSupplement",
     "ToolSpec",
     "UserMessage",
     "estimate_provider_request_characters",

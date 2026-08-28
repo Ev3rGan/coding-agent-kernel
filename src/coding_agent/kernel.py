@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from itertools import count
 
@@ -28,7 +29,17 @@ from coding_agent.events import (
     ProviderCancelled,
     ProviderDone,
     ProviderError,
+    ToolCall,
+    ToolError,
     ToolProgress,
+    ToolResult,
+)
+from coding_agent.extensions import (
+    Extension,
+    ExtensionEvent,
+    ExtensionRuntime,
+    HookInput,
+    HookName,
 )
 from coding_agent.provider import (
     ModelMessage,
@@ -87,6 +98,7 @@ class AgentKernel:
         context_pipeline: ContextPipeline | None = None,
         context_settings: ContextSettings | None = None,
         retry_policy: RetryPolicy | None = None,
+        extensions: Sequence[Extension] = (),
     ) -> None:
         self._provider = provider
         self._tool_runtime = tool_runtime
@@ -96,6 +108,32 @@ class AgentKernel:
         self._retry_policy = retry_policy or RetryPolicy()
         self._model_contexts: list[ModelContext] = []
         self._run_numbers = count(1)
+        self._extension_runtime = ExtensionRuntime()
+        self._extension_context_needed = False
+        for extension in extensions:
+            self._register_extension(extension)
+
+    def _register_extension(self, extension: Extension) -> None:
+        """Register one Extension and surface its contributed Tools on the runtime."""
+        self._extension_runtime.register(extension)
+        # 首轮若需要跑 CONTEXT 或 PROVIDER_REQUEST 钩子，就跳过 first_request 快速路径。
+        self._extension_context_needed = self._extension_runtime.has_handler(
+            HookName.CONTEXT
+        ) or self._extension_runtime.has_handler(HookName.PROVIDER_REQUEST)
+        if self._tool_runtime is not None:
+            for declared in self._extension_runtime.declared_tools_of(extension.name):
+                self._tool_runtime.register(declared.tool)
+                if declared.enabled:
+                    self._tool_runtime.enable(declared.tool.spec.name)
+
+    @property
+    def extension_events(self) -> tuple[ExtensionEvent, ...]:
+        """Expose every dispatched, independently contracted Extension observation."""
+        return self._extension_runtime.events
+
+    @property
+    def extension_names(self) -> tuple[str, ...]:
+        return self._extension_runtime.registered_extensions
 
     @classmethod
     def with_new_session(
@@ -202,7 +240,9 @@ class AgentKernel:
         first_request: ProviderRequest | None = None
         context_error: AgentError | None = None
         try:
-            first_request = self._build_context((UserMessage(text=prompt),), run_id=run_id)
+            first_request = self._build_context_sync(
+                (UserMessage(text=prompt),), run_id=run_id
+            )
             if self._session is not None:
                 self._session.record_user_message(prompt, run_id=run_id)
         except ContextConstructionError as exc:
@@ -230,6 +270,7 @@ class AgentKernel:
         first_request: ProviderRequest | None,
         context_error: AgentError | None,
     ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
+        await self._run_hook(HookName.BEFORE_AGENT_START, run_id=run_id)
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
         next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
@@ -251,6 +292,7 @@ class AgentKernel:
                     error=context_error,
                 )
                 yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                await self._run_hook(HookName.AGENT_SETTLED, run_id=run_id)
                 yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
                 return
             yield AgentEvent(
@@ -260,34 +302,40 @@ class AgentKernel:
                 message_id=message_id,
                 message=message,
             )
-            if turn_number == 1:
-                if first_request is None:  # pragma: no cover - guarded by context_error
-                    raise RuntimeError("First Provider request was not prepared.")
-                request = first_request
-            else:
-                try:
+            try:
+                if turn_number == 1 and first_request is not None:
+                    if self._extension_context_needed:
+                        request = await self._build_context(
+                            (UserMessage(text=prompt),),
+                            run_id=run_id,
+                        )
+                    else:
+                        request = first_request
+                else:
                     injected = next_injected if self._session is not None else tuple(history)
-                    request = self._build_context(
+                    request = await self._build_context(
                         injected,
                         run_id=run_id,
                         pending_messages=control.pending_messages(),
                         active_branch=next_active_branch,
                     )
                     next_active_branch = None
-                except ContextConstructionError as exc:
-                    context_failure = self._record_context_failure(exc, run_id=run_id)
-                    yield AgentEvent(
-                        kind=AgentEventKind.ERROR,
-                        run_id=run_id,
-                        turn_id=turn_id,
-                        message_id=message_id,
-                        message=message,
-                        error=context_failure,
-                    )
-                    yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
-                    yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
-                    return
+            except ContextConstructionError as exc:
+                context_failure = self._record_context_failure(exc, run_id=run_id)
+                yield AgentEvent(
+                    kind=AgentEventKind.ERROR,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    message_id=message_id,
+                    message=message,
+                    error=context_failure,
+                )
+                yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+                await self._run_hook(HookName.AGENT_SETTLED, run_id=run_id)
+                yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
+                return
             failure: ProviderError | None = None
+            await self._run_hook(HookName.INPUT, run_id=run_id, turn_id=turn_id, message=message)
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 accumulator = AssistantMessageAccumulator()
                 message = accumulator.message
@@ -359,6 +407,7 @@ class AgentKernel:
                     provider_error=failure,
                 ):
                     yield failure_event
+                await self._run_hook(HookName.AGENT_SETTLED, run_id=run_id)
                 return
 
             yield AgentEvent(
@@ -369,65 +418,126 @@ class AgentKernel:
                 message=message,
             )
             history.append(message)
+            await self._run_hook(
+                HookName.MESSAGE, run_id=run_id, turn_id=turn_id, message=message
+            )
 
             if message.tool_calls and self._tool_runtime is not None:
-                batch_mode = self._tool_runtime.batch_mode(message.tool_calls)
-                for call in message.tool_calls:
+                resolved, blocked = await self._resolve_tool_calls(
+                    message.tool_calls, run_id=run_id, turn_id=turn_id
+                )
+                blocked_results: dict[str, ToolResult] = {}
+                for call, reason in blocked:
+                    call_mode = self._tool_runtime.batch_mode((call,))
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_EXECUTION_START,
                         run_id=run_id,
                         turn_id=turn_id,
                         tool_call=call,
-                        batch_mode=batch_mode,
+                        batch_mode=call_mode,
                     )
-                progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
-
-                batch_task = asyncio.create_task(
-                    self._tool_runtime.execute_batch(
-                        message.tool_calls,
-                        control.cancel_event,
-                        on_progress=partial(_put_progress, progress_queue),
+                    result = ToolResult(
+                        call.call_id,
+                        call.tool_name,
+                        "error",
+                        None,
+                        ToolError("extension_blocked", reason),
                     )
-                )
-                try:
-                    while not batch_task.done() or not progress_queue.empty():
-                        if not progress_queue.empty():
-                            progress = progress_queue.get_nowait()
-                        else:
-                            progress_task = asyncio.create_task(progress_queue.get())
-                            done, _ = await asyncio.wait(
-                                {batch_task, progress_task},
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if progress_task not in done:
-                                progress_task.cancel()
-                                await asyncio.gather(progress_task, return_exceptions=True)
-                                continue
-                            progress = progress_task.result()
-                        yield AgentEvent(
-                            kind=AgentEventKind.TOOL_EXECUTION_UPDATE,
-                            run_id=run_id,
-                            turn_id=turn_id,
-                            tool_progress=progress,
-                            batch_mode=batch_mode,
-                        )
-                    batch = await batch_task
-                finally:
-                    if not batch_task.done():
-                        batch_task.cancel()
-                        await asyncio.gather(batch_task, return_exceptions=True)
-                results_by_id = {result.call_id: result for result in batch.results}
-                for call_id in batch.completion_order:
-                    result = results_by_id[call_id]
+                    blocked_results[call.call_id] = result
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_EXECUTION_END,
                         run_id=run_id,
                         turn_id=turn_id,
                         tool_result=result,
-                        batch_mode=batch.mode,
+                        batch_mode=call_mode,
                     )
-                history.append(ToolResultMessage(results=batch.results))
-                tool_results = ToolResultMessage(results=batch.results)
+                if not resolved:
+                    executor = blocked_results
+                else:
+                    batch_mode = self._tool_runtime.batch_mode(resolved)
+                    for call in resolved:
+                        yield AgentEvent(
+                            kind=AgentEventKind.TOOL_EXECUTION_START,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_call=call,
+                            batch_mode=batch_mode,
+                        )
+                    for call in resolved:
+                        await self._run_hook(
+                            HookName.TOOL_EXECUTION,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_call=call,
+                        )
+                    progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
+                    batch_task = asyncio.create_task(
+                        self._tool_runtime.execute_batch(
+                            resolved,
+                            control.cancel_event,
+                            on_progress=partial(_put_progress, progress_queue),
+                        )
+                    )
+                    try:
+                        while not batch_task.done() or not progress_queue.empty():
+                            if not progress_queue.empty():
+                                progress = progress_queue.get_nowait()
+                            else:
+                                progress_task = asyncio.create_task(progress_queue.get())
+                                done, _ = await asyncio.wait(
+                                    {batch_task, progress_task},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if progress_task not in done:
+                                    progress_task.cancel()
+                                    await asyncio.gather(
+                                        progress_task, return_exceptions=True
+                                    )
+                                    continue
+                                progress = progress_task.result()
+                            yield AgentEvent(
+                                kind=AgentEventKind.TOOL_EXECUTION_UPDATE,
+                                run_id=run_id,
+                                turn_id=turn_id,
+                                tool_progress=progress,
+                                batch_mode=batch_mode,
+                            )
+                        batch = await batch_task
+                    finally:
+                        if not batch_task.done():
+                            batch_task.cancel()
+                            await asyncio.gather(batch_task, return_exceptions=True)
+                    results_by_id = {result.call_id: result for result in batch.results}
+                    for call_id in batch.completion_order:
+                        result = results_by_id[call_id]
+                        yield AgentEvent(
+                            kind=AgentEventKind.TOOL_EXECUTION_END,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_result=result,
+                            batch_mode=batch.mode,
+                        )
+                    executor = {**blocked_results, **results_by_id}
+                for call in message.tool_calls:
+                    if call.call_id in executor:
+                        decision, _ = await self._run_hook(
+                            HookName.TOOL_RESULT,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_result=executor[call.call_id],
+                        )
+                        note = decision.get("tool_result_supplement")
+                        if isinstance(note, str) and note:
+                            executor[call.call_id] = replace(
+                                executor[call.call_id], note=note
+                            )
+                # 结果按模型生成的 tool_calls 原始顺序对齐，blocked 的用 error 占位。
+                results = tuple(
+                    executor[call.call_id] for call in message.tool_calls
+                    if call.call_id in executor
+                )
+                tool_results = ToolResultMessage(results=results)
+                history.append(tool_results)
                 next_injected = (tool_results,)
                 steering = control.drain_steering()
                 if steering:
@@ -464,6 +574,7 @@ class AgentKernel:
                 continue
 
             yield AgentEvent(kind=AgentEventKind.TURN_END, run_id=run_id, turn_id=turn_id)
+            await self._run_hook(HookName.AGENT_SETTLED, run_id=run_id)
             yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
             return
 
@@ -476,8 +587,37 @@ class AgentKernel:
             provider_error=error,
         ):
             yield failure_event
+        await self._run_hook(HookName.AGENT_SETTLED, run_id=run_id)
 
-    def _build_context(
+    def _build_context_sync(
+        self,
+        injected_messages: tuple[ModelMessage, ...],
+        *,
+        run_id: str,
+    ) -> ProviderRequest:
+        """Synchronously build one Provider request without Extension Hooks.
+
+        This is used by create_run to fail fast on Context construction errors before
+        an Agent Run starts, matching the deterministic pre-Provider failure surface.
+        """
+        active = () if self._session is None else self._session.active_branch
+        result = self._context_pipeline.build(
+            ContextInput(
+                settings=self._context_settings,
+                active_branch=active,
+                active_tools=self._tool_schemas(),
+                injected_messages=injected_messages,
+            )
+        )
+        if result.compaction is not None:
+            if self._session is None:  # pragma: no cover - no branch can produce a plan
+                raise RuntimeError("Compaction requires a durable Session.")
+            self._session.record_compaction(result.compaction, run_id=run_id)
+        request = result.context.provider_request
+        self._model_contexts.append(result.context)
+        return request
+
+    async def _build_context(
         self,
         injected_messages: tuple[ModelMessage, ...],
         *,
@@ -485,16 +625,31 @@ class AgentKernel:
         pending_messages: tuple[ModelMessage, ...] = (),
         active_branch: tuple[SessionEntry, ...] | None = None,
     ) -> ProviderRequest:
+        supplement, _ = await self._run_hook(
+            HookName.CONTEXT,
+            run_id=run_id,
+            context=None,
+        )
+        settings = self._context_settings
+        context_lines = supplement.get("context_lines")
+        if isinstance(context_lines, tuple) and context_lines:
+            settings = ContextSettings(
+                system_prompt=settings.system_prompt,
+                tool_guidelines=settings.tool_guidelines,
+                project_context=(*settings.project_context, *context_lines),
+                max_characters=settings.max_characters,
+            )
+        active = (
+            ()
+            if self._session is None
+            else self._session.active_branch
+            if active_branch is None
+            else active_branch
+        )
         result = self._context_pipeline.build(
             ContextInput(
-                settings=self._context_settings,
-                active_branch=(
-                    ()
-                    if self._session is None
-                    else self._session.active_branch
-                    if active_branch is None
-                    else active_branch
-                ),
+                settings=settings,
+                active_branch=active,
                 active_tools=self._tool_schemas(),
                 injected_messages=injected_messages,
                 pending_messages=pending_messages,
@@ -504,8 +659,74 @@ class AgentKernel:
             if self._session is None:  # pragma: no cover - no branch can produce a plan
                 raise RuntimeError("Compaction requires a durable Session.")
             self._session.record_compaction(result.compaction, run_id=run_id)
+        request = result.context.provider_request
+        maybe_block, _ = await self._run_hook(
+            HookName.PROVIDER_REQUEST,
+            run_id=run_id,
+            request=request,
+        )
+        if maybe_block.get("blocked"):
+            raise ContextConstructionError(
+                "provider_request_blocked",
+                f"Provider request blocked by an Extension: {maybe_block.get('reason')}",
+                stage="provider-request",
+            )
         self._model_contexts.append(result.context)
-        return result.context.provider_request
+        return request
+
+    async def _resolve_tool_calls(
+        self,
+        calls: tuple[ToolCall, ...],
+        *,
+        run_id: str,
+        turn_id: str,
+    ) -> tuple[tuple[ToolCall, ...], list[tuple[ToolCall, str]]]:
+        """Apply the tool_call Hook to every call, returning allowed and blocked."""
+        resolved: list[ToolCall] = []
+        blocked: list[tuple[ToolCall, str]] = []
+        for call in calls:
+            decision, _ = await self._run_hook(
+                HookName.TOOL_CALL,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_call=call,
+            )
+            transformed = decision.get("tool_call")
+            chosen: ToolCall = transformed if isinstance(transformed, ToolCall) else call
+            if decision.get("blocked"):
+                blocked.append((chosen, str(decision.get("reason", "extension policy"))))
+                continue
+            resolved.append(chosen)
+        return tuple(resolved), blocked
+
+    async def _run_hook(
+        self,
+        hook: HookName,
+        *,
+        run_id: str | None = None,
+        turn_id: str | None = None,
+        tool_call: ToolCall | None = None,
+        tool_result: ToolResult | None = None,
+        context: ModelContext | None = None,
+        request: ProviderRequest | None = None,
+        message: AssistantMessage | None = None,
+    ) -> tuple[dict[str, object], tuple[ExtensionEvent, ...]]:
+        """Dispatch one fixed Hook through the Extension runtime."""
+        if not self._extension_runtime.registered_extensions:
+            return {"hook": hook.value}, ()
+        return await self._extension_runtime.run_once(
+            hook,
+            HookInput(
+                hook=hook,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_call=tool_call,
+                tool_result=tool_result,
+                context=context,
+                request=request,
+                message=message,
+            ),
+        )
 
     async def _inject_messages(
         self, run_id: str, messages: tuple[PendingMessage, ...]

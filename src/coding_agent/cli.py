@@ -30,6 +30,15 @@ from coding_agent.events import (
     ToolResult,
     assistant_message_record,
 )
+from coding_agent.extensions import (
+    ContextSupplement,
+    ExtensionRuntime,
+    HookInput,
+    HookName,
+    HookResult,
+    ToolResultSupplement,
+)
+from coding_agent.extensions_example import SampleExtension
 from coding_agent.kernel import AgentKernel
 from coding_agent.provider import FakeProvider, ModelMessage, UserMessage
 from coding_agent.session import JsonlSessionStore, Session, SessionError
@@ -49,7 +58,7 @@ def _error_record(error: AgentError) -> dict[str, str]:
 
 
 def _tool_result_record(result: ToolResult) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "call_id": result.call_id,
         "tool_name": result.tool_name,
         "status": result.status,
@@ -58,6 +67,9 @@ def _tool_result_record(result: ToolResult) -> dict[str, Any]:
         if result.error is None
         else {"code": result.error.code, "message": result.error.message},
     }
+    if result.note:
+        record["note"] = result.note
+    return record
 
 
 def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
@@ -287,6 +299,117 @@ async def _run_control_demo(case: str) -> int:
             "retry-failure": AgentRunState.FAILED,
         }[case]
         return 0 if result.state is expected else 1
+
+
+class _SecondExtension:
+    """A second Extension proving deterministic transform-order composition."""
+
+    @property
+    def name(self) -> str:
+        return "second"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.CONTEXT, self._context)
+
+    def _context(self, input_: HookInput) -> HookResult:  # noqa: ARG001
+        return HookResult.supplement_context(ContextSupplement(("SECOND_RESOURCE",)))
+
+
+class _IllegalExtension:
+    """An Extension whose handler returns an illegal mutation to test rejection."""
+
+    @property
+    def name(self) -> str:
+        return "illegal"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.CONTEXT, self._context)
+
+    def _context(self, input_: HookInput) -> HookResult:  # noqa: ARG001
+        # CONTEXT 钩子返回 tool_result supplement，属于非法改写，应被拒绝。
+        return HookResult.supplement_tool_result(ToolResultSupplement("bad"))
+
+
+def _extensions_script(case: str) -> tuple[tuple[ProviderStreamEvent, ...], ...]:
+    if case == "success":
+        return (
+            (
+                *_scripted_tool_call_events(0, "ext-shout", "shout", {"text": "hello"}),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderTextDelta("Shouted HELLO."), ProviderDone()),
+        )
+    return ((ProviderTextDelta("Deterministic extension ordering."), ProviderDone()),)
+
+
+def _print_extension_details(kernel: AgentKernel) -> None:
+    _print_record(
+        {
+            "extensions": {
+                "registered": list(kernel.extension_names),
+                "events": [
+                    {
+                        "kind": event.kind.value,
+                        "hook": event.hook,
+                        "extension": event.extension,
+                        "message": event.message,
+                    }
+                    for event in kernel.extension_events
+                ],
+                "context_supplemented": any(
+                    event.kind.value == "hook_supplemented" and event.hook == "context"
+                    for event in kernel.extension_events
+                ),
+            }
+        }
+    )
+
+
+async def _extensions_demo(case: str) -> int:
+    with tempfile.TemporaryDirectory(prefix="coding-agent-extensions-") as directory:
+        workspace = Path(directory)
+        extensions: list[Any] = []
+        if case == "success":
+            extensions = [SampleExtension()]
+        elif case == "ordering":
+            extensions = [SampleExtension(), _SecondExtension()]
+        else:
+            extensions = [_IllegalExtension()]
+
+        runtime = ToolRuntime(LocalCodingEnvironment(workspace))
+        provider = FakeProvider(_extensions_script(case))
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=extensions,
+        )
+        _print_record({"extension_names": list(kernel.extension_names)})
+        run = kernel.create_run("Demonstrate the fixed Extension contract.")
+        collected: list[AgentSessionEvent] = []
+        async for event in run:
+            collected.append(event)
+            _print_record(_event_record(event))
+        result = await run.result()
+        _print_record(_result_record(result))
+        _print_extension_details(kernel)
+
+        if case == "success":
+            request = provider.requests[0]
+            _print_record(
+                {
+                    "extension_evidence": {
+                        "active_tools": [tool.get("name") for tool in request.tools],
+                        "context_project_lines": list(request.project_context),
+                        "tool_executed": any(
+                            event.kind is AgentSessionEventKind.TOOL_EXECUTION_END
+                            and event.tool_result is not None
+                            and event.tool_result.tool_name == "shout"
+                            for event in collected
+                        ),
+                    }
+                }
+            )
+        return 0 if result.state is AgentRunState.SETTLED else 1
 
 
 def _scripted_tool_call_events(
@@ -728,6 +851,15 @@ def _parser() -> argparse.ArgumentParser:
         default="steering",
         help="deterministic Agent Run control scenario",
     )
+    extensions = demos.add_parser(
+        "extensions", help="register Extensions and observe fixed Hook composition"
+    )
+    extensions.add_argument(
+        "--case",
+        choices=("success", "ordering", "invalid-mutation"),
+        default="success",
+        help="deterministic Extension composition scenario",
+    )
     return parser
 
 
@@ -745,4 +877,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_context_compaction_demo(args.case))
     if args.command == "demo" and args.demo == "run-control":
         return asyncio.run(_run_control_demo(args.case))
+    if args.command == "demo" and args.demo == "extensions":
+        return asyncio.run(_extensions_demo(args.case))
     raise AssertionError("argparse accepted an unsupported command")

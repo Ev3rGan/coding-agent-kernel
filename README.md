@@ -73,6 +73,28 @@ JSON Lines 会显示 queue、injection/drop、Provider retry、Session 和唯一
 outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表达；不增加 Step、
 第二 AgentLoop、多 Agent 或长期后台服务。
 
+## 通过固定 Extension 合约扩展 Kernel
+
+`AgentKernel` 接受显式构造的 Python `Extension` 实例。Extension 通过
+`ExtensionRuntime` seam 注册自定义 Tool、自定义 SessionEntry kind 和固定 Hook
+handler；它从不取得任意可写的 Kernel 状态。handler 按注册顺序确定性组合，每次
+转换都经过 Kernel 重新校验；非法改写、handler 异常或阻断都会变成结构化的
+`ExtensionEvent` 和明确拒绝，不会破坏 Agent Run 或 Session。
+
+```console
+python -m coding_agent demo extensions
+python -m coding_agent demo extensions --case ordering
+python -m coding_agent demo extensions --case invalid-mutation
+```
+
+success 场景加载示例 Extension：注册 `shout` Tool、通过 context Hook 补充
+`EXTENSION_RESOURCE` 到 Model Context，并声明自定义 SessionEntry kind。ordering
+场景用两个 Extension 展示 context supplement 按注册顺序稳定组合。invalid-mutation
+场景让 handler 返回非法改写，观察 `hook_error` 事件与拒绝行为，同时 run 仍正常
+settled。`ExtensionEvent` 作为独立分发契约，不进入公开 AgentSessionEvent stream。
+`Extension` 实例是显式加载且不热重载，不自动发现目录或 entry point；机制借鉴 Pi
+的 registration 与 hook 思路，深化固定状态所有权与确定性组合规则。
+
 ## English
 
 An independently implemented Python kernel for coding agents, focused on
@@ -206,3 +228,18 @@ The thin CLI observes the public Event Stream and invokes only `AgentRun` contro
 Pending messages stay in two run-scoped FIFO queues and enter Session history only
 when injected at their authoritative drain point. Cancellation drops uninjected
 messages and converges Provider, Tool, and retry work on one terminal result.
+
+## Fixed Extension contract
+
+`python -m coding_agent demo extensions` loads an explicit Python `Extension`
+instance that registers a custom `shout` Tool, appends `EXTENSION_RESOURCE` to
+the Model Context through a context Hook, and declares a custom SessionEntry
+kind. The `--case ordering` scenario shows two Extensions compose their
+context supplements in deterministic registration order. The
+`--case invalid-mutation` scenario makes a handler return an illegal mutation,
+producing a structured `hook_error` rejection without damaging the run.
+`ExtensionEvent` stays an independent dispatch contract and never enters the
+public `AgentSessionEvent` stream. Extensions are explicitly constructed, never
+auto-discovered or hot-reloaded, and receive no arbitrary writable Kernel state.
+The design borrows Pi/Tau registration and Hook ideas, then deepens fixed state
+ownership and deterministic composition rules.
