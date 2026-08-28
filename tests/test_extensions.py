@@ -420,3 +420,49 @@ def test_tool_call_transform_may_not_change_call_id(tmp_path: Path) -> None:
         )
 
     asyncio.run(scenario())
+
+
+class _BlockEverythingExtension:
+    """An Extension that blocks every ToolCall after an earlier transform."""
+
+    @property
+    def name(self) -> str:
+        return "block-all"
+
+    def register(self, runtime: ExtensionRuntime) -> None:
+        runtime.on(self.name, HookName.TOOL_CALL, self._block)
+
+    def _block(self, input_: HookInput) -> HookResult:
+        if input_.tool_call is None:
+            return HookResult.observe()
+        return HookResult.block("post-transform policy")
+
+
+def test_blocked_call_reports_transformed_tool(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+        provider = FakeProvider(
+            [
+                _tool_call_script("tb-1", "read", {"path": "x.py"}),
+                (ProviderTextDelta("done"), ProviderDone()),
+            ]
+        )
+        kernel = AgentKernel(
+            provider,
+            tool_runtime=runtime,
+            extensions=[_TransformingExtension(), _BlockEverythingExtension()],
+        )
+        run = kernel.create_run("transform then block")
+        events = await _collect(run)
+        tool_results = [
+            event.tool_result
+            for event in events
+            if event.kind is AgentSessionEventKind.TOOL_EXECUTION_END
+            and event.tool_result is not None
+        ]
+        # rewriter 先 read->shout，block-all 再拦截：错误结果应指向改写后的 shout。
+        assert len(tool_results) == 1
+        assert tool_results[0].tool_name == "shout"
+        assert tool_results[0].status == "error"
+
+    asyncio.run(scenario())

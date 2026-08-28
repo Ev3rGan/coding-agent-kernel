@@ -194,19 +194,33 @@ class ExtensionRuntime:
             raise ExtensionError("extension must expose a non-empty name")
         if extension.name in self._extensions:
             raise ExtensionError(f"extension already registered: {extension.name}")
+        # 先登记名字以便 on()/declare_tool() 校验归属；register 失败则回滚，避免半注册残留。
+        mark_handlers = {hook: len(self._handlers[hook]) for hook in HookName}
+        mark_tools = len(self._tools)
         self._extensions.append(extension.name)
-        extension.register(self)
+        try:
+            extension.register(self)
+        except Exception:
+            for hook, length in mark_handlers.items():
+                del self._handlers[hook][length:]
+            del self._tools[mark_tools:]
+            self._extensions.pop()
+            raise
         self._event_log.append(
             ExtensionEvent(ExtensionEventKind.REGISTERED, "__register__", extension.name)
         )
 
     def on(self, extension: str, hook: HookName, handler: HookHandler) -> None:
         """Register one handler; this is the seam an Extension calls internally."""
+        if extension not in self._extensions:
+            raise ExtensionError(f"handler for unregistered extension: {extension}")
         self._handlers[hook].append((self._sequence, extension, handler))
         self._sequence += 1
 
     def declare_tool(self, extension: str, tool: Tool, *, enabled: bool = False) -> None:
         """Receive a Tool contributed by an Extension for the Host to enable."""
+        if extension not in self._extensions:
+            raise ExtensionError(f"tool for unregistered extension: {extension}")
         self._tools.append(DeclaredTool(extension, tool, enabled))
 
     def declare_session_entry_kind(self, kind: str) -> None:

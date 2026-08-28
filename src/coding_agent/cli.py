@@ -326,7 +326,7 @@ class _IllegalExtension:
         runtime.on(self.name, HookName.CONTEXT, self._context)
 
     def _context(self, input_: HookInput) -> HookResult:  # noqa: ARG001
-        # A supplement for a non-context Hook is an illegal outcome.
+        # CONTEXT 钩子返回 tool_result supplement，属于非法改写，应被拒绝。
         return HookResult.supplement_tool_result(ToolResultSupplement("bad"))
 
 

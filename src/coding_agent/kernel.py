@@ -691,11 +691,12 @@ class AgentKernel:
                 turn_id=turn_id,
                 tool_call=call,
             )
-            if decision.get("blocked"):
-                blocked.append((call, str(decision.get("reason", "extension policy"))))
-                continue
             transformed = decision.get("tool_call")
-            resolved.append(transformed if isinstance(transformed, ToolCall) else call)
+            chosen: ToolCall = transformed if isinstance(transformed, ToolCall) else call
+            if decision.get("blocked"):
+                blocked.append((chosen, str(decision.get("reason", "extension policy"))))
+                continue
+            resolved.append(chosen)
         return tuple(resolved), blocked
 
     async def _run_hook(

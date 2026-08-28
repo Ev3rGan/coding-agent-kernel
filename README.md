@@ -89,7 +89,7 @@ python -m coding_agent demo extensions --case invalid-mutation
 
 success 场景加载示例 Extension：注册 `shout` Tool、通过 context Hook 补充
 `EXTENSION_RESOURCE` 到 Model Context，并声明自定义 SessionEntry kind。ordering
-场景用两个 Extension 展示 transform/supplement 按注册顺序稳定组合。invalid-mutation
+场景用两个 Extension 展示 context supplement 按注册顺序稳定组合。invalid-mutation
 场景让 handler 返回非法改写，观察 `hook_error` 事件与拒绝行为，同时 run 仍正常
 settled。`ExtensionEvent` 作为独立分发契约，不进入公开 AgentSessionEvent stream。
 `Extension` 实例是显式加载且不热重载，不自动发现目录或 entry point；机制借鉴 Pi
@@ -235,7 +235,7 @@ messages and converges Provider, Tool, and retry work on one terminal result.
 instance that registers a custom `shout` Tool, appends `EXTENSION_RESOURCE` to
 the Model Context through a context Hook, and declares a custom SessionEntry
 kind. The `--case ordering` scenario shows two Extensions compose their
-transform/supplement results in deterministic registration order. The
+context supplements in deterministic registration order. The
 `--case invalid-mutation` scenario makes a handler return an illegal mutation,
 producing a structured `hook_error` rejection without damaging the run.
 `ExtensionEvent` stays an independent dispatch contract and never enters the
