@@ -1,4 +1,11 @@
-"""Isolation helpers for synchronous, untrusted Kernel capability callouts."""
+"""Isolation helpers for synchronous, untrusted Kernel capability callouts.
+
+Callouts run in a worker thread so component cancellation cannot cancel the
+authoritative asyncio task. Callbacks must be finite, synchronous, and
+thread-safe. They must not use loop-bound asyncio objects or mutate shared state
+without their own synchronization. The Host waits for completion; thread
+timeouts or forced thread termination are intentionally not provided here.
+"""
 
 from __future__ import annotations
 
@@ -14,11 +21,11 @@ R = TypeVar("R")
 
 
 class SyncCalloutCancellationError(RuntimeError):
-    pass
+    """A synchronous callback tried to use cancellation as control flow."""
 
 
 def invoke_sync_callout(callback: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-    """Run one synchronous callback outside the Host/Run asyncio task."""
+    """Run one finite synchronous callback outside the Host/Run asyncio task."""
 
     results: list[object] = []
     errors: list[BaseException] = []

@@ -13,7 +13,11 @@ from itertools import count
 from types import MappingProxyType
 from typing import Any, Generic, Literal, NoReturn, Protocol, TypeAlias, TypeVar, cast
 
-from coding_agent.callout import dispose_awaitable, invoke_sync_callout
+from coding_agent.callout import (
+    SyncCalloutCancellationError,
+    dispose_awaitable,
+    invoke_sync_callout,
+)
 from coding_agent.context import (
     CompactionPlan,
     ContextHookInput,
@@ -577,17 +581,7 @@ class ExtensionRuntime:
             try:
                 outcome = self._invoke_handler(registered, InputHookInput(value))
             except Exception as exc:
-                self._emit(
-                    ExtensionEventKind.HANDLER_FAILED,
-                    extension_name=registered.extension_name,
-                    hook=Hook.INPUT,
-                    code="handler_exception",
-                    message=f"{type(exc).__name__}: {exc}",
-                )
-                raise ExtensionDispatchError(
-                    f"Extension {registered.extension_name!r} input handler failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
+                self._handler_failed(registered, Hook.INPUT, exc)
             if isinstance(outcome, Observe):
                 self._emit(
                     ExtensionEventKind.HANDLER_OUTCOME,
@@ -1047,6 +1041,19 @@ class ExtensionRuntime:
                 ):
                     raise ExtensionDispatchError(
                         "tool_result handlers cannot change call_id or tool_name"
+                    )
+                # A post-execution policy may reject successful output before Provider
+                # feedback by downgrading success to error. Cancellation is provenance,
+                # not a policy verdict, so handlers cannot introduce or erase it.
+                if validated.status == "cancelled" and original.status != "cancelled":
+                    original_state = "successful" if original.status == "success" else "failed"
+                    raise ExtensionDispatchError(
+                        f"tool_result handlers cannot relabel a {original_state} "
+                        "ToolResult as cancelled"
+                    )
+                if original.status == "cancelled" and validated.status != "cancelled":
+                    raise ExtensionDispatchError(
+                        "tool_result handlers cannot relabel a cancelled ToolResult"
                     )
                 if original.status != "success" and validated.status == "success":
                     raise ExtensionDispatchError(
@@ -1617,11 +1624,16 @@ class ExtensionRuntime:
         hook: Hook,
         error: Exception,
     ) -> NoReturn:
+        code = (
+            "handler_cancelled"
+            if isinstance(error, SyncCalloutCancellationError)
+            else "handler_exception"
+        )
         self._emit(
             ExtensionEventKind.HANDLER_FAILED,
             extension_name=registered.extension_name,
             hook=hook,
-            code="handler_exception",
+            code=code,
             message=f"{type(error).__name__}: {error}",
         )
         raise ExtensionDispatchError(
@@ -1631,12 +1643,7 @@ class ExtensionRuntime:
 
     @staticmethod
     def _invoke_handler(registered: _RegisteredHandler, hook_input: object) -> HookOutcome:
-        try:
-            outcome = invoke_sync_callout(registered.handler, hook_input)
-        except asyncio.CancelledError as exc:
-            raise ExtensionDispatchError(
-                "Extension handlers cannot cancel the authoritative Agent Run"
-            ) from exc
+        outcome = invoke_sync_callout(registered.handler, hook_input)
         if inspect.isawaitable(outcome):
             dispose_awaitable(outcome)
             raise ExtensionDispatchError(

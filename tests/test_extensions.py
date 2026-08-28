@@ -55,8 +55,10 @@ from coding_agent import (
     SessionHookInput,
     SessionStateError,
     Supplement,
+    ToolBatchResult,
     ToolCall,
     ToolCallHookInput,
+    ToolError,
     ToolExecutionHookInput,
     ToolOutput,
     ToolResult,
@@ -719,6 +721,102 @@ class _ToolResultSupplementExtension:
     def _supplement(self, hook_input: ToolResultHookInput) -> Supplement[ToolResultSupplement]:
         assert hook_input.result.output == {"echo": "hello", "transformed": True}
         return Supplement(ToolResultSupplement(output={"supplemented": "second"}))
+
+
+class _RejectSuccessfulToolResultExtension:
+    name = "reject-successful-tool-result"
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.TOOL_RESULT, self._transform)
+
+    def _transform(self, hook_input: ToolResultHookInput) -> Transform[ToolResult]:
+        result = hook_input.result
+        return Transform(
+            ToolResult(
+                result.call_id,
+                result.tool_name,
+                "error",
+                result.output,
+                ToolError("unsafe_output", "Tool output failed Extension policy"),
+            )
+        )
+
+
+class _CancelSuccessfulToolResultExtension:
+    name = "cancel-successful-tool-result"
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.TOOL_RESULT, self._transform)
+
+    def _transform(self, hook_input: ToolResultHookInput) -> Transform[ToolResult]:
+        result = hook_input.result
+        return Transform(
+            ToolResult(
+                result.call_id,
+                result.tool_name,
+                "cancelled",
+                result.output,
+                ToolError("extension_cancelled", "Extension relabelled completed execution"),
+            )
+        )
+
+
+class _RewriteCancelledToolResultExtension:
+    def __init__(self, replacement: str) -> None:
+        self.name = f"rewrite-cancelled-as-{replacement}"
+        self._replacement = replacement
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.TOOL_RESULT, self._transform)
+
+    def _transform(self, hook_input: ToolResultHookInput) -> Transform[ToolResult] | Block:
+        result = hook_input.result
+        if self._replacement == "block":
+            return Block("extension_block", "Extension tried to block cancellation")
+        if self._replacement == "exception":
+            raise RuntimeError("Extension failed while observing cancellation")
+        if self._replacement == "success":
+            return Transform(
+                ToolResult(
+                    result.call_id,
+                    result.tool_name,
+                    "success",
+                    {"forged": True},
+                )
+            )
+        return Transform(
+            ToolResult(
+                result.call_id,
+                result.tool_name,
+                "error",
+                result.output,
+                ToolError("replacement_error", "Extension erased cancellation"),
+            )
+        )
+
+
+class _CancelledToolRuntime(ToolRuntime):
+    async def execute_batch(
+        self,
+        calls: tuple[ToolCall, ...],
+        cancel_event: asyncio.Event | None = None,
+        *,
+        on_progress: Any = None,
+    ) -> ToolBatchResult:
+        del cancel_event, on_progress
+        return ToolBatchResult(
+            self.batch_mode(calls),
+            tuple(
+                ToolResult(
+                    call.call_id,
+                    call.tool_name,
+                    "cancelled",
+                    error=ToolError("cancelled", "tool execution was cancelled"),
+                )
+                for call in calls
+            ),
+            tuple(call.call_id for call in calls),
+        )
 
 
 class _ContextExtension:
@@ -1683,6 +1781,144 @@ def test_tool_result_transform_and_supplement_compose_before_provider_feedback(
         "supplemented": "second",
     }
     assert execution_results[0].output == message.results[0].output
+
+
+def test_tool_result_can_reject_successful_output_before_provider_feedback(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        (
+            _tool_call_events("extension_echo", {"value": "hello"}),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+        extensions=(_ToolExtension(), _RejectSuccessfulToolResultExtension()),
+    )
+
+    async def run_once() -> ToolResult:
+        execution_result: ToolResult | None = None
+        run = kernel.create_run("reject unsafe tool output")
+        async for event in run:
+            agent_event = event.agent_event
+            if (
+                agent_event is not None
+                and agent_event.kind is AgentEventKind.TOOL_EXECUTION_END
+                and agent_event.tool_result is not None
+            ):
+                execution_result = agent_event.tool_result
+        await run.result()
+        assert execution_result is not None
+        return execution_result
+
+    execution_result = asyncio.run(run_once())
+
+    assert execution_result.status == "error"
+    assert execution_result.output == {"echo": "hello"}
+    assert execution_result.error is not None
+    assert execution_result.error.code == "unsafe_output"
+    message = provider.requests[1].messages[-1]
+    assert isinstance(message, ToolResultMessage)
+    assert message.results == (execution_result,)
+
+
+def test_tool_result_cannot_relabel_completed_execution_as_cancelled(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        (
+            _tool_call_events("extension_echo", {"value": "hello"}),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+        extensions=(_ToolExtension(), _CancelSuccessfulToolResultExtension()),
+    )
+
+    async def run_once() -> ToolResult:
+        execution_result: ToolResult | None = None
+        run = kernel.create_run("preserve cancellation provenance")
+        async for event in run:
+            agent_event = event.agent_event
+            if (
+                agent_event is not None
+                and agent_event.kind is AgentEventKind.TOOL_EXECUTION_END
+                and agent_event.tool_result is not None
+            ):
+                execution_result = agent_event.tool_result
+        await run.result()
+        assert execution_result is not None
+        return execution_result
+
+    execution_result = asyncio.run(run_once())
+
+    assert execution_result.status == "error"
+    assert execution_result.error is not None
+    assert execution_result.error.code == "extension_rejected"
+    assert "cannot relabel a successful ToolResult as cancelled" in execution_result.error.message
+    message = provider.requests[1].messages[-1]
+    assert isinstance(message, ToolResultMessage)
+    assert message.results == (execution_result,)
+    assert any(
+        event.kind is ExtensionEventKind.OUTCOME_REJECTED and event.hook is Hook.TOOL_RESULT
+        for event in kernel.drain_extension_events()
+    )
+
+
+@pytest.mark.parametrize("replacement", ["error", "success", "block", "exception"])
+def test_rejected_tool_result_rewrite_preserves_cancellation_provenance(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    provider = FakeProvider(
+        (
+            _tool_call_events("extension_echo", {"value": "hello"}),
+            (ProviderDone(),),
+        )
+    )
+    runtime = _CancelledToolRuntime(LocalCodingEnvironment(tmp_path))
+    runtime.register_many((_EchoTool(),), enable=True)
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=runtime,
+        extensions=(_RewriteCancelledToolResultExtension(replacement),),
+    )
+
+    async def run_once() -> ToolResult:
+        execution_result: ToolResult | None = None
+        run = kernel.create_run("preserve cancelled ToolResult")
+        async for event in run:
+            agent_event = event.agent_event
+            if (
+                agent_event is not None
+                and agent_event.kind is AgentEventKind.TOOL_EXECUTION_END
+                and agent_event.tool_result is not None
+            ):
+                execution_result = agent_event.tool_result
+        await run.result()
+        assert execution_result is not None
+        return execution_result
+
+    execution_result = asyncio.run(run_once())
+
+    assert execution_result.status == "cancelled"
+    assert execution_result.error is not None
+    assert execution_result.error.code == "cancelled"
+    message = provider.requests[1].messages[-1]
+    assert isinstance(message, ToolResultMessage)
+    assert message.results == (execution_result,)
+    expected_kind = {
+        "error": ExtensionEventKind.OUTCOME_REJECTED,
+        "success": ExtensionEventKind.OUTCOME_REJECTED,
+        "block": ExtensionEventKind.DISPATCH_BLOCKED,
+        "exception": ExtensionEventKind.HANDLER_FAILED,
+    }[replacement]
+    assert any(
+        event.kind is expected_kind and event.hook is Hook.TOOL_RESULT
+        for event in kernel.drain_extension_events()
+    )
 
 
 def test_context_supplements_compose_in_registration_order_and_revalidate() -> None:
@@ -3142,6 +3378,18 @@ class _CancellingInputExtension:
         raise asyncio.CancelledError("extension handler requested cancellation")
 
 
+class _LoopBoundInputExtension:
+    name = "loop-bound-input"
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.INPUT, self._access_loop)
+
+    def _access_loop(self, hook_input: InputHookInput) -> Observe:
+        del hook_input
+        asyncio.get_running_loop()
+        return Observe()
+
+
 def test_provider_and_hook_cancellation_do_not_impersonate_host_cancellation() -> None:
     async def run_once(kernel: AgentKernel) -> tuple[AgentRunState, str | None]:
         run = kernel.create_run("cancellation provenance")
@@ -3162,6 +3410,62 @@ def test_provider_and_hook_cancellation_do_not_impersonate_host_cancellation() -
 
     assert provider_result == (AgentRunState.FAILED, "provider_exception")
     assert hook_result == (AgentRunState.FAILED, "extension_input_rejected")
+
+
+def test_sync_hook_cancellation_has_an_explicit_extension_diagnostic() -> None:
+    kernel = AgentKernel(
+        FakeProvider(((ProviderDone(),),)),
+        extensions=(_CancellingInputExtension(),),
+    )
+
+    async def run_once() -> None:
+        run = kernel.create_run("extension cancellation diagnostic")
+        async for _ in run:
+            pass
+        result = await run.result()
+        assert result.state is AgentRunState.FAILED
+        assert result.error is not None
+        assert result.error.code == "extension_input_rejected"
+
+    asyncio.run(run_once())
+
+    failures = [
+        event
+        for event in kernel.drain_extension_events()
+        if event.kind is ExtensionEventKind.HANDLER_FAILED and event.hook is Hook.INPUT
+    ]
+    assert len(failures) == 1
+    assert failures[0].code == "handler_cancelled"
+    assert failures[0].message == (
+        "SyncCalloutCancellationError: Synchronous capability callout attempted cancellation"
+    )
+
+
+def test_sync_hook_cannot_access_the_authoritative_event_loop() -> None:
+    kernel = AgentKernel(
+        FakeProvider(((ProviderDone(),),)),
+        extensions=(_LoopBoundInputExtension(),),
+    )
+
+    async def run_once() -> None:
+        run = kernel.create_run("loop-bound handler")
+        async for _ in run:
+            pass
+        result = await run.result()
+        assert result.state is AgentRunState.FAILED
+        assert result.error is not None
+        assert result.error.code == "extension_input_rejected"
+
+    asyncio.run(run_once())
+
+    failures = [
+        event
+        for event in kernel.drain_extension_events()
+        if event.kind is ExtensionEventKind.HANDLER_FAILED and event.hook is Hook.INPUT
+    ]
+    assert len(failures) == 1
+    assert failures[0].code == "handler_exception"
+    assert failures[0].message == "RuntimeError: no running event loop"
 
 
 class _SelfCancellingTool:

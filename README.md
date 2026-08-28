@@ -9,6 +9,34 @@ handler；没有目录扫描、entry point、自动发现或热重载。Hook 只
 Extension Tool 继续使用既有 `ToolRuntime` 的 schema、调度、取消与 structured
 `ToolResult` 路径；custom entry 继续使用 append-only Session/Store 路径。
 
+### 同步 callout 与线程契约
+
+Extension 的 `register()`、Hook handler 和 custom `SessionEntry` validator 都是同步
+callout，并在独立 worker thread 中运行。它们必须在有限时间内同步返回，且必须线程
+安全：不得 `await`、不得访问或操作绑定到 Host event loop 的 asyncio 对象，也不得
+在没有自行同步的情况下读写与 Host 或其他 callback 共享的可变状态。推荐只读取
+Kernel 提供的 owned snapshot，并通过明确的 outcome 返回候选值。
+
+Kernel 会把可检测的违规确定性转换为 registration/dispatch/validation failure：返回
+awaitable、抛出 `CancelledError`、访问当前 running loop 或返回非法 outcome 都不会
+取得 Host Task 的取消权，其中 handler cancellation 使用独立的
+`handler_cancelled` 诊断码。Python thread 无法被宿主安全强制终止，因此 callback
+死锁、无限阻塞和未同步 data race 不能由该合约自动修复；callout timeout 与 process
+isolation 是后续 Host/plugin sandbox 的职责，不属于当前 Kernel 合约。
+
+### `ToolResult` 权威与快照成本
+
+`tool_result` handler 可以把已成功执行的输出降级为 `error`，用于在结果反馈给
+Provider 前执行内容或策略校验；这不会回滚 Tool 已经发生的副作用。非成功结果不能
+升级为 `success`，而 `cancelled` 是取消来源事实，handler 既不能引入也不能擦除该
+状态。
+
+为阻止别名逃逸，每个接收 Provider stream event 的 handler 都获得 request 与 event
+的独立深快照；没有对应 handler 时不会复制 request。时间和临时内存开销因此随
+`request size × handler count × event count` 线性增长。面向高频或大 Context 的 Host
+应使用代表性 payload 做容量基准；在没有明确吞吐目标前，Kernel 优先保留所有权隔离，
+不通过共享可变 request 来投机优化。
+
 运行三个确定性场景：
 
 ```console

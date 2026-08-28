@@ -860,6 +860,11 @@ class AgentKernel:
                             )
                         )
                     except ExtensionBlockedError as exc:
+                        if result.status == "cancelled":
+                            # Cancellation is an authoritative execution fact. The
+                            # ExtensionEvent retains the secondary block diagnostic.
+                            transformed_results.append(result)
+                            continue
                         transformed_results.append(
                             ToolResult(
                                 result.call_id,
@@ -870,6 +875,11 @@ class AgentKernel:
                             )
                         )
                     except ExtensionDispatchError as exc:
+                        if result.status == "cancelled":
+                            # Rejection/failure is secondary to the original
+                            # cancellation and must not rewrite its provenance.
+                            transformed_results.append(result)
+                            continue
                         transformed_results.append(
                             ToolResult(
                                 result.call_id,
