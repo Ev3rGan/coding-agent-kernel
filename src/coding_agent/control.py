@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from itertools import count
 
 from coding_agent.events import PendingMessage, PendingMessageKind
+from coding_agent.permissions import (
+    PermissionEvaluation,
+    PermissionRequest,
+    ToolCallLike,
+    make_permission_request,
+)
 from coding_agent.provider import UserMessage
 
 
@@ -44,6 +50,8 @@ class RunControl:
         self._numbers = count(1)
         self._steering: deque[PendingMessage] = deque()
         self._follow_up: deque[PendingMessage] = deque()
+        self._permission_numbers = count(1)
+        self._pending_permission: tuple[PermissionRequest, asyncio.Future[bool]] | None = None
         self.cancel_event = asyncio.Event()
 
     def enqueue(self, kind: PendingMessageKind, text: str) -> PendingMessage:
@@ -74,6 +82,52 @@ class RunControl:
         self._steering.clear()
         self._follow_up.clear()
         return dropped
+
+    def open_permission(
+        self,
+        call: ToolCallLike,
+        evaluation: PermissionEvaluation,
+    ) -> PermissionRequest:
+        if self._pending_permission is not None:
+            raise RuntimeError("AgentRun already has a pending Permission Request")
+        request = make_permission_request(
+            run_id=self._run_id,
+            ordinal=next(self._permission_numbers),
+            call=call,
+            evaluation=evaluation,
+        )
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_permission = (request, future)
+        return request
+
+    async def wait_for_permission(self, request: PermissionRequest) -> bool:
+        pending = self._pending_permission
+        if pending is None or pending[0] != request:
+            raise RuntimeError("Permission Request is no longer pending")
+        try:
+            return await pending[1]
+        finally:
+            if self._pending_permission == pending:
+                self._pending_permission = None
+
+    def resolve_permission(self, request_id: str, approved: bool) -> None:
+        if type(approved) is not bool:
+            raise TypeError("Permission resolution must be a boolean")
+        pending = self._pending_permission
+        if pending is None:
+            raise RuntimeError("AgentRun has no pending Permission Request")
+        request, future = pending
+        if request.request_id != request_id:
+            raise RuntimeError("Permission Request is stale or does not match the pending request")
+        if future.done():
+            raise RuntimeError("Permission Request has already been resolved")
+        future.set_result(approved)
+
+    def invalidate_permission(self) -> None:
+        pending = self._pending_permission
+        self._pending_permission = None
+        if pending is not None and not pending[1].done():
+            pending[1].cancel()
 
     def _drain(self, kind: PendingMessageKind) -> tuple[PendingMessage, ...]:
         queue = self._queue(kind)

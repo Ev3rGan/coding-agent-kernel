@@ -6,7 +6,10 @@ import argparse
 import asyncio
 import dataclasses
 import difflib
+import getpass
 import json
+import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -27,12 +30,21 @@ from coding_agent.events import (
     ProviderError,
     ProviderStreamEvent,
     ProviderTextDelta,
+    ToolCall,
     ToolResult,
     assistant_message_record,
 )
-from coding_agent.extensions import ExtensionEvent, ExtensionEventKind
+from coding_agent.extensions import (
+    ExtensionEvent,
+    ExtensionEventKind,
+    ExtensionRegistry,
+    Hook,
+    ToolCallHookInput,
+    Transform,
+)
 from coding_agent.extensions_example import ExtensionDemoCase, run_extension_demo
 from coding_agent.kernel import AgentKernel
+from coding_agent.permissions import PermissionMode
 from coding_agent.provider import FakeProvider, ModelMessage, ToolResultMessage, UserMessage
 from coding_agent.session import JsonlSessionStore, Session, SessionError
 from coding_agent.tool_runtime import ToolRuntime
@@ -122,6 +134,28 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
         record["attempt"] = event.retry_attempt
         record["remaining"] = event.retry_remaining
         record["error"] = _error_record(event.retry_error)
+    if event.permission_request is not None:
+        request = event.permission_request
+        record["permission_request"] = {
+            "request_id": request.request_id,
+            "call_id": request.call_id,
+            "tool_name": request.tool_name,
+            "final_arguments": request.final_arguments,
+            "operation_intent": request.intent.record(),
+            "reason": request.reason,
+        }
+    if event.permission_decision is not None:
+        decision = event.permission_decision
+        record["permission_decision"] = {
+            "call_id": decision.call_id,
+            "tool_name": decision.tool_name,
+            "mode": decision.mode.value,
+            "resolution": decision.resolution,
+            "source": decision.source,
+            "final_arguments": decision.final_arguments,
+            "operation_intent": decision.intent.record(),
+            "reason": decision.reason,
+        }
     return record
 
 
@@ -351,7 +385,7 @@ async def _extensions_demo(case: ExtensionDemoCase) -> int:
         "custom_session_entries": [
             {"kind": entry.kind, "payload": entry.payload}
             for entry in report.session_entries
-            if entry.kind not in {"configuration", "message", "compaction"}
+            if entry.kind not in {"configuration", "message", "compaction", "permission_decision"}
         ],
         "ordered_outcomes": [
             {
@@ -450,11 +484,7 @@ def _tool_loop_script(case: str) -> tuple[tuple[ProviderStreamEvent, ...], ...]:
             (ProviderTextDelta("Observed three structured tool failures."), ProviderDone()),
         )
 
-    verify = (
-        f'"{sys.executable}" -c "from pathlib import Path; '
-        "assert Path('sample.py').read_text().strip() == 'value = 2'; "
-        "print('verified')\""
-    )
+    verify = 'findstr "value = 2" sample.py' if os.name == "nt" else 'grep -F "value = 2" sample.py'
     return (
         (
             *_scripted_tool_call_events(0, "read", "read", {"path": "sample.py"}),
@@ -471,6 +501,426 @@ def _tool_loop_script(case: str) -> tuple[tuple[ProviderStreamEvent, ...], ...]:
     )
 
 
+def _permission_script(
+    mode: PermissionMode,
+    identity_command: str,
+) -> tuple[tuple[ProviderStreamEvent, ...], ...]:
+    if mode is PermissionMode.ASK:
+        calls = (
+            *_scripted_tool_call_events(
+                0,
+                "approved-write",
+                "write",
+                {"path": "approved.txt", "content": "approved"},
+            ),
+            *_scripted_tool_call_events(
+                1,
+                "denied-write",
+                "write",
+                {"path": "denied.txt", "content": "denied"},
+            ),
+        )
+    elif mode is PermissionMode.AUTO:
+        calls = (
+            *_scripted_tool_call_events(
+                0,
+                "workspace-write",
+                "write",
+                {"path": "auto.txt", "content": "auto"},
+            ),
+            *_scripted_tool_call_events(
+                1,
+                "outside-write",
+                "write",
+                {"path": "../outside-auto.txt", "content": "blocked"},
+            ),
+            *_scripted_tool_call_events(
+                2,
+                "network-shell",
+                "bash",
+                {"command": "curl https://example.invalid"},
+            ),
+            *_scripted_tool_call_events(
+                3,
+                "unknown-shell",
+                "bash",
+                {"command": "echo changed > auto-shell.txt"},
+            ),
+        )
+    elif mode is PermissionMode.FULL:
+        calls = (
+            *_scripted_tool_call_events(
+                0,
+                "outside-write",
+                "write",
+                {"path": "../outside-full.txt", "content": "full"},
+            ),
+            *_scripted_tool_call_events(
+                1,
+                "os-identity",
+                "bash",
+                {"command": identity_command},
+            ),
+        )
+    else:
+        calls = (
+            *_scripted_tool_call_events(
+                0,
+                "workspace-read",
+                "read",
+                {"path": "input.txt"},
+            ),
+            *_scripted_tool_call_events(
+                1,
+                "workspace-write",
+                "write",
+                {"path": "plan.txt", "content": "blocked"},
+            ),
+            *_scripted_tool_call_events(
+                2,
+                "diagnostic-shell",
+                "bash",
+                {"command": "git status"},
+            ),
+            *_scripted_tool_call_events(
+                3,
+                "network-shell",
+                "bash",
+                {"command": "curl https://example.invalid"},
+            ),
+            *_scripted_tool_call_events(
+                4,
+                "outside-read",
+                "read",
+                {"path": "../outside-source.txt"},
+            ),
+            *_scripted_tool_call_events(
+                5,
+                "unknown-shell",
+                "bash",
+                {"command": "echo changed > plan-shell.txt"},
+            ),
+        )
+    return (
+        (*calls, ProviderDone("tool_use")),
+        (ProviderTextDelta(f"Permission Mode {mode.value} demo complete."), ProviderDone()),
+    )
+
+
+class _PermissionRewriteExtension:
+    name = "permission-rewrite"
+
+    def __init__(self) -> None:
+        self._call_count = 0
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.TOOL_CALL, self._rewrite)
+
+    def _rewrite(self, hook_input: ToolCallHookInput) -> Transform[ToolCall]:
+        self._call_count += 1
+        arguments = hook_input.arguments
+        if self._call_count > 1:
+            arguments["path"] = "after.txt"
+        return Transform(ToolCall(hook_input.call_id, hook_input.tool_name, arguments))
+
+
+async def _permission_extension_rewrite_demo(root: Path) -> int:
+    workspace = root / "workspace"
+    workspace.mkdir()
+    provider = FakeProvider(
+        (
+            (
+                *_scripted_tool_call_events(
+                    0,
+                    "rewrite-write",
+                    "write",
+                    {"path": "before.txt", "content": "must-not-write"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+            (
+                *_scripted_tool_call_events(
+                    0,
+                    "rewrite-write",
+                    "write",
+                    {"path": "before.txt", "content": "must-not-write"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel.with_new_session(
+        provider,
+        JsonlSessionStore(root / "session.jsonl"),
+        configuration={"provider": "fake", "demo": "permission-rewrite"},
+        session_id="permission-rewrite-demo",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+        extensions=(_PermissionRewriteExtension(),),
+    )
+    run = kernel.create_run("Demonstrate post-Hook binding.", permission_mode=PermissionMode.ASK)
+    prior_request_id: str | None = None
+    stale_approval_rejected = False
+    final_path = ""
+    async for event in run:
+        record = _event_record(event)
+        record["permission_mode"] = PermissionMode.ASK.value
+        _print_record(record)
+        request = event.permission_request
+        if request is None:
+            continue
+        final_path = str(request.final_arguments["path"])
+        if prior_request_id is None:
+            prior_request_id = request.request_id
+            await run.resolve_permission(request.request_id, True)
+            continue
+        try:
+            await run.resolve_permission(prior_request_id, True)
+        except RuntimeError:
+            stale_approval_rejected = True
+        await run.resolve_permission(request.request_id, False)
+    result = await run.result()
+    kernel.close_session()
+    side_effect_free = (workspace / "before.txt").read_text(
+        encoding="utf-8"
+    ) == "must-not-write" and not (workspace / "after.txt").exists()
+    _print_record(
+        {
+            "permission_demo": {
+                "case": "extension-rewrite",
+                "mode": PermissionMode.ASK.value,
+                "state": result.state.value,
+                "stale_approval_rejected": stale_approval_rejected,
+                "final_binding_confirmed": final_path == "after.txt",
+                "final_path": final_path,
+                "denied_side_effect_free": side_effect_free,
+            }
+        }
+    )
+    return int(
+        result.state is not AgentRunState.SETTLED
+        or not stale_approval_rejected
+        or final_path != "after.txt"
+        or not side_effect_free
+    )
+
+
+async def _permission_pending_terminal_demo(root: Path, case: str) -> int:
+    workspace = root / "workspace"
+    workspace.mkdir()
+    provider = FakeProvider(
+        (
+            (
+                *_scripted_tool_call_events(
+                    0,
+                    "pending-write",
+                    "write",
+                    {"path": "pending.txt", "content": "must-not-write"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+        )
+    )
+    kernel = AgentKernel.with_new_session(
+        provider,
+        JsonlSessionStore(root / "session.jsonl"),
+        configuration={"provider": "fake", "demo": case},
+        session_id=f"permission-{case}-demo",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+    )
+    run = kernel.create_run("Wait for a Host decision.", permission_mode=PermissionMode.ASK)
+    async for event in run:
+        record = _event_record(event)
+        record["permission_mode"] = PermissionMode.ASK.value
+        _print_record(record)
+        if event.permission_request is not None:
+            if case == "host-disconnect":
+                await run.aclose()
+            else:
+                await run.cancel()
+            break
+    result = await run.result()
+    pending_persisted = any(
+        entry.kind == "permission_decision" for entry in kernel.session_active_branch
+    )
+    kernel.close_session()
+    tool_executed = (workspace / "pending.txt").exists()
+    _print_record(
+        {
+            "permission_demo": {
+                "case": case,
+                "mode": PermissionMode.ASK.value,
+                "state": result.state.value,
+                "pending_persisted": pending_persisted,
+                "tool_executed": tool_executed,
+            }
+        }
+    )
+    return int(result.state is not AgentRunState.CANCELLED or pending_persisted or tool_executed)
+
+
+async def _permission_resume_demo(root: Path) -> int:
+    workspace = root / "workspace"
+    workspace.mkdir()
+    store = JsonlSessionStore(root / "session.jsonl")
+    provider = FakeProvider(
+        (
+            (
+                *_scripted_tool_call_events(
+                    0,
+                    "pending-write",
+                    "write",
+                    {"path": "pending.txt", "content": "must-not-write"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel.with_new_session(
+        provider,
+        store,
+        configuration={"provider": "fake", "demo": "permission-resume"},
+        session_id="permission-resume-demo",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+    )
+    pending_run = kernel.create_run(
+        "Create a transient request.", permission_mode=PermissionMode.ASK
+    )
+    async for event in pending_run:
+        record = _event_record(event)
+        record["permission_mode"] = PermissionMode.ASK.value
+        _print_record(record)
+        if event.permission_request is not None:
+            await pending_run.cancel()
+            break
+    await pending_run.result()
+
+    full_run = kernel.create_run("Select full explicitly.", permission_mode=PermissionMode.FULL)
+    async for event in full_run:
+        record = _event_record(event)
+        record["permission_mode"] = PermissionMode.FULL.value
+        _print_record(record)
+    await full_run.result()
+    selected_before_resume = full_run.permission_mode
+    pending_persisted = any(
+        entry.kind == "permission_decision" for entry in kernel.session_active_branch
+    )
+    kernel.close_session()
+
+    resumed = AgentKernel.with_resumed_session(
+        FakeProvider(((ProviderDone(),),)),
+        store,
+        "permission-resume-demo",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+    )
+    resumed_run = resumed.create_run("Resume with the safe default.")
+    async for event in resumed_run:
+        record = _event_record(event)
+        record["permission_mode"] = resumed_run.permission_mode.value
+        _print_record(record)
+    result = await resumed_run.result()
+    resumed.close_session()
+    _print_record(
+        {
+            "permission_demo": {
+                "case": "resume",
+                "state": result.state.value,
+                "selected_before_resume": selected_before_resume.value,
+                "resumed_mode": resumed_run.permission_mode.value,
+                "pending_persisted": pending_persisted,
+            }
+        }
+    )
+    return int(
+        result.state is not AgentRunState.SETTLED
+        or selected_before_resume is not PermissionMode.FULL
+        or resumed_run.permission_mode is not PermissionMode.AUTO
+        or pending_persisted
+    )
+
+
+async def _permissions_demo(mode_value: str, case: str) -> int:
+    mode = PermissionMode(mode_value)
+    with tempfile.TemporaryDirectory(prefix="coding-agent-permissions-") as temporary:
+        root = Path(temporary)
+        if case == "extension-rewrite":
+            return await _permission_extension_rewrite_demo(root)
+        if case in {"cancel", "host-disconnect"}:
+            return await _permission_pending_terminal_demo(root, case)
+        if case == "resume":
+            return await _permission_resume_demo(root)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        (workspace / "input.txt").write_text("input", encoding="utf-8")
+        (root / "outside-source.txt").write_text("outside", encoding="utf-8")
+        host_identity = getpass.getuser().strip()
+        identity_command = subprocess.list2cmdline(
+            [sys.executable, "-c", "import getpass; print(getpass.getuser())"]
+        )
+        provider = FakeProvider(_permission_script(mode, identity_command))
+        kernel = AgentKernel.with_new_session(
+            provider,
+            JsonlSessionStore(root / "session.jsonl"),
+            configuration={"provider": "fake", "demo": "permissions"},
+            session_id="permission-demo",
+            tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+        )
+        run = kernel.create_run("Demonstrate Host-controlled permissions.", permission_mode=mode)
+        observed_results: dict[str, dict[str, Any]] = {}
+        tool_identity: str | None = None
+        async for event in run:
+            record = _event_record(event)
+            record["permission_mode"] = mode.value
+            _print_record(record)
+            if event.permission_request is not None:
+                await run.resolve_permission(
+                    event.permission_request.request_id,
+                    event.permission_request.call_id == "approved-write",
+                )
+            if event.tool_result is not None:
+                result_record = _tool_result_record(event.tool_result)
+                if event.tool_result.call_id == "os-identity" and event.tool_result.output:
+                    tool_identity = str(event.tool_result.output.get("stdout", "")).strip()
+                observed_results[event.tool_result.call_id] = {
+                    "status": result_record["status"],
+                    "error": (
+                        None if result_record["error"] is None else result_record["error"]["code"]
+                    ),
+                }
+        result = await run.result()
+        kernel.close_session()
+        os_authority_unchanged = (
+            tool_identity is not None and tool_identity.casefold() == host_identity.casefold()
+        )
+        warning = (
+            "RISK: full bypasses Kernel approval and workspace containment; "
+            "OS authority, cancellation, timeout, and process lifecycle are unchanged."
+            if mode is PermissionMode.FULL
+            else ""
+        )
+        _print_record(
+            {
+                "permission_demo": {
+                    "case": case,
+                    "mode": mode.value,
+                    "state": result.state.value,
+                    "results": observed_results,
+                    "approved_exists": (workspace / "approved.txt").exists(),
+                    "denied_exists": (workspace / "denied.txt").exists(),
+                    "workspace_write_exists": (workspace / "auto.txt").exists(),
+                    "outside_exists": (root / f"outside-{mode.value}.txt").exists(),
+                    "warning": warning,
+                    "os_authority_unchanged": os_authority_unchanged,
+                }
+            }
+        )
+        return int(
+            result.state is not AgentRunState.SETTLED
+            or (mode is PermissionMode.FULL and not os_authority_unchanged)
+        )
+
+
 async def _tool_loop_demo(case: str) -> int:
     with tempfile.TemporaryDirectory(prefix="coding-agent-tool-loop-") as temporary:
         workspace = Path(temporary)
@@ -483,8 +933,16 @@ async def _tool_loop_demo(case: str) -> int:
         run = AgentKernel(provider, tool_runtime=runtime).create_run(
             "Run the deterministic coding task."
         )
+        verification_succeeded = case != "success"
         async for event in run:
             _print_record(_event_record(event))
+            if event.tool_result is not None and event.tool_result.call_id == "verify":
+                stdout = (
+                    "" if event.tool_result.output is None else event.tool_result.output["stdout"]
+                )
+                verification_succeeded = (
+                    event.tool_result.status == "success" and "value = 2" in str(stdout)
+                )
         result = await run.result()
         _print_record(_result_record(result))
         after = (workspace / "sample.py").read_text(encoding="utf-8")
@@ -497,7 +955,7 @@ async def _tool_loop_demo(case: str) -> int:
             )
         )
         _print_record({"workspace": {"before": before, "after": after, "diff": diff}})
-        return 0 if result.state is AgentRunState.SETTLED else 1
+        return int(result.state is not AgentRunState.SETTLED or not verification_succeeded)
 
 
 async def _run_session_message(kernel: AgentKernel) -> None:
@@ -846,6 +1304,22 @@ def _parser() -> argparse.ArgumentParser:
         default="success",
         help="deterministic Extension scenario",
     )
+    permissions = demos.add_parser(
+        "permissions",
+        help="run Host-controlled Permission Mode scenarios",
+    )
+    permissions.add_argument(
+        "--mode",
+        choices=tuple(mode.value for mode in PermissionMode),
+        default=PermissionMode.AUTO.value,
+        help="Host-selected run-scoped Permission Mode",
+    )
+    permissions.add_argument(
+        "--case",
+        choices=("standard", "extension-rewrite", "cancel", "host-disconnect", "resume"),
+        default="standard",
+        help="deterministic permission lifecycle scenario",
+    )
     return parser
 
 
@@ -865,4 +1339,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_run_control_demo(args.case))
     if args.command == "demo" and args.demo == "extensions":
         return asyncio.run(_extensions_demo(args.case))
+    if args.command == "demo" and args.demo == "permissions":
+        return asyncio.run(_permissions_demo(args.mode, args.case))
     raise AssertionError("argparse accepted an unsupported command")

@@ -184,6 +184,13 @@ async def _files(root: Path, cancel_event: asyncio.Event | None) -> list[Path]:
     return paths
 
 
+def _display_path(path: Path, environment: LocalCodingEnvironment) -> str:
+    try:
+        return path.relative_to(environment.workspace).as_posix()
+    except ValueError:
+        return str(path)
+
+
 class GrepTool:
     spec = ToolSpec(
         "grep",
@@ -207,14 +214,14 @@ class GrepTool:
         candidates = await _files(root, cancel_event) if root.is_dir() else [root]
         for path in candidates:
             raise_if_cancelled(cancel_event)
-            relative = path.relative_to(environment.workspace).as_posix()
-            content = await environment.read_text(relative, cancel_event)
+            display_path = _display_path(path, environment)
+            content = await environment.read_text(str(path), cancel_event)
             for line_number, line in enumerate(content.splitlines(), 1):
                 raise_if_cancelled(cancel_event)
                 if pattern.search(line):
                     matches.append(
                         {
-                            "path": path.relative_to(environment.workspace).as_posix(),
+                            "path": display_path,
                             "line": line_number,
                             "text": line,
                         }
@@ -242,7 +249,7 @@ class FindTool:
         del on_progress
         root = environment.resolve_path(arguments.get("path", "."))
         paths = [
-            path.relative_to(environment.workspace).as_posix()
+            _display_path(path, environment)
             for path in await _files(root, cancel_event)
             if fnmatch.fnmatch(path.name, arguments["pattern"])
         ]

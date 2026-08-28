@@ -20,6 +20,7 @@ from coding_agent.events import (
     PendingMessageKind,
 )
 from coding_agent.extensions import ExtensionError
+from coding_agent.permissions import PermissionMode
 from coding_agent.session import Session
 
 _STREAM_END: Final = object()
@@ -41,6 +42,7 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         initial_events: tuple[AgentSessionEvent, ...] = (),
         event_observer: RunEventObserver | None = None,
         settled_observer: RunSettledObserver | None = None,
+        permission_mode: PermissionMode = PermissionMode.AUTO,
     ) -> None:
         loop = asyncio.get_running_loop()
         self._run_id = run_id
@@ -51,6 +53,7 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         self._stream_exhausted = False
         self._session = session
         self._control = RunControl(run_id)
+        self._permission_mode = permission_mode
         self._terminal_lock = asyncio.Lock()
         self._cancel_requested = False
         self._event_observer = event_observer
@@ -71,6 +74,12 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         """The current run state."""
 
         return self._state
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        """The immutable Host-selected Permission Mode for this Agent Run."""
+
+        return self._permission_mode
 
     def __aiter__(self) -> AgentRun:
         if self._iterator_claimed:
@@ -104,6 +113,7 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
             if self._state is AgentRunState.ACTIVE and not self._cancel_requested:
                 self._cancel_requested = True
                 self._control.cancel_event.set()
+                self._control.invalidate_permission()
                 for message in self._control.drop_all():
                     self._events.put_nowait(
                         AgentSessionEvent.from_pending_message(
@@ -115,6 +125,19 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
                     )
                 self._worker.cancel()
         return await self.result()
+
+    async def aclose(self) -> None:
+        """Treat an Event Stream Host disconnect as cancellation and cleanup."""
+
+        await self.cancel()
+
+    async def resolve_permission(self, request_id: str, approved: bool) -> None:
+        """Resolve the one currently pending Permission Request exactly once."""
+
+        async with self._terminal_lock:
+            if self._state is not AgentRunState.ACTIVE or self._cancel_requested:
+                raise RuntimeError("cannot resolve permission when AgentRun is not active")
+            self._control.resolve_permission(request_id, approved)
 
     async def steer(self, text: str) -> PendingMessage:
         """Queue a Steering Message for the next authoritative drain point."""
@@ -267,6 +290,8 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
         async with self._terminal_lock:
             if self._state is not AgentRunState.ACTIVE:
                 return
+
+            self._control.invalidate_permission()
 
             result = AgentRunResult(
                 run_id=self._run_id,

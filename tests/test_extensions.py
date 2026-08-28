@@ -2117,7 +2117,7 @@ def test_fixed_hook_set_dispatches_on_authoritative_runtime_paths(tmp_path: Path
             (ProviderTextDelta("trace complete"), ProviderDone()),
         )
     )
-    new_ids = iter(("checkpoint", "prompt", "assistant-tool", "assistant-final"))
+    new_ids = iter(("checkpoint", "prompt", "assistant-tool", "permission", "assistant-final"))
     trace = _TraceExtension()
     kernel = AgentKernel.with_resumed_session(
         provider,

@@ -20,6 +20,7 @@ from coding_agent.events import (
     assistant_message_record,
 )
 from coding_agent.json_contract import json_object_snapshot
+from coding_agent.permissions import PermissionDecision, validate_permission_decision_record
 
 if TYPE_CHECKING:
     from coding_agent.context import CompactionPlan
@@ -30,7 +31,7 @@ SESSION_SCHEMA_VERSION = 1
 SessionEntryKind: TypeAlias = str
 SessionRecordKind = Literal["entry", "active_leaf", "closed", "resumed"]
 SessionEntryValidator: TypeAlias = Callable[[Mapping[str, object]], None]
-_BUILTIN_ENTRY_KINDS = frozenset({"configuration", "message", "compaction"})
+_BUILTIN_ENTRY_KINDS = frozenset({"configuration", "message", "compaction", "permission_decision"})
 
 
 class SessionError(ValueError):
@@ -596,6 +597,18 @@ class Session:
             run_id=run_id,
         )
 
+    def record_permission_decision(
+        self,
+        decision: PermissionDecision,
+        *,
+        run_id: str | None = None,
+    ) -> SessionEntry:
+        """Persist one resolved audit fact without a pending approval capability."""
+
+        payload = decision.record()
+        validate_permission_decision_record(payload)
+        return self._append_entry("permission_decision", payload, run_id=run_id)
+
     def append_custom(
         self,
         kind: str,
@@ -860,6 +873,13 @@ class Session:
                     )
                 if entry.kind == "compaction":
                     self._validate_compaction_entry(entry)
+                elif entry.kind == "permission_decision":
+                    try:
+                        validate_permission_decision_record(entry.payload)
+                    except ValueError as exc:
+                        raise SessionCorruptionError(
+                            f"Permission Decision {entry.entry_id!r} is invalid: {exc}"
+                        ) from exc
                 elif entry.kind not in _BUILTIN_ENTRY_KINDS:
                     self._validate_custom_payload(entry.kind, entry.payload, persisted=True)
                 self._entries[entry.entry_id] = entry

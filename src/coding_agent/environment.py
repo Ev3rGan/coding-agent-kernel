@@ -54,10 +54,23 @@ class LocalCodingEnvironment:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self._contain_workspace = True
+
+    def _execution_view(self, *, contain_workspace: bool) -> LocalCodingEnvironment:
+        """Return a run-local view without mutating a shared environment."""
+
+        view = object.__new__(type(self))
+        view.workspace = self.workspace
+        view._contain_workspace = contain_workspace
+        return view
 
     def resolve_path(self, path: str) -> Path:
         candidate = (self.workspace / path).resolve()
-        if candidate != self.workspace and self.workspace not in candidate.parents:
+        if (
+            self._contain_workspace
+            and candidate != self.workspace
+            and self.workspace not in candidate.parents
+        ):
             raise WorkspacePathError(f"path escapes workspace: {path}")
         return candidate
 

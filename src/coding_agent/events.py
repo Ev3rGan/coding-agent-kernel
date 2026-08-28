@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast, get_args
 
 from coding_agent.json_contract import json_object_snapshot
+from coding_agent.permissions import PermissionDecision, PermissionRequest
 
 if TYPE_CHECKING:
     from coding_agent.session import SessionEntry
@@ -560,6 +561,8 @@ class AgentSessionEventKind(StrEnum):
     MESSAGE_INJECTED = "message_injected"
     MESSAGE_DROPPED = "message_dropped"
     PROVIDER_RETRY = "provider_retry"
+    PERMISSION_REQUESTED = "permission_requested"
+    PERMISSION_RESOLVED = "permission_resolved"
 
 
 _TERMINAL_EVENT_KINDS = {
@@ -585,6 +588,11 @@ _CONTROL_EVENT_KINDS = {
     AgentSessionEventKind.PROVIDER_RETRY,
 }
 
+_PERMISSION_EVENT_KINDS = {
+    AgentSessionEventKind.PERMISSION_REQUESTED,
+    AgentSessionEventKind.PERMISSION_RESOLVED,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionEvent:
@@ -605,11 +613,23 @@ class AgentSessionEvent:
     retry_attempt: int | None = None
     retry_remaining: int | None = None
     retry_error: AgentError | None = None
+    permission_request: PermissionRequest | None = None
+    permission_decision: PermissionDecision | None = None
 
     def __post_init__(self) -> None:
         terminal = self.kind in _TERMINAL_EVENT_KINDS
         session_event = self.kind in _SESSION_EVENT_KINDS
         control_event = self.kind in _CONTROL_EVENT_KINDS
+        permission_event = self.kind in _PERMISSION_EVENT_KINDS
+        if permission_event:
+            if self.agent_event is not None or self.result is not None or self.run_id is None:
+                raise ValueError("Permission events require run data only")
+            if self.kind is AgentSessionEventKind.PERMISSION_REQUESTED:
+                if self.permission_request is None or self.permission_decision is not None:
+                    raise ValueError("permission_requested requires only a Permission Request")
+            elif self.permission_decision is None or self.permission_request is not None:
+                raise ValueError("permission_resolved requires only a Permission Decision")
+            return
         if control_event:
             if self.agent_event is not None or self.result is not None:
                 raise ValueError("Control events cannot wrap AgentEvent or a result")
@@ -659,6 +679,26 @@ class AgentSessionEvent:
             raise ValueError("terminal events require only a final result")
         if not terminal and self.agent_event is None:
             raise ValueError("non-terminal events require an AgentEvent")
+
+    @classmethod
+    def from_permission_request(cls, request: PermissionRequest) -> AgentSessionEvent:
+        return cls(
+            AgentSessionEventKind.PERMISSION_REQUESTED,
+            run_id=request.run_id,
+            permission_request=request,
+        )
+
+    @classmethod
+    def from_permission_decision(
+        cls,
+        run_id: str,
+        decision: PermissionDecision,
+    ) -> AgentSessionEvent:
+        return cls(
+            AgentSessionEventKind.PERMISSION_RESOLVED,
+            run_id=run_id,
+            permission_decision=decision,
+        )
 
     @classmethod
     def from_pending_message(

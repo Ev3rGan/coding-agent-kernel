@@ -11,6 +11,7 @@ from coding_agent import (
     AgentSessionEventKind,
     FakeProvider,
     LocalCodingEnvironment,
+    PermissionMode,
     ProviderDone,
     ProviderStreamEvent,
     ProviderTextDelta,
@@ -72,7 +73,9 @@ def test_agent_run_executes_tool_batch_and_sends_ordered_results_to_next_turn(
     runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
 
     async def collect() -> tuple[list[AgentSessionEvent], AgentRunResult]:
-        run = AgentKernel(provider, tool_runtime=runtime).create_run("Update the value.")
+        run = AgentKernel(provider, tool_runtime=runtime).create_run(
+            "Update the value.", permission_mode=PermissionMode.FULL
+        )
         events = [event async for event in run]
         return events, await run.result()
 
@@ -181,7 +184,7 @@ def test_bash_progress_is_observable_before_process_completion(tmp_path: Path) -
         run = AgentKernel(
             FakeProvider([first_turn, second_turn]),
             tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
-        ).create_run("Observe progress.")
+        ).create_run("Observe progress.", permission_mode=PermissionMode.FULL)
         saw_live_progress = False
         async for event in run:
             if event.kind is AgentSessionEventKind.TOOL_EXECUTION_UPDATE:
