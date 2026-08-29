@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Final, Protocol
+from typing import Final, Literal, Protocol, cast
 
 from coding_agent.events import (
     AssistantMessage,
     TokenUsage,
     ToolCall,
+    ToolError,
+    ToolResult,
     assistant_message_record,
+    tool_result_record,
 )
 from coding_agent.provider import (
     BranchSummaryMessage,
@@ -191,6 +194,63 @@ def _message_from_entry(entry: SessionEntry) -> ModelMessage | None:
                 None if payload.get("response_id") is None else str(payload["response_id"])
             ),
         )
+    if role == "tool":
+        raw_results = payload.get("results")
+        if not isinstance(raw_results, list) or not raw_results:
+            raise ContextConstructionError(
+                "context_entry_invalid",
+                f"Tool SessionEntry {entry.entry_id!r} must contain results.",
+                stage="context",
+            )
+        results: list[ToolResult] = []
+        for raw_result in raw_results:
+            if not isinstance(raw_result, dict):
+                raise ContextConstructionError(
+                    "context_entry_invalid",
+                    f"Tool SessionEntry {entry.entry_id!r} has an invalid result.",
+                    stage="context",
+                )
+            call_id = raw_result.get("call_id")
+            tool_name = raw_result.get("tool_name")
+            raw_status = raw_result.get("status")
+            output = raw_result.get("output")
+            raw_error = raw_result.get("error")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(tool_name, str)
+                or not tool_name
+                or raw_status not in {"success", "error", "cancelled"}
+                or (output is not None and not isinstance(output, dict))
+            ):
+                raise ContextConstructionError(
+                    "context_entry_invalid",
+                    f"Tool SessionEntry {entry.entry_id!r} has invalid result fields.",
+                    stage="context",
+                )
+            error = None
+            if raw_error is not None:
+                if (
+                    not isinstance(raw_error, dict)
+                    or not isinstance(raw_error.get("code"), str)
+                    or not isinstance(raw_error.get("message"), str)
+                ):
+                    raise ContextConstructionError(
+                        "context_entry_invalid",
+                        f"Tool SessionEntry {entry.entry_id!r} has an invalid error.",
+                        stage="context",
+                    )
+                error = ToolError(raw_error["code"], raw_error["message"])
+            results.append(
+                ToolResult(
+                    call_id,
+                    tool_name,
+                    cast(Literal["success", "error", "cancelled"], raw_status),
+                    output,
+                    error,
+                )
+            )
+        return ToolResultMessage(results=tuple(results))
     raise ContextConstructionError(
         "context_entry_invalid",
         f"Message SessionEntry {entry.entry_id!r} has unsupported role {role!r}.",
@@ -203,23 +263,7 @@ def _request_record(request: ProviderRequest) -> dict[str, object]:
         if isinstance(message, ToolResultMessage):
             return {
                 "role": message.role,
-                "results": [
-                    {
-                        "call_id": result.call_id,
-                        "tool_name": result.tool_name,
-                        "status": result.status,
-                        "output": result.output,
-                        "error": (
-                            None
-                            if result.error is None
-                            else {
-                                "code": result.error.code,
-                                "message": result.error.message,
-                            }
-                        ),
-                    }
-                    for result in message.results
-                ],
+                "results": [tool_result_record(result) for result in message.results],
             }
         if isinstance(message, AssistantMessage):
             return assistant_message_record(message)

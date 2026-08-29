@@ -17,7 +17,9 @@ CLI 在 Provider 捕获凭据后，会在 Agent Run 期间从可被 Tool 子进�
 结束后再恢复 Host 进程环境。不要把 API key 写入 task、workspace、Session 或 shell history。
 
 每次新运行会创建 append-only JSONL Session，并在最终记录中打印 Session ID 和文件
-路径。使用同一个 store 恢复已关闭的 Session：
+路径。authoritative assistant messages 与对应的 ToolResults 都会按活动分支持久化，使恢复
+后的 Provider history 继续保持完整的 assistant/tool 配对。使用同一个 store 恢复已关闭的
+Session：
 
 ```console
 python -m coding_agent run --provider deepseek --workspace <workspace> --mode ask \
@@ -43,8 +45,11 @@ Host permission resolution，Adapter 不执行 Tool 或复制 AgentLoop。
 
 HTTP 429、500/503、timeout/transport interruption 映射到既有有限 retry 分类；格式、
 认证、余额、API error 和 malformed stream 产生不可泄露 server body 或 key 的结构化
-失败。确定性测试使用注入的 HTTP transport，不会访问 DeepSeek 或产生费用。
-**带真实凭据的 live acceptance 尚未执行，仍是 Ready PR 前的明确 remaining gate。**
+失败。确定性测试使用注入的 HTTP transport，不会访问 DeepSeek 或产生费用。限界的真实
+凭据验收也已在 disposable workspace 完成：同一公共 CLI 的完整编码 run 依次执行
+read/inspect、批准后的 edit、bash 测试与最终说明，并另行验证 JSONL Session 关闭和无
+Tool 的 resume；凭据未进入 CLI JSON、Session 或 workspace。常规测试仍使用注入
+transport，不依赖外网或真实凭据。
 
 本能力借鉴 Pi 的 Provider normalization；简化为 DeepSeek + Fake 两个 Adapter；深化点
 是把同一 Python Kernel seam 用于真实 CLI、权限和恢复。它不引入 Provider 生态、模型

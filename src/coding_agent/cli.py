@@ -39,8 +39,8 @@ from coding_agent.events import (
     ProviderStreamEvent,
     ProviderTextDelta,
     ToolCall,
-    ToolResult,
     assistant_message_record,
+    tool_result_record,
 )
 from coding_agent.extensions import (
     ExtensionEvent,
@@ -68,18 +68,6 @@ def _provider_record(event: ProviderStreamEvent) -> dict[str, Any]:
 
 def _error_record(error: AgentError) -> dict[str, str]:
     return {"source": error.source, "code": error.code, "message": error.message}
-
-
-def _tool_result_record(result: ToolResult) -> dict[str, Any]:
-    return {
-        "call_id": result.call_id,
-        "tool_name": result.tool_name,
-        "status": result.status,
-        "output": result.output,
-        "error": None
-        if result.error is None
-        else {"code": result.error.code, "message": result.error.message},
-    }
 
 
 def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
@@ -119,7 +107,7 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
             "arguments": event.tool_call.arguments,
         }
     if event.tool_result is not None:
-        record["tool_result"] = _tool_result_record(event.tool_result)
+        record["tool_result"] = tool_result_record(event.tool_result)
     if event.tool_progress is not None:
         record["tool_progress"] = {
             "call_id": event.tool_progress.call_id,
@@ -576,10 +564,10 @@ async def _extensions_demo(case: ExtensionDemoCase) -> int:
             else getattr(report.provider_requests[0].messages[-1], "text", None)
         ),
         "custom_tool_result": (
-            None if "allowed" not in by_call_id else _tool_result_record(by_call_id["allowed"])
+            None if "allowed" not in by_call_id else tool_result_record(by_call_id["allowed"])
         ),
         "blocked_tool_result": (
-            None if "blocked" not in by_call_id else _tool_result_record(by_call_id["blocked"])
+            None if "blocked" not in by_call_id else tool_result_record(by_call_id["blocked"])
         ),
         "custom_session_entries": [
             {"kind": entry.kind, "payload": entry.payload}
@@ -1092,7 +1080,7 @@ async def _permissions_demo(mode_value: str, case: str) -> int:
                     event.permission_request.call_id == "approved-write",
                 )
             if event.tool_result is not None:
-                result_record = _tool_result_record(event.tool_result)
+                result_record = tool_result_record(event.tool_result)
                 if event.tool_result.call_id == "os-identity" and event.tool_result.output:
                     tool_identity = str(event.tool_result.output.get("stdout", "")).strip()
                 observed_results[event.tool_result.call_id] = {

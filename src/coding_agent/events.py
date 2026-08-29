@@ -292,6 +292,22 @@ class ToolResult:
     error: ToolError | None = None
 
 
+def tool_result_record(result: ToolResult) -> dict[str, Any]:
+    """Return the canonical JSON-ready representation of a ToolResult."""
+
+    return {
+        "call_id": result.call_id,
+        "tool_name": result.tool_name,
+        "status": result.status,
+        "output": result.output,
+        "error": (
+            None
+            if result.error is None
+            else {"code": result.error.code, "message": result.error.message}
+        ),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ToolProgress:
     call_id: str

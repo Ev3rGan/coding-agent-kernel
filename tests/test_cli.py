@@ -219,6 +219,177 @@ def test_deepseek_run_cli_uses_public_kernel_path_permissions_session_and_patch(
     }
 
 
+def test_deepseek_run_cli_keeps_each_tool_result_in_sequential_tool_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-sequential-tool-secret")
+    monkeypatch.setattr("sys.stdin", io.StringIO("approve\n"))
+    responses = iter(
+        (
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "Create the requested file.",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "sequential-write",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"path":"ticket08_live.txt","content":"LIVE_OK\\n"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+                response_id="sequential-write-response",
+            ),
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "Verify the written file.",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "sequential-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"ticket08_live.txt"}',
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+                response_id="sequential-read-response",
+            ),
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "The file content is correct.",
+                    "content": "Live sequential ToolCall verification completed.",
+                },
+                finish_reason="stop",
+                response_id="sequential-final-response",
+            ),
+        )
+    )
+    request_bodies: list[dict[str, Any]] = []
+
+    def has_complete_tool_history(body: dict[str, Any]) -> bool:
+        pending_call_ids: set[str] = set()
+        for message in body["messages"]:
+            role = message["role"]
+            if role == "assistant":
+                if pending_call_ids:
+                    return False
+                tool_calls = message.get("tool_calls", [])
+                if tool_calls and not isinstance(message.get("reasoning_content"), str):
+                    return False
+                pending_call_ids = {call["id"] for call in tool_calls}
+            elif role == "tool":
+                call_id = message.get("tool_call_id")
+                if call_id not in pending_call_ids:
+                    return False
+                pending_call_ids.remove(call_id)
+            elif pending_call_ids:
+                return False
+        return not pending_call_ids
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads((await request.aread()).decode())
+        request_bodies.append(body)
+        if not has_complete_tool_history(body):
+            return httpx.Response(400)
+        return httpx.Response(200, stream=next(responses))
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "create and verify the disposable file",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert len(request_bodies) == 3
+    assert [[message["role"] for message in body["messages"]] for body in request_bodies] == [
+        ["system", "user"],
+        ["system", "user", "assistant", "tool"],
+        ["system", "user", "assistant", "tool", "assistant", "tool"],
+    ]
+    assert exit_code == 0
+    assert (workspace / "ticket08_live.txt").read_text(encoding="utf-8") == "LIVE_OK\n"
+    assert records[-3]["result"]["state"] == "settled"
+    assert records[-1]["workspace"]["changed_paths"] == ["ticket08_live.txt"]
+
+    session_id = records[-2]["session"]["session_id"]
+    resumed_bodies: list[dict[str, Any]] = []
+
+    async def resume_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads((await request.aread()).decode())
+        resumed_bodies.append(body)
+        if not has_complete_tool_history(body):
+            return httpx.Response(400)
+        return httpx.Response(
+            200,
+            stream=_deepseek_turn(
+                delta={
+                    "reasoning_content": "The durable tool history is complete.",
+                    "content": "Resume verification completed.",
+                },
+                finish_reason="stop",
+                response_id="sequential-resume-response",
+            ),
+        )
+
+    resumed_exit = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "--resume",
+            session_id,
+            "verify the durable history",
+        ],
+        deepseek_transport=httpx.MockTransport(resume_handler),
+    )
+    resumed_records = _records(capsys.readouterr().out)
+
+    assert resumed_exit == 0
+    assert len(resumed_bodies) == 1
+    assert [message["role"] for message in resumed_bodies[0]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert any(record.get("event") == "session_resumed" for record in resumed_records)
+
+
 def test_deepseek_run_cli_missing_credential_fails_before_session_or_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
