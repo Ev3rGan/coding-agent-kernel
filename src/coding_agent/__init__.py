@@ -89,6 +89,17 @@ from coding_agent.extensions import (
     hook_policy,
 )
 from coding_agent.kernel import AgentKernel
+from coding_agent.permissions import (
+    OperationIntent,
+    OperationKind,
+    PermissionAction,
+    PermissionDecision,
+    PermissionEvaluation,
+    PermissionMode,
+    PermissionPolicy,
+    PermissionRequest,
+    TargetScope,
+)
 from coding_agent.provider import (
     BranchSummaryMessage,
     FakeProvider,
@@ -168,6 +179,14 @@ __all__ = [
     "LocalCodingEnvironment",
     "PendingMessage",
     "PendingMessageKind",
+    "OperationIntent",
+    "OperationKind",
+    "PermissionAction",
+    "PermissionDecision",
+    "PermissionEvaluation",
+    "PermissionMode",
+    "PermissionPolicy",
+    "PermissionRequest",
     "ProviderDone",
     "ProviderAbort",
     "ProviderCancelled",
@@ -200,6 +219,7 @@ __all__ = [
     "SessionStateError",
     "SessionStore",
     "TokenUsage",
+    "TargetScope",
     "ToolCall",
     "ToolCallHookInput",
     "ToolResultHookInput",

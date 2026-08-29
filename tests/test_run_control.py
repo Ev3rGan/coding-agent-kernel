@@ -17,6 +17,7 @@ from coding_agent import (
     InMemorySessionStore,
     LocalCodingEnvironment,
     PendingMessageKind,
+    PermissionMode,
     ProviderDone,
     ProviderError,
     ProviderRequest,
@@ -292,7 +293,7 @@ def test_steering_during_tool_batch_injects_after_tool_result(tmp_path: Path) ->
             configuration={"provider": "fake"},
             tool_runtime=runtime,
         )
-        run = kernel.create_run("use the tool")
+        run = kernel.create_run("use the tool", permission_mode=PermissionMode.FULL)
         events_task = asyncio.create_task(_collect(run))
         await tool.started.wait()
 
@@ -481,7 +482,9 @@ def test_cancel_propagates_shared_signal_to_in_flight_tool(tmp_path: Path) -> No
         runtime.register(tool)
         runtime.enable("blocking")
         provider = FakeProvider([_tool_call_script()])
-        run = AgentKernel(provider, tool_runtime=runtime).create_run("use tool")
+        run = AgentKernel(provider, tool_runtime=runtime).create_run(
+            "use tool", permission_mode=PermissionMode.FULL
+        )
         events_task = asyncio.create_task(_collect(run))
         await tool.started.wait()
 
@@ -523,7 +526,7 @@ def test_cancel_joins_parallel_tool_children_before_terminal_result(tmp_path: Pa
             ProviderDone("tool_use"),
         )
         run = AgentKernel(FakeProvider([first_turn]), tool_runtime=runtime).create_run(
-            "parallel work"
+            "parallel work", permission_mode=PermissionMode.FULL
         )
         events_task = asyncio.create_task(_collect(run))
         await tool.both_started.wait()

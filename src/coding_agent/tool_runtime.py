@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from coding_agent.environment import CommandTimeoutError, LocalCodingEnvironment
 from coding_agent.events import ToolCall, ToolError, ToolProgress, ToolResult
 from coding_agent.json_contract import json_object_snapshot
+from coding_agent.permissions import (
+    PermissionAction,
+    PermissionDecision,
+    PermissionEvaluation,
+    PermissionMode,
+    PermissionPolicy,
+)
 from coding_agent.tools import Tool, ToolExecutionError, ToolOutput, ToolSpec, builtin_tools
 
 
@@ -106,6 +113,10 @@ class ToolRuntime:
         enabled: set[str] | None = None,
     ) -> None:
         self.environment = environment
+        self._permission_policy = PermissionPolicy(
+            environment.workspace,
+            read_only_shell_guaranteed=environment.read_only_shell_guaranteed,
+        )
         self._tools: dict[str, _RegisteredTool] = {}
         for tool in builtin_tools():
             self.register(tool)
@@ -236,6 +247,16 @@ class ToolRuntime:
             raise KeyError(f"unknown tools: {sorted(unknown)}")
         self._enabled.update(names)
 
+    def evaluate_permission(
+        self,
+        call: ToolCall,
+        mode: PermissionMode,
+    ) -> PermissionEvaluation:
+        """Classify one validated final ToolCall without executing it."""
+
+        self.validate_call(call)
+        return self._permission_policy.evaluate(mode, call)
+
     async def execute_batch(
         self,
         calls: tuple[ToolCall, ...],
@@ -243,12 +264,63 @@ class ToolRuntime:
         *,
         on_progress: ToolProgressCallback | None = None,
     ) -> ToolBatchResult:
+        """Execute an already-authorized batch through the historical Adapter seam."""
+
+        return await self._execute_batch(
+            calls,
+            cancel_event,
+            on_progress=on_progress,
+            permission_mode=None,
+            permission_decisions=None,
+        )
+
+    async def _execute_batch(
+        self,
+        calls: tuple[ToolCall, ...],
+        cancel_event: asyncio.Event | None,
+        *,
+        on_progress: ToolProgressCallback | None,
+        permission_mode: PermissionMode | None,
+        permission_decisions: Mapping[str, PermissionDecision] | None,
+    ) -> ToolBatchResult:
         mode = self.batch_mode(calls)
         completion: list[str] = []
         indexed: list[tuple[int, ToolResult]] = []
 
         async def execute(index: int, call: ToolCall) -> tuple[int, ToolResult]:
-            result = await self._execute_one(call, cancel_event, on_progress)
+            try:
+                self.validate_call(call)
+            except InvalidArgumentsError:
+                result = await self._execute_one(
+                    call,
+                    self.environment._execution_view(contain_workspace=True),
+                    cancel_event,
+                    on_progress,
+                )
+                return index, result
+            if permission_mode is None:
+                result = await self._execute_one(
+                    call,
+                    self.environment._execution_view(contain_workspace=True),
+                    cancel_event,
+                    on_progress,
+                )
+                return index, result
+            gate_error = self._permission_gate_error(
+                call,
+                permission_mode,
+                permission_decisions,
+            )
+            if gate_error is not None:
+                return index, gate_error
+            result = await self._execute_one(
+                call,
+                self.environment._execution_view(
+                    contain_workspace=permission_mode is not PermissionMode.FULL
+                ),
+                cancel_event,
+                on_progress,
+            )
             return index, result
 
         if mode == "sequential":
@@ -271,6 +343,95 @@ class ToolRuntime:
 
         ordered = tuple(result for _, result in sorted(indexed, key=lambda item: item[0]))
         return ToolBatchResult(mode, ordered, tuple(completion))
+
+    async def execute_guarded_batch(
+        self,
+        calls: tuple[ToolCall, ...],
+        cancel_event: asyncio.Event | None = None,
+        *,
+        on_progress: ToolProgressCallback | None = None,
+        permission_mode: PermissionMode | str = PermissionMode.AUTO,
+        permission_decisions: Mapping[str, PermissionDecision] | None = None,
+    ) -> ToolBatchResult:
+        """Apply the gate while preserving pre-permission ToolRuntime adapters."""
+
+        normalized_mode = PermissionMode(permission_mode)
+        if type(self).execute_batch is ToolRuntime.execute_batch:
+            return await self._execute_batch(
+                calls,
+                cancel_event,
+                on_progress=on_progress,
+                permission_mode=normalized_mode,
+                permission_decisions=permission_decisions,
+            )
+
+        # An older adapter can still supply execution behavior, but only after
+        # every call has independently passed the same final permission gate.
+        gate_errors: dict[str, ToolResult] = {}
+        for call in calls:
+            try:
+                self.validate_call(call)
+            except InvalidArgumentsError:
+                continue
+            gate_error = self._permission_gate_error(
+                call,
+                normalized_mode,
+                permission_decisions,
+            )
+            if gate_error is not None:
+                gate_errors[call.call_id] = gate_error
+        if gate_errors:
+            results = tuple(
+                gate_errors.get(item.call_id)
+                or self._error(
+                    item,
+                    "permission_denied",
+                    "legacy ToolRuntime adapter batch was rejected before execution",
+                )
+                for item in calls
+            )
+            return ToolBatchResult(
+                self.batch_mode(calls),
+                results,
+                tuple(item.call_id for item in calls),
+            )
+        return await self.execute_batch(calls, cancel_event, on_progress=on_progress)
+
+    def _permission_gate_error(
+        self,
+        call: ToolCall,
+        permission_mode: PermissionMode,
+        permission_decisions: Mapping[str, PermissionDecision] | None,
+    ) -> ToolResult | None:
+        try:
+            evaluation = self._permission_policy.evaluate(permission_mode, call)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return self._error(
+                call,
+                "permission_invalid",
+                "Permission classification failed for final ToolCall",
+            )
+        decision = None if permission_decisions is None else permission_decisions.get(call.call_id)
+        if decision is not None and (
+            decision.call_id != call.call_id
+            or decision.tool_name != call.tool_name
+            or decision.mode != permission_mode
+            or decision.binding != evaluation.binding
+        ):
+            return self._error(
+                call,
+                "permission_invalid",
+                "Permission Decision does not match the final ToolCall and Operation Intent",
+            )
+        if evaluation.action is PermissionAction.ASK and decision is None:
+            return self._error(call, "permission_required", evaluation.reason)
+        denied = evaluation.action is PermissionAction.DENY or (
+            decision is not None and not decision.approved
+        )
+        if denied:
+            reason = evaluation.reason if decision is None else decision.reason
+            return self._error(call, "permission_denied", reason)
+        return None
 
     def batch_mode(self, calls: tuple[ToolCall, ...]) -> Literal["parallel", "sequential"]:
         """Return the one authoritative scheduling mode for a batch."""
@@ -296,6 +457,7 @@ class ToolRuntime:
     async def _execute_one(
         self,
         call: ToolCall,
+        environment: LocalCodingEnvironment,
         cancel_event: asyncio.Event | None,
         on_progress: ToolProgressCallback | None,
     ) -> ToolResult:
@@ -320,7 +482,7 @@ class ToolRuntime:
                 if on_progress is not None:
                     await on_progress(ToolProgress(call.call_id, call.tool_name, stream, data))
 
-            output = await tool.execute(call.arguments, self.environment, cancel_event, report)
+            output = await tool.execute(call.arguments, environment, cancel_event, report)
             if not isinstance(output, ToolOutput):
                 raise ValueError("Tool execute must return ToolOutput")
             safe_output = json_object_snapshot(output.data, label="ToolOutput.data")

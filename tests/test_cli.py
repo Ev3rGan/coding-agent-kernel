@@ -49,6 +49,14 @@ def test_tool_loop_cli_edits_verifies_and_summarizes_workspace(capsys: Any) -> N
     assert "+value = 2" in workspace["diff"]
     assert records[-2]["result"]["message"]["text"].startswith("Updated")
     assert sum(record.get("event") == "turn_start" for record in records) == 2
+    verify = next(
+        record["tool_result"]
+        for record in records
+        if record.get("event") == "tool_execution_end"
+        and record["tool_result"]["call_id"] == "verify"
+    )
+    assert verify["status"] == "success"
+    assert "value = 2" in verify["output"]["stdout"]
 
 
 def test_mixed_batch_cli_exposes_both_modes_and_ordered_results(capsys: Any) -> None:
@@ -294,3 +302,72 @@ def test_extensions_invalid_mutation_cli_rejects_without_traceback_or_damage(
     assert summary["provider_calls"] == 0
     assert summary["session_unchanged"] is True
     assert summary["handler_failure_observed"] is True
+
+
+@pytest.mark.parametrize("mode", ("plan", "ask", "auto", "full"))
+def test_permissions_cli_exposes_mode_matrix_and_full_risk(
+    capsys: Any,
+    mode: str,
+) -> None:
+    exit_code = main(["demo", "permissions", "--mode", mode])
+
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+    summary = records[-1]["permission_demo"]
+
+    assert exit_code == 0
+    assert summary["mode"] == mode
+    assert summary["state"] == "settled"
+    if mode == "plan":
+        assert summary["results"]["workspace-read"]["status"] == "success"
+        assert summary["results"]["workspace-write"]["error"] == "permission_denied"
+        assert summary["results"]["diagnostic-shell"]["error"] == "permission_denied"
+    elif mode == "ask":
+        assert summary["approved_exists"] is True
+        assert summary["denied_exists"] is False
+        assert sum(record.get("event") == "permission_requested" for record in records) == 2
+    elif mode == "auto":
+        assert summary["workspace_write_exists"] is True
+        assert summary["outside_exists"] is False
+        assert summary["results"]["network-shell"]["error"] == "permission_denied"
+        assert summary["results"]["unknown-shell"]["error"] == "permission_denied"
+    else:
+        assert summary["outside_exists"] is True
+        assert summary["results"]["os-identity"]["status"] == "success"
+        assert summary["os_authority_unchanged"] is True
+        assert "risk" in summary["warning"].lower()
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("extension-rewrite", "cancel", "host-disconnect", "resume"),
+)
+def test_permissions_cli_lifecycle_cases_are_non_replayable(
+    capsys: Any,
+    case: str,
+) -> None:
+    exit_code = main(["demo", "permissions", "--case", case])
+
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+    summary = records[-1]["permission_demo"]
+
+    assert exit_code == 0
+    assert summary["case"] == case
+    if case == "extension-rewrite":
+        assert summary["stale_approval_rejected"] is True
+        assert summary["final_binding_confirmed"] is True
+        assert summary["final_path"] == "after.txt"
+        assert summary["denied_side_effect_free"] is True
+    elif case in {"cancel", "host-disconnect"}:
+        assert summary["state"] == "cancelled"
+        assert summary["denial_persisted"] is True
+        assert summary["pending_persisted"] is False
+        assert summary["tool_executed"] is False
+    else:
+        assert summary["selected_before_resume"] == "full"
+        assert summary["resumed_mode"] == "auto"
+        assert summary["denial_persisted"] is True
+        assert summary["pending_persisted"] is False
+    assert "Traceback" not in captured.err

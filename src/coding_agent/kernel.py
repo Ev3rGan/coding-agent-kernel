@@ -54,6 +54,12 @@ from coding_agent.extensions import (
     ExtensionRegistrationError,
     ExtensionRuntime,
 )
+from coding_agent.permissions import (
+    PermissionAction,
+    PermissionDecision,
+    PermissionMode,
+    make_permission_decision,
+)
 from coding_agent.provider import (
     BranchSummaryMessage,
     ModelMessage,
@@ -381,9 +387,18 @@ class AgentKernel:
         except (TypeError, ValueError) as exc:
             raise ExtensionRegistrationError(str(exc)) from exc
 
-    def create_run(self, prompt: str) -> AgentRun:
+    def create_run(
+        self,
+        prompt: str,
+        *,
+        permission_mode: PermissionMode | str = PermissionMode.AUTO,
+    ) -> AgentRun:
         """Start one Agent Run for the supplied user input."""
 
+        try:
+            selected_permission_mode = PermissionMode(permission_mode)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Permission Mode: {permission_mode!r}") from exc
         run_id = f"run-{next(self._run_numbers)}"
         input_error: AgentError | None = None
         try:
@@ -441,6 +456,7 @@ class AgentKernel:
                         prompt=prompt,
                         first_request=first_request,
                         context_error=context_error,
+                        permission_mode=selected_permission_mode,
                     )
                 )
             ),
@@ -448,6 +464,7 @@ class AgentKernel:
             initial_events=initial_events,
             event_observer=self._extension_runtime.observe_runtime_event,
             settled_observer=self._settle_extensions,
+            permission_mode=selected_permission_mode,
         )
 
     async def _extension_input_failure_events(
@@ -465,6 +482,7 @@ class AgentKernel:
         prompt: str,
         first_request: ProviderRequest | None,
         context_error: AgentError | None,
+        permission_mode: PermissionMode,
     ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
@@ -794,6 +812,54 @@ class AgentKernel:
                             error=ToolError("extension_rejected", str(exc)),
                         )
 
+                permission_decisions: dict[str, PermissionDecision] = {}
+                permission_executable: list[tuple[int, ToolCall]] = []
+                for index, call in executable:
+                    permission_request = None
+                    try:
+                        evaluation = self._tool_runtime.evaluate_permission(
+                            call,
+                            permission_mode,
+                        )
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        try:
+                            self._tool_runtime.validate_call(call)
+                        except ValueError:
+                            permission_executable.append((index, call))
+                        else:
+                            precomputed[index] = ToolResult(
+                                call.call_id,
+                                call.tool_name,
+                                "error",
+                                error=ToolError(
+                                    "permission_invalid",
+                                    "Permission classification failed for final ToolCall",
+                                ),
+                            )
+                        continue
+                    if evaluation.action is PermissionAction.ASK:
+                        permission_request = control.open_permission(
+                            call,
+                            evaluation,
+                            permission_mode,
+                        )
+                        yield AgentSessionEvent.from_permission_request(permission_request)
+                        decision = await control.wait_for_permission(permission_request)
+                    else:
+                        decision = make_permission_decision(
+                            mode=permission_mode,
+                            call=call,
+                            evaluation=evaluation,
+                            approved=evaluation.action is PermissionAction.ALLOW,
+                            source="policy",
+                        )
+                    permission_decisions[call.call_id] = decision
+                    if permission_request is None and self._session is not None:
+                        self._session.record_permission_decision(decision, run_id=run_id)
+                        for session_event in self._session.drain_events():
+                            yield session_event
+                    permission_executable.append((index, call))
+                executable = permission_executable
                 executable_calls = tuple(call for _, call in executable)
                 batch_mode = self._tool_runtime.batch_mode(executable_calls)
                 for _, call in executable:
@@ -807,10 +873,12 @@ class AgentKernel:
                 progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
 
                 batch_task = asyncio.create_task(
-                    self._tool_runtime.execute_batch(
+                    self._tool_runtime.execute_guarded_batch(
                         executable_calls,
                         control.cancel_event,
                         on_progress=partial(_put_progress, progress_queue),
+                        permission_mode=permission_mode,
+                        permission_decisions=permission_decisions,
                     )
                 )
                 try:

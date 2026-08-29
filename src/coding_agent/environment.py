@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import signal
 import subprocess
@@ -54,10 +55,28 @@ class LocalCodingEnvironment:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self._contain_workspace = True
+
+    def _execution_view(self, *, contain_workspace: bool) -> LocalCodingEnvironment:
+        """Return a run-local view without mutating a shared environment."""
+
+        view = copy.copy(self)
+        view._contain_workspace = contain_workspace
+        return view
+
+    @property
+    def read_only_shell_guaranteed(self) -> bool:
+        """Whether this environment enforces read-only shell execution itself."""
+
+        return False
 
     def resolve_path(self, path: str) -> Path:
         candidate = (self.workspace / path).resolve()
-        if candidate != self.workspace and self.workspace not in candidate.parents:
+        if (
+            self._contain_workspace
+            and candidate != self.workspace
+            and self.workspace not in candidate.parents
+        ):
             raise WorkspacePathError(f"path escapes workspace: {path}")
         return candidate
 
