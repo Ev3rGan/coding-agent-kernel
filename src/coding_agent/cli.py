@@ -16,8 +16,16 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from coding_agent.context import ContextInput, ContextPipeline, ContextSettings
 from coding_agent.control import RetryPolicy
+from coding_agent.deepseek import (
+    DEEPSEEK_MODELS,
+    DEFAULT_DEEPSEEK_MODEL,
+    DeepSeekConfigurationError,
+    DeepSeekProvider,
+)
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
@@ -192,6 +200,195 @@ def _extension_event_record(event: ExtensionEvent) -> dict[str, Any]:
 
 def _print_record(record: dict[str, Any]) -> None:
     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+
+def _startup_error(code: str, message: str) -> int:
+    _print_record({"startup_error": {"code": code, "message": message}})
+    return 2
+
+
+def _default_session_file() -> Path:
+    local_state = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+    if local_state:
+        root = Path(local_state)
+    else:
+        root = Path.home() / ".local" / "state"
+    return root / "coding-agent-kernel" / "sessions.jsonl"
+
+
+def _workspace_snapshot(root: Path, *, excluded: set[Path]) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        names[:] = [
+            name for name in names if name != ".git" and not (directory_path / name).is_symlink()
+        ]
+        for name in files:
+            path = directory_path / name
+            if path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if resolved in excluded:
+                continue
+            relative = path.relative_to(root).as_posix()
+            snapshot[relative] = path.read_bytes()
+    return snapshot
+
+
+def _workspace_record(
+    root: Path,
+    before: dict[str, bytes],
+    after: dict[str, bytes],
+) -> dict[str, object]:
+    changed = sorted(
+        path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
+    )
+    patch_lines: list[str] = []
+    binary_paths: list[str] = []
+    for path in changed:
+        before_bytes = before.get(path, b"")
+        after_bytes = after.get(path, b"")
+        try:
+            before_text = before_bytes.decode("utf-8")
+            after_text = after_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            binary_paths.append(path)
+            continue
+        from_path = f"a/{path}" if path in before else "/dev/null"
+        to_path = f"b/{path}" if path in after else "/dev/null"
+        patch_lines.extend(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=from_path,
+                tofile=to_path,
+            )
+        )
+    return {
+        "root": str(root),
+        "changed_paths": changed,
+        "patch": "".join(patch_lines),
+        "binary_paths": binary_paths,
+    }
+
+
+async def _read_permission_decision(request_id: str) -> bool:
+    _print_record(
+        {
+            "permission_prompt": {
+                "request_id": request_id,
+                "choices": ["approve", "deny"],
+                "default": "deny",
+            }
+        }
+    )
+    answer = (await asyncio.to_thread(sys.stdin.readline)).strip().casefold()
+    return answer in {"approve", "approved", "a", "y", "yes"}
+
+
+async def _drive_agent_run(kernel: AgentKernel, task: str, mode: str) -> AgentRunResult:
+    run = kernel.create_run(task, permission_mode=mode)
+    async for event in run:
+        _print_record(_event_record(event))
+        if event.permission_request is not None:
+            approved = await _read_permission_decision(event.permission_request.request_id)
+            await run.resolve_permission(event.permission_request.request_id, approved)
+    return await run.result()
+
+
+def _deepseek_run(args: argparse.Namespace, transport: httpx.AsyncBaseTransport | None) -> int:
+    try:
+        provider = DeepSeekProvider(
+            model=args.model,
+            transport=transport,
+        )
+    except DeepSeekConfigurationError as exc:
+        return _startup_error(exc.code, str(exc))
+
+    inherited_api_key = os.environ.pop("DEEPSEEK_API_KEY", None)
+    try:
+        return _run_deepseek_session(args, provider)
+    finally:
+        if inherited_api_key is not None:
+            os.environ["DEEPSEEK_API_KEY"] = inherited_api_key
+
+
+def _run_deepseek_session(args: argparse.Namespace, provider: DeepSeekProvider) -> int:
+    try:
+        workspace = Path(args.workspace).resolve(strict=True)
+    except OSError as exc:
+        return _startup_error(
+            "workspace_invalid",
+            f"Workspace could not be resolved: {type(exc).__name__}: {exc}",
+        )
+    if not workspace.is_dir():
+        return _startup_error("workspace_invalid", "Workspace must be an existing directory.")
+
+    session_file = Path(args.session_file or _default_session_file()).resolve()
+    before = _workspace_snapshot(workspace, excluded={session_file})
+    try:
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        store = JsonlSessionStore(session_file)
+        runtime = ToolRuntime(LocalCodingEnvironment(workspace))
+        runtime.enable("grep", "find", "ls")
+        context_settings = ContextSettings(project_context=(f"Workspace root: {workspace}",))
+        if args.resume is None:
+            kernel = AgentKernel.with_new_session(
+                provider,
+                store,
+                configuration={
+                    "provider": "deepseek",
+                    "model": args.model,
+                    "workspace": str(workspace),
+                },
+                session_id=args.session_id,
+                tool_runtime=runtime,
+                context_settings=context_settings,
+            )
+            resumed = False
+        else:
+            kernel = AgentKernel.with_resumed_session(
+                provider,
+                store,
+                args.resume,
+                tool_runtime=runtime,
+                context_settings=context_settings,
+            )
+            resumed = True
+    except (OSError, SessionError, ValueError) as exc:
+        return _startup_error(
+            "session_start_failed",
+            f"Session could not be started: {type(exc).__name__}: {exc}",
+        )
+
+    if args.mode == PermissionMode.FULL.value:
+        _print_record(
+            {
+                "warning": {
+                    "code": "full_permission_mode",
+                    "message": (
+                        "RISK: full bypasses Kernel approval and workspace containment; "
+                        "OS authority, cancellation, timeout, and process lifecycle are unchanged."
+                    ),
+                }
+            }
+        )
+
+    result = asyncio.run(_drive_agent_run(kernel, args.task, args.mode))
+    kernel.close_session()
+    after = _workspace_snapshot(workspace, excluded={session_file})
+    _print_record(_result_record(result))
+    _print_record(
+        {
+            "session": {
+                "session_id": kernel.session_id,
+                "path": str(session_file),
+                "resumed": resumed,
+            }
+        }
+    )
+    _print_record({"workspace": _workspace_record(workspace, before, after)})
+    return int(result.state is not AgentRunState.SETTLED)
 
 
 async def _streamed_run_demo(case: str) -> int:
@@ -1266,6 +1463,40 @@ async def _context_compaction_demo(case: str) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m coding_agent")
     commands = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("run", help="run a DeepSeek-backed coding task")
+    run.add_argument("task", help="coding task for the Agent Run")
+    run.add_argument(
+        "--provider",
+        choices=("deepseek",),
+        required=True,
+        help="ModelProvider Adapter",
+    )
+    run.add_argument(
+        "--workspace",
+        type=Path,
+        required=True,
+        help="existing disposable or explicitly authorized workspace",
+    )
+    run.add_argument(
+        "--mode",
+        choices=tuple(mode.value for mode in PermissionMode),
+        default=PermissionMode.AUTO.value,
+        help="Host-selected run-scoped Permission Mode",
+    )
+    run.add_argument(
+        "--model",
+        choices=DEEPSEEK_MODELS,
+        default=DEFAULT_DEEPSEEK_MODEL,
+        help="official DeepSeek model identifier",
+    )
+    run.add_argument(
+        "--session-file",
+        type=Path,
+        help="append-only JSONL Session store (defaults to the user state directory)",
+    )
+    session_action = run.add_mutually_exclusive_group()
+    session_action.add_argument("--session-id", help="explicit ID for a new Session")
+    session_action.add_argument("--resume", metavar="SESSION_ID", help="resume a closed Session")
     demo = commands.add_parser("demo", help="run deterministic local demonstrations")
     demos = demo.add_subparsers(dest="demo", required=True)
     streamed_run = demos.add_parser("streamed-run", help="observe one Fake Provider Agent Run")
@@ -1339,10 +1570,16 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    deepseek_transport: httpx.AsyncBaseTransport | None = None,
+) -> int:
     """Parse Host arguments, drive AgentRun, and render public events."""
 
     args = _parser().parse_args(argv)
+    if args.command == "run":
+        return _deepseek_run(args, deepseek_transport)
     if args.command == "demo" and args.demo == "streamed-run":
         return asyncio.run(_streamed_run_demo(args.case))
     if args.command == "demo" and args.demo == "tool-loop":
