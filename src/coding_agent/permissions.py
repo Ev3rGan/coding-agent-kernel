@@ -395,6 +395,8 @@ class PermissionPolicy:
         return quote is not None
 
     def _normalize_target(self, raw: str, *, cwd: Path | None = None) -> Path:
+        if "\0" in raw:
+            raise ValueError("path target contains NUL")
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = (self._workspace if cwd is None else cwd) / candidate
