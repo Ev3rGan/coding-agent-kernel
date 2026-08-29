@@ -11,6 +11,7 @@ import pytest
 
 from coding_agent import (
     AgentKernel,
+    AgentRunState,
     AgentSessionEvent,
     AgentSessionEventKind,
     ExtensionRegistry,
@@ -19,6 +20,7 @@ from coding_agent import (
     InMemorySessionStore,
     JsonlSessionStore,
     LocalCodingEnvironment,
+    OperationKind,
     PermissionAction,
     PermissionDecision,
     PermissionMode,
@@ -82,6 +84,20 @@ class _StatefulEnvironment(LocalCodingEnvironment):
         if self.adapter_state != "ready":
             raise RuntimeError("environment adapter state was not preserved")
         return super().resolve_path(path)
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("directory links are not available")
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -315,6 +331,140 @@ def test_auto_requires_permission_for_outside_output_option_before_shell_executi
     assert not outside.exists()
 
 
+@pytest.mark.parametrize("option", ("--pre", "--hostname-bin"))
+def test_auto_requires_permission_for_shell_options_that_spawn_child_processes(
+    tmp_path: Path,
+    option: str,
+) -> None:
+    call = ToolCall(
+        "child-process-option",
+        "bash",
+        {"command": f"rg {option} processor needle ."},
+    )
+
+    evaluation = PermissionPolicy(tmp_path).evaluate(PermissionMode.AUTO, call)
+
+    assert evaluation.action is PermissionAction.ASK
+    assert evaluation.intent.kind is OperationKind.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "./cat input.txt",
+        "find . -exec malicious-script {} +",
+        "find . -execdir malicious-script {} +",
+        "find . -ok malicious-script {} +",
+        "find . -okdir malicious-script {} +",
+        "cat *",
+        "cat file?.txt",
+        "cat [ab]",
+        "cat file\nunknown-command",
+        "cat file\r\nunknown-command",
+    ),
+)
+def test_auto_requires_permission_for_shell_execution_and_expansion_escapes(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    evaluation = PermissionPolicy(tmp_path).evaluate(
+        PermissionMode.AUTO,
+        ToolCall("shell-escape", "bash", {"command": command}),
+    )
+
+    assert evaluation.action is PermissionAction.ASK
+    assert evaluation.intent.kind is OperationKind.UNKNOWN
+
+
+@pytest.mark.skipif(os.name != "nt", reason="cmd.exe single-quote semantics are Windows-only")
+@pytest.mark.parametrize(
+    "command",
+    ("echo 'safe & unknown-command'", "echo 'safe | unknown-command'"),
+)
+def test_auto_uses_windows_quote_semantics_for_shell_separators(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    evaluation = PermissionPolicy(tmp_path).evaluate(
+        PermissionMode.AUTO,
+        ToolCall("windows-quote", "bash", {"command": command}),
+    )
+
+    assert evaluation.action is PermissionAction.ASK
+    assert evaluation.intent.kind is OperationKind.UNKNOWN
+
+
+def test_permission_request_id_is_not_reused_after_session_resume(tmp_path: Path) -> None:
+    store = InMemorySessionStore()
+    first_kernel = AgentKernel.with_new_session(
+        FakeProvider(
+            (
+                (
+                    *_tool_call_events(
+                        0,
+                        "same-call",
+                        "write",
+                        {"path": "same.txt", "content": "must-not-write"},
+                    ),
+                    ProviderDone("tool_use"),
+                ),
+            )
+        ),
+        store,
+        configuration={"provider": "fake"},
+        session_id="request-replay",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def cancel_first_request() -> str:
+        run = first_kernel.create_run("first request", permission_mode=PermissionMode.ASK)
+        request_id = ""
+        async for event in run:
+            if event.permission_request is not None:
+                request_id = event.permission_request.request_id
+                await run.cancel()
+        assert (await run.result()).state is AgentRunState.CANCELLED
+        return request_id
+
+    stale_request_id = asyncio.run(cancel_first_request())
+    first_kernel.close_session()
+    resumed = AgentKernel.with_resumed_session(
+        FakeProvider(
+            (
+                (
+                    *_tool_call_events(
+                        0,
+                        "same-call",
+                        "write",
+                        {"path": "same.txt", "content": "must-not-write"},
+                    ),
+                    ProviderDone("tool_use"),
+                ),
+                (ProviderDone(),),
+            )
+        ),
+        store,
+        "request-replay",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def reject_stale_request() -> None:
+        run = resumed.create_run("same request", permission_mode=PermissionMode.ASK)
+        async for event in run:
+            if event.permission_request is None:
+                continue
+            assert event.permission_request.request_id != stale_request_id
+            with pytest.raises(RuntimeError, match="stale|match"):
+                await run.resolve_permission(stale_request_id, True)
+            await run.resolve_permission(event.permission_request.request_id, False)
+        assert (await run.result()).state is AgentRunState.SETTLED
+
+    asyncio.run(reject_stale_request())
+
+    assert stale_request_id
+    assert not (tmp_path / "same.txt").exists()
+
+
 def test_tool_runtime_denial_is_side_effect_free_and_scheduling_is_orthogonal(
     tmp_path: Path,
 ) -> None:
@@ -470,17 +620,7 @@ def test_non_full_search_does_not_follow_a_directory_link_outside_workspace(
     outside.mkdir()
     (outside / "secret.txt").write_text("outside", encoding="utf-8")
     link = workspace / "linked-outside"
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except OSError:
-        if os.name != "nt":
-            pytest.skip("directory links are not available")
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    _create_directory_link(link, outside)
     runtime = ToolRuntime(LocalCodingEnvironment(workspace))
     runtime.enable("find")
 
@@ -493,6 +633,29 @@ def test_non_full_search_does_not_follow_a_directory_link_outside_workspace(
 
     assert batch.results[0].status == "success"
     assert batch.results[0].output == {"paths": []}
+
+
+def test_auto_requires_host_confirmation_for_a_bare_shell_target_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside", encoding="utf-8")
+    _create_directory_link(workspace / "linked-outside", outside)
+    command = "dir linked-outside" if os.name == "nt" else "ls linked-outside"
+    runtime = ToolRuntime(LocalCodingEnvironment(workspace))
+
+    result = asyncio.run(
+        runtime.execute_guarded_batch(
+            (ToolCall("shell", "bash", {"command": command}),),
+            permission_mode=PermissionMode.AUTO,
+        )
+    ).results[0]
+
+    assert result.error is not None
+    assert result.error.code == "permission_required"
 
 
 def test_agent_run_resolves_each_permission_once_and_denial_reaches_the_model(
@@ -544,8 +707,18 @@ def test_agent_run_resolves_each_permission_once_and_denial_reaches_the_model(
 
     assert (tmp_path / "approved.txt").read_text(encoding="utf-8") == "approved"
     assert not (tmp_path / "denied.txt").exists()
-    assert sum(event.kind is AgentSessionEventKind.PERMISSION_REQUESTED for event in events) == 2
-    assert sum(event.kind is AgentSessionEventKind.PERMISSION_RESOLVED for event in events) == 2
+    requested = [
+        event.permission_request
+        for event in events
+        if event.kind is AgentSessionEventKind.PERMISSION_REQUESTED
+    ]
+    resolved = [
+        event for event in events if event.kind is AgentSessionEventKind.PERMISSION_RESOLVED
+    ]
+    assert len(requested) == len(resolved) == 2
+    assert [event.permission_request_id for event in resolved] == [
+        request.request_id for request in requested if request is not None
+    ]
     denied_results = [
         event.tool_result
         for event in events
@@ -557,6 +730,105 @@ def test_agent_run_resolves_each_permission_once_and_denial_reaches_the_model(
     assert denied_results[0].error.code == "permission_denied"
     feedback = cast(ToolResultMessage, provider.requests[1].messages[-1])
     assert feedback.results[1] == denied_results[0]
+
+
+def test_policy_decisions_do_not_emit_permission_resolved(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        (
+            (
+                *_tool_call_events(
+                    0,
+                    "automatic-write",
+                    "write",
+                    {"path": "automatic.txt", "content": "automatic"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def scenario() -> list[AgentSessionEvent]:
+        run = kernel.create_run("write automatically")
+        events = [event async for event in run]
+        await run.result()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert (tmp_path / "automatic.txt").read_text(encoding="utf-8") == "automatic"
+    assert all(
+        event.kind
+        not in {
+            AgentSessionEventKind.PERMISSION_REQUESTED,
+            AgentSessionEventKind.PERMISSION_RESOLVED,
+        }
+        for event in events
+    )
+
+
+def test_accepted_permission_resolution_is_published_before_immediate_cancel(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        (
+            (
+                *_tool_call_events(
+                    0,
+                    "resolved-before-cancel",
+                    "write",
+                    {"path": "not-executed.txt", "content": "blocked by cancellation"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+        )
+    )
+    store = InMemorySessionStore()
+    kernel = AgentKernel.with_new_session(
+        provider,
+        store,
+        configuration={"provider": "fake"},
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def scenario() -> tuple[AgentRunState, list[AgentSessionEvent]]:
+        run = kernel.create_run("resolve then cancel", permission_mode=PermissionMode.ASK)
+        events: list[AgentSessionEvent] = []
+        async for event in run:
+            events.append(event)
+            if event.permission_request is not None:
+                await run.resolve_permission(event.permission_request.request_id, True)
+                await run.cancel()
+        return (await run.result()).state, events
+
+    state, events = asyncio.run(scenario())
+
+    assert state is AgentRunState.CANCELLED
+    assert not (tmp_path / "not-executed.txt").exists()
+    resolved = [
+        event for event in events if event.kind is AgentSessionEventKind.PERMISSION_RESOLVED
+    ]
+    assert len(resolved) == 1
+    assert resolved[0].permission_decision is not None
+    assert resolved[0].permission_decision.resolution == "approved"
+    decisions = [
+        entry for entry in kernel.session_active_branch if entry.kind == "permission_decision"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].payload["resolution"] == "approved"
+    assert next(
+        index
+        for index, event in enumerate(events)
+        if event.kind is AgentSessionEventKind.PERMISSION_RESOLVED
+    ) < next(
+        index
+        for index, event in enumerate(events)
+        if event.kind is AgentSessionEventKind.RUN_CANCELLED
+    )
 
 
 def test_resolved_decision_is_durable_without_pending_capability_and_full_downgrades(
@@ -663,28 +935,43 @@ def test_pending_permission_is_invalidated_by_cancel_or_host_disconnect(
         tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
     )
 
-    async def scenario() -> tuple[str, str]:
+    async def scenario() -> tuple[str, str, list[AgentSessionEvent]]:
         run = kernel.create_run("wait for Host", permission_mode=PermissionMode.ASK)
         request_id = ""
+        events: list[AgentSessionEvent] = []
         async for event in run:
+            events.append(event)
             if event.permission_request is not None:
                 request_id = event.permission_request.request_id
                 if termination == "cancel":
                     await run.cancel()
                 else:
                     await run.aclose()
-                break
         result = await run.result()
         with pytest.raises(RuntimeError, match="not active|pending"):
             await run.resolve_permission(request_id, True)
-        return result.state.value, request_id
+        return result.state.value, request_id, events
 
-    state, request_id = asyncio.run(scenario())
+    state, request_id, events = asyncio.run(scenario())
 
     assert state == "cancelled"
     assert request_id
     assert not (tmp_path / "never.txt").exists()
-    assert all(entry.kind != "permission_decision" for entry in kernel.session_active_branch)
+    resolved = [
+        event for event in events if event.kind is AgentSessionEventKind.PERMISSION_RESOLVED
+    ]
+    assert len(resolved) == 1
+    assert resolved[0].permission_request_id == request_id
+    assert resolved[0].permission_decision is not None
+    assert resolved[0].permission_decision.resolution == "denied"
+    decisions = [
+        entry for entry in kernel.session_active_branch if entry.kind == "permission_decision"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].payload["resolution"] == "denied"
+    assert decisions[0].payload["source"] == "host"
+    assert "request_id" not in decisions[0].payload
+    assert "binding" not in decisions[0].payload
 
 
 def test_extension_rewrite_invalidates_pre_hook_approval_identity(tmp_path: Path) -> None:
@@ -852,7 +1139,13 @@ def test_session_resume_rejects_permission_decision_with_pending_capability(
 
 @pytest.mark.parametrize(
     "corruption",
-    ("empty-targets", "empty-intent-reason", "file-command-digest"),
+    (
+        "empty-targets",
+        "empty-intent-reason",
+        "file-command-digest",
+        "write-read-kind",
+        "ask-policy-write-approved",
+    ),
 )
 def test_session_resume_rejects_semantically_invalid_permission_decision(
     tmp_path: Path,
@@ -904,8 +1197,12 @@ def test_session_resume_rejects_semantically_invalid_permission_decision(
         intent["targets"] = []
     elif corruption == "empty-intent-reason":
         intent["reason"] = ""
-    else:
+    elif corruption == "file-command-digest":
         intent["command_sha256"] = "0" * 64
+    elif corruption == "write-read-kind":
+        intent["kind"] = "read"
+    else:
+        decision["source"] = "policy"
     session_path.write_text(
         "".join(
             json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"

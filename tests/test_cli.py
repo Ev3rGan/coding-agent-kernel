@@ -362,10 +362,12 @@ def test_permissions_cli_lifecycle_cases_are_non_replayable(
         assert summary["denied_side_effect_free"] is True
     elif case in {"cancel", "host-disconnect"}:
         assert summary["state"] == "cancelled"
+        assert summary["denial_persisted"] is True
         assert summary["pending_persisted"] is False
         assert summary["tool_executed"] is False
     else:
         assert summary["selected_before_resume"] == "full"
         assert summary["resumed_mode"] == "auto"
+        assert summary["denial_persisted"] is True
         assert summary["pending_persisted"] is False
     assert "Traceback" not in captured.err

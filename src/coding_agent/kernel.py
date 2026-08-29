@@ -815,6 +815,7 @@ class AgentKernel:
                 permission_decisions: dict[str, PermissionDecision] = {}
                 permission_executable: list[tuple[int, ToolCall]] = []
                 for index, call in executable:
+                    permission_request = None
                     try:
                         evaluation = self._tool_runtime.evaluate_permission(
                             call,
@@ -843,19 +844,7 @@ class AgentKernel:
                             permission_mode,
                         )
                         yield AgentSessionEvent.from_permission_request(permission_request)
-                        approved = await control.wait_for_permission(permission_request)
-                        decision = make_permission_decision(
-                            mode=permission_mode,
-                            call=call,
-                            evaluation=evaluation,
-                            approved=approved,
-                            source="host",
-                            reason=(
-                                "Host approved the one-time Permission Request"
-                                if approved
-                                else "Host denied the one-time Permission Request"
-                            ),
-                        )
+                        decision = await control.wait_for_permission(permission_request)
                     else:
                         decision = make_permission_decision(
                             mode=permission_mode,
@@ -865,10 +854,8 @@ class AgentKernel:
                             source="policy",
                         )
                     permission_decisions[call.call_id] = decision
-                    if self._session is not None:
+                    if permission_request is None and self._session is not None:
                         self._session.record_permission_decision(decision, run_id=run_id)
-                    yield AgentSessionEvent.from_permission_decision(run_id, decision)
-                    if self._session is not None:
                         for session_event in self._session.drain_events():
                             yield session_event
                     permission_executable.append((index, call))

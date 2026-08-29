@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import secrets
 import shlex
 from dataclasses import dataclass
 from enum import StrEnum
@@ -53,6 +55,13 @@ class ToolCallLike(Protocol):
 
     @property
     def arguments(self) -> dict[str, Any]: ...
+
+
+def _decode_arguments_object(arguments_json: str) -> dict[str, Any]:
+    value = json.loads(arguments_json)
+    if not isinstance(value, dict):  # pragma: no cover - constructed canonically
+        raise RuntimeError("Permission arguments must be a JSON object.")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,10 +115,7 @@ class PermissionEvaluation:
 
     @property
     def final_arguments(self) -> dict[str, Any]:
-        value = json.loads(self.final_arguments_json)
-        if not isinstance(value, dict):  # pragma: no cover - constructed canonically
-            raise RuntimeError("Permission arguments must be a JSON object.")
-        return value
+        return _decode_arguments_object(self.final_arguments_json)
 
 
 PermissionResolution = Literal["approved", "denied"]
@@ -132,10 +138,7 @@ class PermissionRequest:
 
     @property
     def final_arguments(self) -> dict[str, Any]:
-        value = json.loads(self.final_arguments_json)
-        if not isinstance(value, dict):  # pragma: no cover - constructed canonically
-            raise RuntimeError("Permission arguments must be a JSON object.")
-        return value
+        return _decode_arguments_object(self.final_arguments_json)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,10 +161,7 @@ class PermissionDecision:
 
     @property
     def final_arguments(self) -> dict[str, Any]:
-        value = json.loads(self.final_arguments_json)
-        if not isinstance(value, dict):  # pragma: no cover - constructed canonically
-            raise RuntimeError("Permission arguments must be a JSON object.")
-        return value
+        return _decode_arguments_object(self.final_arguments_json)
 
     def record(self) -> dict[str, object]:
         """Return a secret-free durable record without a pending request capability."""
@@ -192,6 +192,42 @@ _NETWORK_COMMAND = re.compile(
 _READABLE_SHELL_COMMANDS = frozenset(
     {"cat", "dir", "echo", "exit", "find", "findstr", "grep", "ls", "rg", "type"}
 )
+_CHILD_PROCESS_SHELL_OPTIONS = frozenset(
+    {"--hostname-bin", "--pre", "-exec", "-execdir", "-ok", "-okdir"}
+)
+
+
+def _canonical_permission_actions(
+    mode: PermissionMode,
+    kind: OperationKind,
+    scope: TargetScope,
+    *,
+    read_only_shell_guaranteed: bool | None,
+) -> frozenset[PermissionAction]:
+    """Return canonical actions; ``None`` preserves either valid PLAN shell outcome."""
+
+    if mode is PermissionMode.FULL:
+        return frozenset({PermissionAction.ALLOW})
+    if mode is PermissionMode.PLAN:
+        if kind is OperationKind.READ and scope is TargetScope.WORKSPACE:
+            return frozenset({PermissionAction.ALLOW})
+        if kind is OperationKind.SHELL and scope is TargetScope.WORKSPACE:
+            if read_only_shell_guaranteed is None:
+                return frozenset({PermissionAction.ALLOW, PermissionAction.DENY})
+            if read_only_shell_guaranteed:
+                return frozenset({PermissionAction.ALLOW})
+        return frozenset({PermissionAction.DENY})
+    if mode is PermissionMode.ASK:
+        if kind is OperationKind.READ and scope is TargetScope.WORKSPACE:
+            return frozenset({PermissionAction.ALLOW})
+        return frozenset({PermissionAction.ASK})
+    if kind in {
+        OperationKind.NETWORK,
+        OperationKind.CUSTOM,
+        OperationKind.UNKNOWN,
+    } or scope in {TargetScope.OUTSIDE, TargetScope.UNKNOWN}:
+        return frozenset({PermissionAction.ASK})
+    return frozenset({PermissionAction.ALLOW})
 
 
 class PermissionPolicy:
@@ -287,7 +323,7 @@ class PermissionPolicy:
             tokens = shlex.split(command, posix=True)
         except ValueError:
             tokens = []
-        executable = Path(tokens[0]).name.lower() if tokens else ""
+        executable = tokens[0].lower() if tokens else ""
         recognized = executable in _READABLE_SHELL_COMMANDS
         if not recognized:
             return self._unknown_bash_intent(
@@ -298,7 +334,9 @@ class PermissionPolicy:
         targets = [cwd_path]
         for token in tokens[1:]:
             if token.startswith("-"):
-                if any(marker in token for marker in ("=", "/", "\\", "..")):
+                if token in _CHILD_PROCESS_SHELL_OPTIONS or any(
+                    marker in token for marker in ("=", "/", "\\", "..")
+                ):
                     return self._unknown_bash_intent(
                         command,
                         cwd_path,
@@ -307,8 +345,7 @@ class PermissionPolicy:
                 continue
             if "://" in token:
                 continue
-            if "/" in token or "\\" in token or token.startswith("."):
-                targets.append(self._normalize_target(token, cwd=cwd_path))
+            targets.append(self._normalize_target(token, cwd=cwd_path))
         scope = self._scope(tuple(targets))
         return OperationIntent(
             "bash",
@@ -335,6 +372,7 @@ class PermissionPolicy:
     @staticmethod
     def _has_unquoted_shell_meta(command: str) -> bool:
         quote: str | None = None
+        quote_characters = {'"'} if os.name == "nt" else {"'", '"'}
         escaped = False
         for index, character in enumerate(command):
             if escaped:
@@ -347,10 +385,10 @@ class PermissionPolicy:
                 if character == quote:
                     quote = None
                 continue
-            if character in {"'", '"'}:
+            if character in quote_characters:
                 quote = character
                 continue
-            if character in "|&;<>`":
+            if character in "|&;<>`*?[]\r\n":
                 return True
             if character == "$" and index + 1 < len(command) and command[index + 1] == "(":
                 return True
@@ -375,29 +413,35 @@ class PermissionPolicy:
         mode: PermissionMode,
         intent: OperationIntent,
     ) -> tuple[PermissionAction, str]:
-        if mode is PermissionMode.FULL:
-            return PermissionAction.ALLOW, "full bypasses Kernel approval and containment"
-        if mode is PermissionMode.PLAN:
-            if intent.kind is OperationKind.READ and intent.scope is TargetScope.WORKSPACE:
-                return PermissionAction.ALLOW, "plan allows contained workspace reads"
-            if (
-                intent.kind is OperationKind.SHELL
-                and intent.scope is TargetScope.WORKSPACE
-                and self._read_only_shell_guaranteed
-            ):
-                return PermissionAction.ALLOW, "environment guarantees read-only diagnostic shell"
-            return PermissionAction.DENY, "plan rejects operations not guaranteed read-only"
-        if mode is PermissionMode.ASK:
-            if intent.kind is OperationKind.READ and intent.scope is TargetScope.WORKSPACE:
-                return PermissionAction.ALLOW, "ask allows contained workspace reads"
-            return PermissionAction.ASK, "ask requires one Host decision for this final ToolCall"
-        if intent.kind in {
-            OperationKind.NETWORK,
-            OperationKind.CUSTOM,
-            OperationKind.UNKNOWN,
-        } or intent.scope in {TargetScope.OUTSIDE, TargetScope.UNKNOWN}:
-            return PermissionAction.ASK, "auto requires one Host decision for elevated authority"
-        return PermissionAction.ALLOW, "auto allows ordinary contained workspace operations"
+        actions = _canonical_permission_actions(
+            mode,
+            intent.kind,
+            intent.scope,
+            read_only_shell_guaranteed=self._read_only_shell_guaranteed,
+        )
+        action = next(iter(actions))
+        reasons = {
+            (PermissionMode.FULL, PermissionAction.ALLOW): (
+                "full bypasses Kernel approval and containment"
+            ),
+            (PermissionMode.PLAN, PermissionAction.ALLOW): (
+                "plan allows operations guaranteed read-only"
+            ),
+            (PermissionMode.PLAN, PermissionAction.DENY): (
+                "plan rejects operations not guaranteed read-only"
+            ),
+            (PermissionMode.ASK, PermissionAction.ALLOW): ("ask allows contained workspace reads"),
+            (PermissionMode.ASK, PermissionAction.ASK): (
+                "ask requires one Host decision for this final ToolCall"
+            ),
+            (PermissionMode.AUTO, PermissionAction.ASK): (
+                "auto requires one Host decision for elevated authority"
+            ),
+            (PermissionMode.AUTO, PermissionAction.ALLOW): (
+                "auto allows ordinary contained workspace operations"
+            ),
+        }
+        return action, reasons[(mode, action)]
 
 
 def make_permission_request(
@@ -408,7 +452,7 @@ def make_permission_request(
     call: ToolCallLike,
     evaluation: PermissionEvaluation,
 ) -> PermissionRequest:
-    request_id = f"{run_id}:permission:{ordinal}:{evaluation.binding[:16]}"
+    request_id = f"{run_id}:permission:{ordinal}:{evaluation.binding[:16]}:{secrets.token_hex(16)}"
     return PermissionRequest(
         request_id,
         run_id,
@@ -443,7 +487,7 @@ def validate_permission_decision_record(payload: dict[str, object]) -> None:
         if not isinstance(value, str) or not value:
             raise ValueError(f"Permission Decision field {name!r} must be a non-empty string")
     try:
-        PermissionMode(payload.get("mode"))  # type: ignore[arg-type]
+        mode = PermissionMode(payload.get("mode"))  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ValueError("Permission Decision has an invalid mode") from exc
     if payload.get("resolution") not in {"approved", "denied"}:
@@ -469,7 +513,7 @@ def validate_permission_decision_record(payload: dict[str, object]) -> None:
         raise ValueError("Permission Decision has an invalid Operation Intent schema")
     try:
         intent_kind = OperationKind(raw_intent.get("kind"))  # type: ignore[arg-type]
-        TargetScope(raw_intent.get("scope"))  # type: ignore[arg-type]
+        intent_scope = TargetScope(raw_intent.get("scope"))  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "Permission Decision has an invalid Operation Intent classification"
@@ -502,6 +546,34 @@ def validate_permission_decision_record(payload: dict[str, object]) -> None:
             raise ValueError("Permission Decision has an inconsistent bash Operation Intent")
     elif cwd is not None or command_digest is not None:
         raise ValueError("Permission Decision has shell fields on a non-bash Operation Intent")
+    tool_name = payload["tool_name"]
+    if tool_name in _FILE_READ_TOOLS and intent_kind is not OperationKind.READ:
+        raise ValueError("Permission Decision has a non-read intent for a read Tool")
+    if tool_name in _FILE_WRITE_TOOLS and intent_kind is not OperationKind.WRITE:
+        raise ValueError("Permission Decision has a non-write intent for a write Tool")
+    if tool_name in _FILE_READ_TOOLS | _FILE_WRITE_TOOLS:
+        if intent_scope is TargetScope.UNKNOWN:
+            raise ValueError("Permission Decision has an unknown scope for a file Tool")
+    elif tool_name != "bash" and (
+        intent_kind is not OperationKind.CUSTOM or intent_scope is not TargetScope.UNKNOWN
+    ):
+        raise ValueError("Permission Decision has an inconsistent custom Tool intent")
+
+    record_action = (
+        PermissionAction.ASK
+        if payload["source"] == "host"
+        else (
+            PermissionAction.ALLOW if payload["resolution"] == "approved" else PermissionAction.DENY
+        )
+    )
+    valid_actions = _canonical_permission_actions(
+        mode,
+        intent_kind,
+        intent_scope,
+        read_only_shell_guaranteed=None,
+    )
+    if record_action not in valid_actions:
+        raise ValueError("Permission Decision contradicts the canonical mode matrix")
 
 
 def make_permission_decision(
@@ -523,4 +595,25 @@ def make_permission_decision(
         evaluation.intent,
         evaluation.binding,
         evaluation.reason if reason is None else reason,
+    )
+
+
+def make_permission_request_decision(
+    request: PermissionRequest,
+    *,
+    approved: bool,
+    reason: str,
+) -> PermissionDecision:
+    """Resolve a transient request as a non-replayable Host decision."""
+
+    return PermissionDecision(
+        request.call_id,
+        request.tool_name,
+        request.mode,
+        "approved" if approved else "denied",
+        "host",
+        request.final_arguments_json,
+        request.intent,
+        request.binding,
+        reason,
     )

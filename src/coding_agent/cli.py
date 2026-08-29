@@ -148,6 +148,7 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
     if event.permission_decision is not None:
         decision = event.permission_decision
         record["permission_decision"] = {
+            "request_id": event.permission_request_id,
             "call_id": decision.call_id,
             "tool_name": decision.tool_name,
             "mode": decision.mode.value,
@@ -739,10 +740,13 @@ async def _permission_pending_terminal_demo(root: Path, case: str) -> int:
                 await run.aclose()
             else:
                 await run.cancel()
-            break
     result = await run.result()
+    decisions = [
+        entry for entry in kernel.session_active_branch if entry.kind == "permission_decision"
+    ]
+    denial_persisted = len(decisions) == 1 and decisions[0].payload.get("resolution") == "denied"
     pending_persisted = any(
-        entry.kind == "permission_decision" for entry in kernel.session_active_branch
+        "request_id" in entry.payload or "binding" in entry.payload for entry in decisions
     )
     kernel.close_session()
     tool_executed = (workspace / "pending.txt").exists()
@@ -752,12 +756,18 @@ async def _permission_pending_terminal_demo(root: Path, case: str) -> int:
                 "case": case,
                 "mode": PermissionMode.ASK.value,
                 "state": result.state.value,
+                "denial_persisted": denial_persisted,
                 "pending_persisted": pending_persisted,
                 "tool_executed": tool_executed,
             }
         }
     )
-    return int(result.state is not AgentRunState.CANCELLED or pending_persisted or tool_executed)
+    return int(
+        result.state is not AgentRunState.CANCELLED
+        or not denial_persisted
+        or pending_persisted
+        or tool_executed
+    )
 
 
 async def _permission_resume_demo(root: Path) -> int:
@@ -794,7 +804,6 @@ async def _permission_resume_demo(root: Path) -> int:
         _print_record(record)
         if event.permission_request is not None:
             await pending_run.cancel()
-            break
     await pending_run.result()
 
     full_run = kernel.create_run("Select full explicitly.", permission_mode=PermissionMode.FULL)
@@ -804,8 +813,12 @@ async def _permission_resume_demo(root: Path) -> int:
         _print_record(record)
     await full_run.result()
     selected_before_resume = full_run.permission_mode
+    decisions = [
+        entry for entry in kernel.session_active_branch if entry.kind == "permission_decision"
+    ]
+    denial_persisted = len(decisions) == 1 and decisions[0].payload.get("resolution") == "denied"
     pending_persisted = any(
-        entry.kind == "permission_decision" for entry in kernel.session_active_branch
+        "request_id" in entry.payload or "binding" in entry.payload for entry in decisions
     )
     kernel.close_session()
 
@@ -829,6 +842,7 @@ async def _permission_resume_demo(root: Path) -> int:
                 "state": result.state.value,
                 "selected_before_resume": selected_before_resume.value,
                 "resumed_mode": resumed_run.permission_mode.value,
+                "denial_persisted": denial_persisted,
                 "pending_persisted": pending_persisted,
             }
         }
@@ -837,6 +851,7 @@ async def _permission_resume_demo(root: Path) -> int:
         result.state is not AgentRunState.SETTLED
         or selected_before_resume is not PermissionMode.FULL
         or resumed_run.permission_mode is not PermissionMode.AUTO
+        or not denial_persisted
         or pending_persisted
     )
 

@@ -614,6 +614,7 @@ class AgentSessionEvent:
     retry_remaining: int | None = None
     retry_error: AgentError | None = None
     permission_request: PermissionRequest | None = None
+    permission_request_id: str | None = None
     permission_decision: PermissionDecision | None = None
 
     def __post_init__(self) -> None:
@@ -625,10 +626,20 @@ class AgentSessionEvent:
             if self.agent_event is not None or self.result is not None or self.run_id is None:
                 raise ValueError("Permission events require run data only")
             if self.kind is AgentSessionEventKind.PERMISSION_REQUESTED:
-                if self.permission_request is None or self.permission_decision is not None:
+                if (
+                    self.permission_request is None
+                    or self.permission_request_id is not None
+                    or self.permission_decision is not None
+                ):
                     raise ValueError("permission_requested requires only a Permission Request")
-            elif self.permission_decision is None or self.permission_request is not None:
-                raise ValueError("permission_resolved requires only a Permission Decision")
+            elif (
+                self.permission_decision is None
+                or self.permission_request is not None
+                or not self.permission_request_id
+            ):
+                raise ValueError(
+                    "permission_resolved requires a Permission Request ID and Decision"
+                )
             return
         if control_event:
             if self.agent_event is not None or self.result is not None:
@@ -692,11 +703,13 @@ class AgentSessionEvent:
     def from_permission_decision(
         cls,
         run_id: str,
+        request_id: str,
         decision: PermissionDecision,
     ) -> AgentSessionEvent:
         return cls(
             AgentSessionEventKind.PERMISSION_RESOLVED,
             run_id=run_id,
+            permission_request_id=request_id,
             permission_decision=decision,
         )
 
