@@ -71,6 +71,8 @@ class LocalCodingEnvironment:
         return False
 
     def resolve_path(self, path: str) -> Path:
+        if "\0" in path:
+            raise WorkspacePathError("path target contains NUL")
         candidate = (self.workspace / path).resolve()
         if (
             self._contain_workspace

@@ -86,6 +86,20 @@ class _StatefulEnvironment(LocalCodingEnvironment):
         return super().resolve_path(path)
 
 
+class _ExecutionRecordingEnvironment(LocalCodingEnvironment):
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.read_paths: list[str] = []
+
+    async def read_text(
+        self,
+        path: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> str:
+        self.read_paths.append(path)
+        return await super().read_text(path, cancel_event)
+
+
 def _create_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -192,6 +206,37 @@ def test_canonical_permission_matrix_uses_normalized_final_arguments(
 
     assert evaluation.action is expected_action
     assert evaluation.intent.scope is expected_scope
+
+
+@pytest.mark.parametrize(
+    "call",
+    (
+        ToolCall("read-leading-nul", "read", {"path": "\0target.txt"}),
+        ToolCall("read-middle-nul", "read", {"path": "target\0name.txt"}),
+        ToolCall("read-trailing-nul", "read", {"path": "target.txt\0"}),
+        ToolCall(
+            "write-middle-nul",
+            "write",
+            {"path": "target\0name.txt", "content": "must-not-write"},
+        ),
+        ToolCall(
+            "bash-cwd-middle-nul",
+            "bash",
+            {"command": "echo diagnostic", "cwd": "target\0directory"},
+        ),
+        ToolCall(
+            "bash-target-middle-nul",
+            "bash",
+            {"command": "cat target\0name.txt"},
+        ),
+    ),
+)
+def test_permission_policy_rejects_nul_in_normalized_path_inputs(
+    tmp_path: Path,
+    call: ToolCall,
+) -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        PermissionPolicy(tmp_path).evaluate(PermissionMode.AUTO, call)
 
 
 def test_plan_allows_shell_only_when_the_environment_guarantees_read_only(
@@ -535,9 +580,27 @@ def test_run_local_execution_view_preserves_environment_adapter_state(
     assert batch.results[0].output == {"content": "value"}
 
 
+def test_guarded_runtime_reports_safe_permission_classification_reason(
+    tmp_path: Path,
+) -> None:
+    batch = asyncio.run(
+        ToolRuntime(LocalCodingEnvironment(tmp_path)).execute_guarded_batch(
+            (ToolCall("invalid-path", "read", {"path": "\0"}),),
+        )
+    )
+
+    result = batch.results[0]
+    assert result.error is not None
+    assert result.error.code == "permission_invalid"
+    assert result.error.message == (
+        "Permission classification failed for final ToolCall: path target contains NUL"
+    )
+
+
 def test_permission_classification_failure_is_a_model_visible_tool_error(
     tmp_path: Path,
 ) -> None:
+    environment = _ExecutionRecordingEnvironment(tmp_path)
     provider = FakeProvider(
         (
             (
@@ -549,7 +612,7 @@ def test_permission_classification_failure_is_a_model_visible_tool_error(
     )
     kernel = AgentKernel(
         provider,
-        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+        tool_runtime=ToolRuntime(environment),
     )
 
     async def scenario() -> tuple[list[AgentSessionEvent], str]:
@@ -568,6 +631,10 @@ def test_permission_classification_failure_is_a_model_visible_tool_error(
     assert state == "settled"
     assert tool_result.error is not None
     assert tool_result.error.code == "permission_invalid"
+    assert tool_result.error.message == (
+        "Permission classification failed for final ToolCall: path target contains NUL"
+    )
+    assert environment.read_paths == []
     feedback = cast(ToolResultMessage, provider.requests[1].messages[-1])
     assert feedback.results == (tool_result,)
 
