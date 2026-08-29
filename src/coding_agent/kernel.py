@@ -59,6 +59,7 @@ from coding_agent.permissions import (
     PermissionDecision,
     PermissionMode,
     make_permission_decision,
+    permission_classification_error_message,
 )
 from coding_agent.provider import (
     BranchSummaryMessage,
@@ -821,7 +822,7 @@ class AgentKernel:
                             call,
                             permission_mode,
                         )
-                    except (OSError, RuntimeError, TypeError, ValueError):
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
                         try:
                             self._tool_runtime.validate_call(call)
                         except ValueError:
@@ -833,7 +834,7 @@ class AgentKernel:
                                 "error",
                                 error=ToolError(
                                     "permission_invalid",
-                                    "Permission classification failed for final ToolCall",
+                                    permission_classification_error_message(exc),
                                 ),
                             )
                         continue

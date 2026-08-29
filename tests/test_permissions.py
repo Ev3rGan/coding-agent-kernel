@@ -580,6 +580,23 @@ def test_run_local_execution_view_preserves_environment_adapter_state(
     assert batch.results[0].output == {"content": "value"}
 
 
+def test_guarded_runtime_reports_safe_permission_classification_reason(
+    tmp_path: Path,
+) -> None:
+    batch = asyncio.run(
+        ToolRuntime(LocalCodingEnvironment(tmp_path)).execute_guarded_batch(
+            (ToolCall("invalid-path", "read", {"path": "\0"}),),
+        )
+    )
+
+    result = batch.results[0]
+    assert result.error is not None
+    assert result.error.code == "permission_invalid"
+    assert result.error.message == (
+        "Permission classification failed for final ToolCall: path target contains NUL"
+    )
+
+
 def test_permission_classification_failure_is_a_model_visible_tool_error(
     tmp_path: Path,
 ) -> None:
@@ -614,6 +631,9 @@ def test_permission_classification_failure_is_a_model_visible_tool_error(
     assert state == "settled"
     assert tool_result.error is not None
     assert tool_result.error.code == "permission_invalid"
+    assert tool_result.error.message == (
+        "Permission classification failed for final ToolCall: path target contains NUL"
+    )
     assert environment.read_paths == []
     feedback = cast(ToolResultMessage, provider.requests[1].messages[-1])
     assert feedback.results == (tool_result,)

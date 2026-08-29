@@ -3,7 +3,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from coding_agent import LocalCodingEnvironment, ToolBatchResult, ToolCall, ToolRuntime
+
+
+def test_environment_rejects_nul_path_before_normalization(tmp_path: Path) -> None:
+    environment = LocalCodingEnvironment(tmp_path)
+
+    with pytest.raises(ValueError, match="NUL"):
+        environment.resolve_path("target.txt\0../../outside.txt")
 
 
 def test_runtime_registers_seven_tools_and_requires_opt_in_for_search_tools(tmp_path: Path) -> None:

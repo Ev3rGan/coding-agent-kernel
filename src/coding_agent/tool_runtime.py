@@ -18,6 +18,7 @@ from coding_agent.permissions import (
     PermissionEvaluation,
     PermissionMode,
     PermissionPolicy,
+    permission_classification_error_message,
 )
 from coding_agent.tools import Tool, ToolExecutionError, ToolOutput, ToolSpec, builtin_tools
 
@@ -405,11 +406,11 @@ class ToolRuntime:
     ) -> ToolResult | None:
         try:
             evaluation = self._permission_policy.evaluate(permission_mode, call)
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return self._error(
                 call,
                 "permission_invalid",
-                "Permission classification failed for final ToolCall",
+                permission_classification_error_message(exc),
             )
         decision = None if permission_decisions is None else permission_decisions.get(call.call_id)
         if decision is not None and (

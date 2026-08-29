@@ -25,6 +25,19 @@ class PermissionMode(StrEnum):
     FULL = "full"
 
 
+class PermissionClassificationError(ValueError):
+    """A permission-classification failure whose reason is safe for the model."""
+
+
+def permission_classification_error_message(exc: Exception) -> str:
+    """Return a model-safe message without exposing unexpected Host failures."""
+
+    message = "Permission classification failed for final ToolCall"
+    if isinstance(exc, PermissionClassificationError):
+        return f"{message}: {exc}"
+    return message
+
+
 class PermissionAction(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -396,7 +409,7 @@ class PermissionPolicy:
 
     def _normalize_target(self, raw: str, *, cwd: Path | None = None) -> Path:
         if "\0" in raw:
-            raise ValueError("path target contains NUL")
+            raise PermissionClassificationError("path target contains NUL")
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = (self._workspace if cwd is None else cwd) / candidate
