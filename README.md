@@ -130,6 +130,21 @@ JSON Lines 会显示 queue、injection/drop、Provider retry、Session 和唯一
 outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表达；不增加 Step、
 第二 AgentLoop、多 Agent 或长期后台服务。
 
+## Host 权限模式
+
+每次 `AgentRun` 都由 Host 选择 `plan`、`ask`、`auto` 或 `full`，默认是 `auto`。
+Host 必须持续消费 `AgentRun` Event Stream；收到 `permission_requested` 后，只能通过
+`AgentRun.resolve_permission()` 对该次请求批准或拒绝。若 Host 既不处理请求也不取消或
+关闭 run，run 会继续等待决策，不会由 Kernel 猜测超时或自动提升权限。`ask` 会自动
+允许 workspace read；`ask/auto` 对 outside、network、unknown 和没有 target contract
+的 custom Tool 请求一次性确认。
+
+从早期无限制 shell 行为迁移的可信集成，应实现上述请求处理；只有在一次明确可信、
+可丢弃的运行中才显式选择 `full`。`full` 仅跳过 Kernel approval/containment，仍受 OS
+权限、取消、timeout 与进程生命周期约束；它不是生产级 sandbox 或 OS 提权。
+`ToolRuntime.execute_batch()` 是供已完成授权的 Host adapter 使用的历史低层 seam；
+产品权限边界是 `AgentKernel` 经最终参数重验证后调用 guarded runtime 的路径。
+
 ## English
 
 An independently implemented Python kernel for coding agents, focused on
@@ -238,13 +253,32 @@ async def observe_run() -> None:
 
 `AgentRun.state` is one of `active`, `settled`, `cancelled`, or `failed`.
 `AgentRun.cancel()` cancels active Provider or Tool Execution work. Model
-Real Providers and Permission Policy remain later-ticket work.
+Providers remain later-ticket work.
 The implemented Context pipeline projects only the selected Active Branch and
 explicitly injected messages before every Provider call.
 
 The Run/Turn and layered event semantics follow the selected Pi behavioral
 baseline. This project keeps only a thin CLI product shell, while the
 asynchronously iterable `AgentRun` facade is the Python-facing public boundary.
+
+## Host permission modes
+
+The Host selects `plan`, `ask`, `auto`, or `full` for every `AgentRun`; the
+default is `auto`. A Host must keep consuming the run's Event Stream and resolve
+each `permission_requested` event only through `AgentRun.resolve_permission()`.
+If it neither resolves, cancels, nor closes the run, the run waits instead of
+guessing a timeout or elevating itself. `ask` automatically allows workspace
+reads; `ask/auto` request one-time confirmation for outside, network, unknown,
+and custom Tools without a target contract.
+
+Trusted integrations migrating from earlier unrestricted shell behavior should
+handle those requests. Select `full` only for an explicitly trusted disposable
+run. `full` skips Kernel approval and containment, but not OS authority,
+cancellation, timeouts, or process-lifecycle controls; it is not a production
+sandbox or OS elevation. `ToolRuntime.execute_batch()` is the historical
+low-level seam for a Host adapter that has already authorized a batch. The
+product permission boundary is the guarded path from `AgentKernel` after final
+argument revalidation.
 
 ## Recoverable, branching Sessions
 

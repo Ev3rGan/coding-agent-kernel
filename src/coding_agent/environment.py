@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import signal
 import subprocess
@@ -59,10 +60,15 @@ class LocalCodingEnvironment:
     def _execution_view(self, *, contain_workspace: bool) -> LocalCodingEnvironment:
         """Return a run-local view without mutating a shared environment."""
 
-        view = object.__new__(type(self))
-        view.workspace = self.workspace
+        view = copy.copy(self)
         view._contain_workspace = contain_workspace
         return view
+
+    @property
+    def read_only_shell_guaranteed(self) -> bool:
+        """Whether this environment enforces read-only shell execution itself."""
+
+        return False
 
     def resolve_path(self, path: str) -> Path:
         candidate = (self.workspace / path).resolve()

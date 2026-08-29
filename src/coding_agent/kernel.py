@@ -812,18 +812,36 @@ class AgentKernel:
                             error=ToolError("extension_rejected", str(exc)),
                         )
 
-                executable_calls = tuple(call for _, call in executable)
                 permission_decisions: dict[str, PermissionDecision] = {}
-                for _, call in executable:
+                permission_executable: list[tuple[int, ToolCall]] = []
+                for index, call in executable:
                     try:
                         evaluation = self._tool_runtime.evaluate_permission(
                             call,
                             permission_mode,
                         )
-                    except ValueError:
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        try:
+                            self._tool_runtime.validate_call(call)
+                        except ValueError:
+                            permission_executable.append((index, call))
+                        else:
+                            precomputed[index] = ToolResult(
+                                call.call_id,
+                                call.tool_name,
+                                "error",
+                                error=ToolError(
+                                    "permission_invalid",
+                                    "Permission classification failed for final ToolCall",
+                                ),
+                            )
                         continue
                     if evaluation.action is PermissionAction.ASK:
-                        permission_request = control.open_permission(call, evaluation)
+                        permission_request = control.open_permission(
+                            call,
+                            evaluation,
+                            permission_mode,
+                        )
                         yield AgentSessionEvent.from_permission_request(permission_request)
                         approved = await control.wait_for_permission(permission_request)
                         decision = make_permission_decision(
@@ -853,6 +871,9 @@ class AgentKernel:
                     if self._session is not None:
                         for session_event in self._session.drain_events():
                             yield session_event
+                    permission_executable.append((index, call))
+                executable = permission_executable
+                executable_calls = tuple(call for _, call in executable)
                 batch_mode = self._tool_runtime.batch_mode(executable_calls)
                 for _, call in executable:
                     yield AgentEvent(

@@ -140,6 +140,7 @@ def _event_record(event: AgentSessionEvent) -> dict[str, Any]:
             "request_id": request.request_id,
             "call_id": request.call_id,
             "tool_name": request.tool_name,
+            "mode": request.mode.value,
             "final_arguments": request.final_arguments,
             "operation_intent": request.intent.record(),
             "reason": request.reason,

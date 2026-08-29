@@ -175,11 +175,39 @@ class BashTool:
         return ToolOutput(output)
 
 
-async def _files(root: Path, cancel_event: asyncio.Event | None) -> list[Path]:
+async def _files(
+    root: Path,
+    environment: LocalCodingEnvironment,
+    cancel_event: asyncio.Event | None,
+) -> list[Path]:
     raise_if_cancelled(cancel_event)
-    paths = await asyncio.to_thread(
-        lambda: sorted(path for path in root.rglob("*") if path.is_file())
-    )
+
+    def scan() -> list[Path]:
+        directories = [root]
+        visited: set[Path] = set()
+        paths: list[Path] = []
+        while directories:
+            candidate = directories.pop()
+            try:
+                directory = environment.resolve_path(str(candidate))
+                if directory in visited:
+                    continue
+                visited.add(directory)
+                entries = sorted(directory.iterdir(), reverse=True)
+            except (OSError, ValueError):
+                continue
+            for entry in entries:
+                try:
+                    resolved = environment.resolve_path(str(entry))
+                    if resolved.is_dir():
+                        directories.append(resolved)
+                    elif resolved.is_file():
+                        paths.append(resolved)
+                except (OSError, ValueError):
+                    continue
+        return sorted(paths)
+
+    paths = await asyncio.to_thread(scan)
     raise_if_cancelled(cancel_event)
     return paths
 
@@ -211,7 +239,7 @@ class GrepTool:
         root = environment.resolve_path(arguments.get("path", "."))
         pattern = re.compile(arguments["pattern"])
         matches: list[dict[str, Any]] = []
-        candidates = await _files(root, cancel_event) if root.is_dir() else [root]
+        candidates = await _files(root, environment, cancel_event) if root.is_dir() else [root]
         for path in candidates:
             raise_if_cancelled(cancel_event)
             display_path = _display_path(path, environment)
@@ -250,7 +278,7 @@ class FindTool:
         root = environment.resolve_path(arguments.get("path", "."))
         paths = [
             _display_path(path, environment)
-            for path in await _files(root, cancel_event)
+            for path in await _files(root, environment, cancel_event)
             if fnmatch.fnmatch(path.name, arguments["pattern"])
         ]
         return ToolOutput({"paths": paths})

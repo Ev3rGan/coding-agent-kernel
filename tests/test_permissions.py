@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +20,7 @@ from coding_agent import (
     JsonlSessionStore,
     LocalCodingEnvironment,
     PermissionAction,
+    PermissionDecision,
     PermissionMode,
     PermissionPolicy,
     ProviderDone,
@@ -64,6 +67,23 @@ class _RewritePathExtension:
         return Transform(ToolCall(hook_input.call_id, hook_input.tool_name, arguments))
 
 
+class _ReadOnlyShellEnvironment(LocalCodingEnvironment):
+    @property
+    def read_only_shell_guaranteed(self) -> bool:
+        return True
+
+
+class _StatefulEnvironment(LocalCodingEnvironment):
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.adapter_state = "ready"
+
+    def resolve_path(self, path: str) -> Path:
+        if self.adapter_state != "ready":
+            raise RuntimeError("environment adapter state was not preserved")
+        return super().resolve_path(path)
+
+
 @pytest.mark.parametrize(
     ("mode", "call", "expected_action", "expected_scope"),
     (
@@ -83,7 +103,7 @@ class _RewritePathExtension:
             PermissionMode.PLAN,
             ToolCall("shell", "bash", {"command": "git status"}),
             PermissionAction.DENY,
-            TargetScope.WORKSPACE,
+            TargetScope.UNKNOWN,
         ),
         (
             PermissionMode.ASK,
@@ -106,20 +126,32 @@ class _RewritePathExtension:
         (
             PermissionMode.AUTO,
             ToolCall("network", "bash", {"command": "curl https://example.invalid"}),
-            PermissionAction.DENY,
+            PermissionAction.ASK,
             TargetScope.WORKSPACE,
         ),
         (
             PermissionMode.AUTO,
             ToolCall("unknown", "bash", {"command": "echo changed > inside.txt"}),
-            PermissionAction.DENY,
+            PermissionAction.ASK,
             TargetScope.UNKNOWN,
         ),
         (
             PermissionMode.AUTO,
             ToolCall("outside", "read", {"path": "../outside.txt"}),
-            PermissionAction.DENY,
+            PermissionAction.ASK,
             TargetScope.OUTSIDE,
+        ),
+        (
+            PermissionMode.ASK,
+            ToolCall("outside", "read", {"path": "../outside.txt"}),
+            PermissionAction.ASK,
+            TargetScope.OUTSIDE,
+        ),
+        (
+            PermissionMode.AUTO,
+            ToolCall("custom", "extension_echo", {"value": "unclassified"}),
+            PermissionAction.ASK,
+            TargetScope.UNKNOWN,
         ),
         (
             PermissionMode.FULL,
@@ -144,6 +176,23 @@ def test_canonical_permission_matrix_uses_normalized_final_arguments(
 
     assert evaluation.action is expected_action
     assert evaluation.intent.scope is expected_scope
+
+
+def test_plan_allows_shell_only_when_the_environment_guarantees_read_only(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("diagnostic", "bash", {"command": "echo diagnostic"})
+    ordinary = ToolRuntime(LocalCodingEnvironment(tmp_path)).evaluate_permission(
+        call,
+        PermissionMode.PLAN,
+    )
+    constrained = ToolRuntime(_ReadOnlyShellEnvironment(tmp_path)).evaluate_permission(
+        call,
+        PermissionMode.PLAN,
+    )
+
+    assert ordinary.action is PermissionAction.DENY
+    assert constrained.action is PermissionAction.ALLOW
 
 
 def test_permission_binding_changes_when_an_extension_rewrites_final_arguments(
@@ -182,7 +231,22 @@ def test_auto_treats_code_executors_and_plugin_runners_as_unknown(
         ToolCall("shell", "bash", {"command": command}),
     )
 
-    assert evaluation.action is PermissionAction.DENY
+    assert evaluation.action is PermissionAction.ASK
+    assert evaluation.intent.kind.value == "unknown"
+    assert evaluation.intent.scope is TargetScope.UNKNOWN
+
+
+@pytest.mark.parametrize("command", ("git status", "git diff", "git log", "git show HEAD"))
+def test_auto_requires_host_confirmation_for_git_commands(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    evaluation = PermissionPolicy(tmp_path).evaluate(
+        PermissionMode.AUTO,
+        ToolCall("git", "bash", {"command": command}),
+    )
+
+    assert evaluation.action is PermissionAction.ASK
     assert evaluation.intent.kind.value == "unknown"
     assert evaluation.intent.scope is TargetScope.UNKNOWN
 
@@ -197,7 +261,7 @@ def test_auto_does_not_lose_windows_backslashes_during_shell_classification(
         ToolCall("shell", "bash", {"command": r"findstr needle C:\Windows\win.ini"}),
     )
 
-    assert evaluation.action is PermissionAction.DENY
+    assert evaluation.action is PermissionAction.ASK
     assert evaluation.intent.kind.value == "unknown"
     assert evaluation.intent.scope is TargetScope.UNKNOWN
 
@@ -224,12 +288,14 @@ def test_auto_denies_path_options_and_ambiguous_shell_expansions(
         ToolCall("shell", "bash", {"command": command}),
     )
 
-    assert evaluation.action is PermissionAction.DENY
+    assert evaluation.action is PermissionAction.ASK
     assert evaluation.intent.kind.value == "unknown"
     assert evaluation.intent.scope is TargetScope.UNKNOWN
 
 
-def test_auto_denies_outside_output_option_before_shell_execution(tmp_path: Path) -> None:
+def test_auto_requires_permission_for_outside_output_option_before_shell_execution(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.patch"
@@ -245,7 +311,7 @@ def test_auto_denies_outside_output_option_before_shell_execution(tmp_path: Path
     ).results[0]
 
     assert result.error is not None
-    assert result.error.code == "permission_denied"
+    assert result.error.code == "permission_required"
     assert not outside.exists()
 
 
@@ -271,6 +337,91 @@ def test_tool_runtime_denial_is_side_effect_free_and_scheduling_is_orthogonal(
     assert target.read_text(encoding="utf-8") == "before"
 
 
+def test_guarded_runtime_normalizes_a_host_mode_string_before_binding(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "approved.txt"
+    runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+    call = ToolCall("approved", "write", {"path": "approved.txt", "content": "value"})
+    evaluation = PermissionPolicy(tmp_path).evaluate(PermissionMode.ASK, call)
+    decision = PermissionDecision(
+        call.call_id,
+        call.tool_name,
+        PermissionMode.ASK,
+        "approved",
+        "host",
+        evaluation.final_arguments_json,
+        evaluation.intent,
+        evaluation.binding,
+        "Host approved the one-time Permission Request",
+    )
+
+    batch = asyncio.run(
+        runtime.execute_guarded_batch(
+            (call,),
+            permission_mode="ask",
+            permission_decisions={call.call_id: decision},
+        )
+    )
+
+    assert batch.results[0].status == "success"
+    assert target.read_text(encoding="utf-8") == "value"
+
+
+def test_run_local_execution_view_preserves_environment_adapter_state(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "value.txt").write_text("value", encoding="utf-8")
+    runtime = ToolRuntime(_StatefulEnvironment(tmp_path))
+
+    batch = asyncio.run(
+        runtime.execute_guarded_batch(
+            (ToolCall("read", "read", {"path": "value.txt"}),),
+            permission_mode=PermissionMode.AUTO,
+        )
+    )
+
+    assert batch.results[0].status == "success"
+    assert batch.results[0].output == {"content": "value"}
+
+
+def test_permission_classification_failure_is_a_model_visible_tool_error(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        (
+            (
+                *_tool_call_events(0, "invalid-path", "read", {"path": "\0"}),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def scenario() -> tuple[list[AgentSessionEvent], str]:
+        run = kernel.create_run("read an invalid path")
+        events = [event async for event in run]
+        result = await run.result()
+        return events, result.state.value
+
+    events, state = asyncio.run(scenario())
+    tool_result = next(
+        event.tool_result
+        for event in events
+        if event.kind is AgentSessionEventKind.TOOL_EXECUTION_END and event.tool_result is not None
+    )
+
+    assert state == "settled"
+    assert tool_result.error is not None
+    assert tool_result.error.code == "permission_invalid"
+    feedback = cast(ToolResultMessage, provider.requests[1].messages[-1])
+    assert feedback.results == (tool_result,)
+
+
 def test_full_skips_kernel_containment_but_auto_does_not(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -282,7 +433,7 @@ def test_full_skips_kernel_containment_but_auto_does_not(tmp_path: Path) -> None
     full = asyncio.run(runtime.execute_guarded_batch((call,), permission_mode=PermissionMode.FULL))
 
     assert auto.results[0].error is not None
-    assert auto.results[0].error.code == "permission_denied"
+    assert auto.results[0].error.code == "permission_required"
     assert full.results[0].status == "success"
     assert outside.read_text(encoding="utf-8") == "created"
 
@@ -308,6 +459,40 @@ def test_full_search_tools_can_report_outside_targets(tmp_path: Path) -> None:
         "matches": [{"path": str(target.resolve()), "line": 1, "text": "needle = 1"}]
     }
     assert batch.results[1].output == {"paths": [str(target.resolve())]}
+
+
+def test_non_full_search_does_not_follow_a_directory_link_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside", encoding="utf-8")
+    link = workspace / "linked-outside"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("directory links are not available")
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    runtime = ToolRuntime(LocalCodingEnvironment(workspace))
+    runtime.enable("find")
+
+    batch = asyncio.run(
+        runtime.execute_guarded_batch(
+            (ToolCall("find", "find", {"pattern": "*.txt", "path": "."}),),
+            permission_mode=PermissionMode.AUTO,
+        )
+    )
+
+    assert batch.results[0].status == "success"
+    assert batch.results[0].output == {"paths": []}
 
 
 def test_agent_run_resolves_each_permission_once_and_denial_reaches_the_model(
@@ -347,6 +532,7 @@ def test_agent_run_resolves_each_permission_once_and_denial_reaches_the_model(
             if event.kind is AgentSessionEventKind.PERMISSION_REQUESTED:
                 request = event.permission_request
                 assert request is not None
+                assert request.mode is PermissionMode.ASK
                 approved = request.call_id == "approved-write"
                 await run.resolve_permission(request.request_id, approved)
                 with pytest.raises(RuntimeError, match="pending|resolved"):
@@ -552,7 +738,9 @@ def test_extension_rewrite_invalidates_pre_hook_approval_identity(tmp_path: Path
     assert (workspace / "after.txt").read_text(encoding="utf-8") == "rewritten"
 
 
-def test_extension_cannot_rewrite_an_auto_denial_into_success(tmp_path: Path) -> None:
+def test_host_can_deny_an_auto_request_after_an_extension_rewrites_outside(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
@@ -578,7 +766,12 @@ def test_extension_cannot_rewrite_an_auto_denial_into_success(tmp_path: Path) ->
 
     async def scenario() -> list[AgentSessionEvent]:
         run = kernel.create_run("rewrite outside")
-        events = [event async for event in run]
+        events: list[AgentSessionEvent] = []
+        async for event in run:
+            events.append(event)
+            if event.permission_request is not None:
+                assert event.permission_request.mode is PermissionMode.AUTO
+                await run.resolve_permission(event.permission_request.request_id, False)
         await run.result()
         return events
 
@@ -653,5 +846,78 @@ def test_session_resume_rejects_permission_decision_with_pending_capability(
             FakeProvider(((ProviderDone(),),)),
             JsonlSessionStore(session_path),
             "corrupt-permission",
+            tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("empty-targets", "empty-intent-reason", "file-command-digest"),
+)
+def test_session_resume_rejects_semantically_invalid_permission_decision(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    session_path = tmp_path / "session.jsonl"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = FakeProvider(
+        (
+            (
+                *_tool_call_events(
+                    0,
+                    "durable-write",
+                    "write",
+                    {"path": "durable.txt", "content": "not-in-decision"},
+                ),
+                ProviderDone("tool_use"),
+            ),
+            (ProviderDone(),),
+        )
+    )
+    kernel = AgentKernel.with_new_session(
+        provider,
+        JsonlSessionStore(session_path),
+        configuration={"provider": "fake"},
+        session_id=f"corrupt-{corruption}",
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
+    )
+
+    async def approve() -> None:
+        run = kernel.create_run("persist", permission_mode=PermissionMode.ASK)
+        async for event in run:
+            if event.permission_request is not None:
+                await run.resolve_permission(event.permission_request.request_id, True)
+        await run.result()
+
+    asyncio.run(approve())
+    kernel.close_session()
+    records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+    decision = next(
+        record["entry"]["payload"]
+        for record in records
+        if record.get("record_type") == "entry"
+        and record["entry"].get("kind") == "permission_decision"
+    )
+    intent = decision["operation_intent"]
+    if corruption == "empty-targets":
+        intent["targets"] = []
+    elif corruption == "empty-intent-reason":
+        intent["reason"] = ""
+    else:
+        intent["command_sha256"] = "0" * 64
+    session_path.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SessionCorruptionError, match="Permission Decision"):
+        AgentKernel.with_resumed_session(
+            FakeProvider(((ProviderDone(),),)),
+            JsonlSessionStore(session_path),
+            f"corrupt-{corruption}",
             tool_runtime=ToolRuntime(LocalCodingEnvironment(workspace)),
         )

@@ -10,6 +10,7 @@ from itertools import count
 from coding_agent.events import PendingMessage, PendingMessageKind
 from coding_agent.permissions import (
     PermissionEvaluation,
+    PermissionMode,
     PermissionRequest,
     ToolCallLike,
     make_permission_request,
@@ -87,12 +88,14 @@ class RunControl:
         self,
         call: ToolCallLike,
         evaluation: PermissionEvaluation,
+        mode: PermissionMode,
     ) -> PermissionRequest:
         if self._pending_permission is not None:
             raise RuntimeError("AgentRun already has a pending Permission Request")
         request = make_permission_request(
             run_id=self._run_id,
             ordinal=next(self._permission_numbers),
+            mode=mode,
             call=call,
             evaluation=evaluation,
         )

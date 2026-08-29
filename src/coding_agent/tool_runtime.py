@@ -113,7 +113,10 @@ class ToolRuntime:
         enabled: set[str] | None = None,
     ) -> None:
         self.environment = environment
-        self._permission_policy = PermissionPolicy(environment.workspace)
+        self._permission_policy = PermissionPolicy(
+            environment.workspace,
+            read_only_shell_guaranteed=environment.read_only_shell_guaranteed,
+        )
         self._tools: dict[str, _RegisteredTool] = {}
         for tool in builtin_tools():
             self.register(tool)
@@ -347,17 +350,18 @@ class ToolRuntime:
         cancel_event: asyncio.Event | None = None,
         *,
         on_progress: ToolProgressCallback | None = None,
-        permission_mode: PermissionMode = PermissionMode.AUTO,
+        permission_mode: PermissionMode | str = PermissionMode.AUTO,
         permission_decisions: Mapping[str, PermissionDecision] | None = None,
     ) -> ToolBatchResult:
         """Apply the gate while preserving pre-permission ToolRuntime adapters."""
 
+        normalized_mode = PermissionMode(permission_mode)
         if type(self).execute_batch is ToolRuntime.execute_batch:
             return await self._execute_batch(
                 calls,
                 cancel_event,
                 on_progress=on_progress,
-                permission_mode=permission_mode,
+                permission_mode=normalized_mode,
                 permission_decisions=permission_decisions,
             )
 
@@ -371,7 +375,7 @@ class ToolRuntime:
                 continue
             gate_error = self._permission_gate_error(
                 call,
-                permission_mode,
+                normalized_mode,
                 permission_decisions,
             )
             if gate_error is not None:
@@ -399,12 +403,19 @@ class ToolRuntime:
         permission_mode: PermissionMode,
         permission_decisions: Mapping[str, PermissionDecision] | None,
     ) -> ToolResult | None:
-        evaluation = self._permission_policy.evaluate(permission_mode, call)
+        try:
+            evaluation = self._permission_policy.evaluate(permission_mode, call)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return self._error(
+                call,
+                "permission_invalid",
+                "Permission classification failed for final ToolCall",
+            )
         decision = None if permission_decisions is None else permission_decisions.get(call.call_id)
         if decision is not None and (
             decision.call_id != call.call_id
             or decision.tool_name != call.tool_name
-            or decision.mode is not permission_mode
+            or decision.mode != permission_mode
             or decision.binding != evaluation.binding
         ):
             return self._error(

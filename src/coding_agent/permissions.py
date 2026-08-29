@@ -124,6 +124,7 @@ class PermissionRequest:
     run_id: str
     call_id: str
     tool_name: str
+    mode: PermissionMode
     final_arguments_json: str
     intent: OperationIntent
     binding: str
@@ -257,7 +258,7 @@ class PermissionPolicy:
         return OperationIntent(
             tool_name,
             OperationKind.CUSTOM,
-            TargetScope.WORKSPACE,
+            TargetScope.UNKNOWN,
             (str(self._workspace),),
             "Host explicitly registered a custom Tool without a file target contract",
         )
@@ -287,7 +288,7 @@ class PermissionPolicy:
         except ValueError:
             tokens = []
         executable = Path(tokens[0]).name.lower() if tokens else ""
-        recognized = executable in _READABLE_SHELL_COMMANDS or self._recognized_shell(tokens)
+        recognized = executable in _READABLE_SHELL_COMMANDS
         if not recognized:
             return self._unknown_bash_intent(
                 command,
@@ -330,15 +331,6 @@ class PermissionPolicy:
             command,
             str(cwd_path),
         )
-
-    @staticmethod
-    def _recognized_shell(tokens: list[str]) -> bool:
-        if not tokens:
-            return False
-        executable = Path(tokens[0]).name.lower()
-        if executable == "git":
-            return len(tokens) > 1 and tokens[1].lower() in {"diff", "log", "show", "status"}
-        return False
 
     @staticmethod
     def _has_unquoted_shell_meta(command: str) -> bool:
@@ -385,22 +377,26 @@ class PermissionPolicy:
     ) -> tuple[PermissionAction, str]:
         if mode is PermissionMode.FULL:
             return PermissionAction.ALLOW, "full bypasses Kernel approval and containment"
-        if intent.scope is TargetScope.OUTSIDE:
-            return PermissionAction.DENY, "non-full modes contain Tool Execution to the workspace"
-        if intent.kind is OperationKind.UNKNOWN or intent.scope is TargetScope.UNKNOWN:
-            return PermissionAction.DENY, "unclassified operations require full mode"
         if mode is PermissionMode.PLAN:
-            if intent.kind is OperationKind.READ:
+            if intent.kind is OperationKind.READ and intent.scope is TargetScope.WORKSPACE:
                 return PermissionAction.ALLOW, "plan allows contained workspace reads"
-            if intent.kind is OperationKind.SHELL and self._read_only_shell_guaranteed:
+            if (
+                intent.kind is OperationKind.SHELL
+                and intent.scope is TargetScope.WORKSPACE
+                and self._read_only_shell_guaranteed
+            ):
                 return PermissionAction.ALLOW, "environment guarantees read-only diagnostic shell"
             return PermissionAction.DENY, "plan rejects operations not guaranteed read-only"
         if mode is PermissionMode.ASK:
-            if intent.kind is OperationKind.READ:
+            if intent.kind is OperationKind.READ and intent.scope is TargetScope.WORKSPACE:
                 return PermissionAction.ALLOW, "ask allows contained workspace reads"
             return PermissionAction.ASK, "ask requires one Host decision for this final ToolCall"
-        if intent.kind is OperationKind.NETWORK:
-            return PermissionAction.DENY, "auto rejects recognized network operations"
+        if intent.kind in {
+            OperationKind.NETWORK,
+            OperationKind.CUSTOM,
+            OperationKind.UNKNOWN,
+        } or intent.scope in {TargetScope.OUTSIDE, TargetScope.UNKNOWN}:
+            return PermissionAction.ASK, "auto requires one Host decision for elevated authority"
         return PermissionAction.ALLOW, "auto allows ordinary contained workspace operations"
 
 
@@ -408,6 +404,7 @@ def make_permission_request(
     *,
     run_id: str,
     ordinal: int,
+    mode: PermissionMode,
     call: ToolCallLike,
     evaluation: PermissionEvaluation,
 ) -> PermissionRequest:
@@ -417,6 +414,7 @@ def make_permission_request(
         run_id,
         call.call_id,
         call.tool_name,
+        mode,
         evaluation.final_arguments_json,
         evaluation.intent,
         evaluation.binding,
@@ -470,17 +468,22 @@ def validate_permission_decision_record(payload: dict[str, object]) -> None:
     if set(raw_intent) != intent_keys or raw_intent.get("tool_name") != payload.get("tool_name"):
         raise ValueError("Permission Decision has an invalid Operation Intent schema")
     try:
-        OperationKind(raw_intent.get("kind"))  # type: ignore[arg-type]
+        intent_kind = OperationKind(raw_intent.get("kind"))  # type: ignore[arg-type]
         TargetScope(raw_intent.get("scope"))  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "Permission Decision has an invalid Operation Intent classification"
         ) from exc
     targets = raw_intent.get("targets")
-    if not isinstance(targets, list) or not all(isinstance(target, str) for target in targets):
-        raise ValueError("Permission Decision Operation Intent targets must be strings")
-    if not isinstance(raw_intent.get("reason"), str):
-        raise ValueError("Permission Decision Operation Intent requires a reason")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or not all(isinstance(target, str) and target for target in targets)
+    ):
+        raise ValueError("Permission Decision Operation Intent targets must be non-empty strings")
+    intent_reason = raw_intent.get("reason")
+    if not isinstance(intent_reason, str) or not intent_reason:
+        raise ValueError("Permission Decision Operation Intent requires a non-empty reason")
     for optional in ("cwd", "command_sha256"):
         value = raw_intent.get(optional)
         if value is not None and not isinstance(value, str):
@@ -488,6 +491,17 @@ def validate_permission_decision_record(payload: dict[str, object]) -> None:
     command_digest = raw_intent.get("command_sha256")
     if command_digest is not None and re.fullmatch(r"[0-9a-f]{64}", command_digest) is None:
         raise ValueError("Permission Decision has an invalid command digest")
+    cwd = raw_intent.get("cwd")
+    if payload.get("tool_name") == "bash":
+        if (
+            intent_kind not in {OperationKind.SHELL, OperationKind.NETWORK, OperationKind.UNKNOWN}
+            or not isinstance(cwd, str)
+            or not cwd
+            or not isinstance(command_digest, str)
+        ):
+            raise ValueError("Permission Decision has an inconsistent bash Operation Intent")
+    elif cwd is not None or command_digest is not None:
+        raise ValueError("Permission Decision has shell fields on a non-bash Operation Intent")
 
 
 def make_permission_decision(

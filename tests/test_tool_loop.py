@@ -156,7 +156,7 @@ def test_host_can_cancel_an_active_tool_execution(tmp_path: Path) -> None:
         run = AgentKernel(
             FakeProvider([first_turn]),
             tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
-        ).create_run("Start then cancel.")
+        ).create_run("Start then cancel.", permission_mode=PermissionMode.FULL)
         events: list[AgentSessionEvent] = []
         async for event in run:
             events.append(event)

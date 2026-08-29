@@ -39,6 +39,7 @@ from coding_agent.extensions import (
     Transform,
 )
 from coding_agent.kernel import AgentKernel
+from coding_agent.permissions import PermissionMode
 from coding_agent.provider import FakeProvider, ProviderRequest
 from coding_agent.session import JsonlSessionStore, SessionEntry
 from coding_agent.tool_runtime import ToolRuntime
@@ -216,8 +217,14 @@ async def run_extension_demo(case: ExtensionDemoCase) -> ExtensionDemoReport:
         extensions=extensions,
     )
     prompt = "ordering" if case == "ordering" else "run extension demonstration"
-    run = kernel.create_run(prompt)
-    events = tuple([event async for event in run])
+    permission_mode = PermissionMode.ASK if case == "success" else PermissionMode.AUTO
+    run = kernel.create_run(prompt, permission_mode=permission_mode)
+    event_list: list[AgentSessionEvent] = []
+    async for event in run:
+        event_list.append(event)
+        if event.permission_request is not None:
+            await run.resolve_permission(event.permission_request.request_id, True)
+    events = tuple(event_list)
     result = await run.result()
     return ExtensionDemoReport(
         case=case,

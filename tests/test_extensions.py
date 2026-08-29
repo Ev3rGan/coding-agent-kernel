@@ -38,6 +38,7 @@ from coding_agent import (
     MessageHookInput,
     ModelContext,
     Observe,
+    PermissionMode,
     ProviderDone,
     ProviderError,
     ProviderRequest,
@@ -1331,7 +1332,7 @@ def test_extension_tool_uses_existing_runtime_validation_and_result_path(tmp_pat
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("use extension tool")
+        run = kernel.create_run("use extension tool", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -1478,7 +1479,9 @@ def test_extension_tool_exception_preserves_batch_alignment(tmp_path: Path) -> N
     )
 
     async def run_once() -> AgentRunState:
-        run = kernel.create_run("aligned extension tool failure")
+        run = kernel.create_run(
+            "aligned extension tool failure", permission_mode=PermissionMode.FULL
+        )
         async for _ in run:
             pass
         return (await run.result()).state
@@ -1530,7 +1533,7 @@ def test_extension_tool_cannot_mutate_run_cancellation_or_cancel_sibling(
     )
 
     async def run_once() -> AgentRunState:
-        run = kernel.create_run("protect Run cancellation")
+        run = kernel.create_run("protect Run cancellation", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         return (await run.result()).state
@@ -1576,7 +1579,7 @@ def test_extension_tool_argument_mutation_cannot_change_authoritative_tool_call(
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("protect ToolCall arguments")
+        run = kernel.create_run("protect ToolCall arguments", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -1623,7 +1626,7 @@ def test_malformed_extension_tool_output_becomes_safe_aligned_error(tmp_path: Pa
     )
 
     async def run_once() -> AgentRunState:
-        run = kernel.create_run("normalize malformed output")
+        run = kernel.create_run("normalize malformed output", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         return (await run.result()).state
@@ -1660,7 +1663,7 @@ def test_malformed_extension_tool_progress_is_rejected_before_public_event(
     )
 
     async def run_once() -> tuple[AgentRunState, list[AgentSessionEventKind]]:
-        run = kernel.create_run("reject malformed progress")
+        run = kernel.create_run("reject malformed progress", permission_mode=PermissionMode.FULL)
         events = [event async for event in run]
         return (await run.result()).state, [event.kind for event in events]
 
@@ -1721,7 +1724,7 @@ def test_tool_call_transform_revalidates_and_block_preserves_batch_alignment(
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("intercept tool calls")
+        run = kernel.create_run("intercept tool calls", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -1759,7 +1762,7 @@ def test_tool_result_transform_and_supplement_compose_before_provider_feedback(
 
     async def run_once() -> list[ToolResult]:
         execution_results: list[ToolResult] = []
-        run = kernel.create_run("tool result hooks")
+        run = kernel.create_run("tool result hooks", permission_mode=PermissionMode.FULL)
         async for event in run:
             agent_event = event.agent_event
             if (
@@ -1800,7 +1803,7 @@ def test_tool_result_can_reject_successful_output_before_provider_feedback(
 
     async def run_once() -> ToolResult:
         execution_result: ToolResult | None = None
-        run = kernel.create_run("reject unsafe tool output")
+        run = kernel.create_run("reject unsafe tool output", permission_mode=PermissionMode.FULL)
         async for event in run:
             agent_event = event.agent_event
             if (
@@ -1839,7 +1842,9 @@ def test_tool_result_cannot_relabel_completed_execution_as_cancelled(tmp_path: P
 
     async def run_once() -> ToolResult:
         execution_result: ToolResult | None = None
-        run = kernel.create_run("preserve cancellation provenance")
+        run = kernel.create_run(
+            "preserve cancellation provenance", permission_mode=PermissionMode.FULL
+        )
         async for event in run:
             agent_event = event.agent_event
             if (
@@ -1888,7 +1893,9 @@ def test_rejected_tool_result_rewrite_preserves_cancellation_provenance(
 
     async def run_once() -> ToolResult:
         execution_result: ToolResult | None = None
-        run = kernel.create_run("preserve cancelled ToolResult")
+        run = kernel.create_run(
+            "preserve cancelled ToolResult", permission_mode=PermissionMode.FULL
+        )
         async for event in run:
             agent_event = event.agent_event
             if (
@@ -2130,7 +2137,7 @@ def test_fixed_hook_set_dispatches_on_authoritative_runtime_paths(tmp_path: Path
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("trace all hooks")
+        run = kernel.create_run("trace all hooks", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -2815,7 +2822,9 @@ def test_observer_failure_closes_tool_source_and_joins_active_batch(tmp_path: Pa
             tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
             extensions=(_FailingProgressObserverExtension(tool),),
         )
-        run = kernel.create_run("fail while a Tool batch is active")
+        run = kernel.create_run(
+            "fail while a Tool batch is active", permission_mode=PermissionMode.FULL
+        )
         events = [event async for event in run]
         result = await run.result()
 
@@ -2958,7 +2967,7 @@ def test_mutating_tool_call_snapshot_cannot_change_kernel_owned_arguments(
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("snapshot")
+        run = kernel.create_run("snapshot", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -2985,7 +2994,7 @@ def test_retained_transform_reference_cannot_mutate_kernel_owned_tool_call(
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("retain then mutate")
+        run = kernel.create_run("retain then mutate", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -3014,7 +3023,7 @@ def test_tool_result_cannot_forge_blocked_execution_as_success(tmp_path: Path) -
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("do not forge")
+        run = kernel.create_run("do not forge", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -3045,7 +3054,7 @@ def test_tool_result_block_becomes_an_aligned_structured_error(tmp_path: Path) -
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("block ToolResult")
+        run = kernel.create_run("block ToolResult", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
@@ -3530,7 +3539,7 @@ def test_tool_result_hook_cannot_reintroduce_non_standard_json(tmp_path: Path) -
     )
 
     async def run_once() -> None:
-        run = kernel.create_run("reject non-standard json")
+        run = kernel.create_run("reject non-standard json", permission_mode=PermissionMode.FULL)
         async for _ in run:
             pass
         await run.result()
