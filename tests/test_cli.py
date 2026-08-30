@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -77,8 +78,13 @@ def test_deepseek_run_cli_uses_public_kernel_path_permissions_session_and_patch(
     session_file = tmp_path / "session.jsonl"
     secret = "test-only-cli-secret"
     monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    monkeypatch.setenv("PATH", "")
     monkeypatch.setattr("sys.stdin", io.StringIO("approve\napprove\n"))
     request_bodies: list[dict[str, Any]] = []
+    credential_probe = (
+        f'"{sys.executable}" -c '
+        "\"import os; print(os.getenv('DEEPSEEK_API_KEY', 'not-present'))\""
+    )
     first = _deepseek_turn(
         delta={
             "tool_calls": [
@@ -105,10 +111,7 @@ def test_deepseek_run_cli_uses_public_kernel_path_permissions_session_and_patch(
                     "type": "function",
                     "function": {
                         "name": "bash",
-                        "arguments": (
-                            '{"command":"python -c \\"import os; '
-                            "print(os.getenv('DEEPSEEK_API_KEY', 'not-present'))\\\"\"}"
-                        ),
+                        "arguments": json.dumps({"command": credential_probe}),
                     },
                 },
             ]
