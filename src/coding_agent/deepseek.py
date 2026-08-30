@@ -399,26 +399,28 @@ async def _payload_events(
             if index not in state.open_tool_calls:
                 state.open_tool_calls.add(index)
                 yield ProviderToolCallStart(index)
-            call_id = raw_call.get("id", "")
+            call_id = raw_call.get("id")
             call_type = raw_call.get("type")
-            if not isinstance(call_id, str):
-                raise _DeepSeekProtocolError("DeepSeek ToolCall id delta must be a string.")
+            if call_id is not None and not isinstance(call_id, str):
+                raise _DeepSeekProtocolError("DeepSeek ToolCall id delta must be a string or null.")
             if call_type is not None and call_type != "function":
                 raise _DeepSeekProtocolError("DeepSeek supports function ToolCalls only.")
             raw_function = raw_call.get("function", {})
             if not isinstance(raw_function, dict):
                 raise _DeepSeekProtocolError("DeepSeek ToolCall function must be an object.")
-            name = raw_function.get("name", "")
-            arguments = raw_function.get("arguments", "")
-            if not isinstance(name, str) or not isinstance(arguments, str):
+            name = raw_function.get("name")
+            arguments = raw_function.get("arguments")
+            if (name is not None and not isinstance(name, str)) or (
+                arguments is not None and not isinstance(arguments, str)
+            ):
                 raise _DeepSeekProtocolError(
-                    "DeepSeek ToolCall name and arguments deltas must be strings."
+                    "DeepSeek ToolCall name and arguments deltas must be strings or null."
                 )
             yield ProviderToolCallDelta(
                 index,
-                call_id_delta=call_id,
-                tool_name_delta=name,
-                arguments_delta=arguments,
+                call_id_delta=call_id or "",
+                tool_name_delta=name or "",
+                arguments_delta=arguments or "",
             )
 
     finish_reason = choice.get("finish_reason")

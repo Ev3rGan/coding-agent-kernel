@@ -21,6 +21,7 @@ from coding_agent.events import (
     ProviderCancelled,
     ProviderDone,
     ProviderError,
+    ProviderEventKind,
     ProviderStreamEvent,
     ProviderStreamStart,
     ProviderTextDelta,
@@ -156,7 +157,22 @@ def test_provider_maps_complete_request_and_normalizes_stream_across_byte_bounda
         },
         "[DONE]",
     )
-    chunk_stream = _ChunkStream(_split_bytes(stream, (1, 5, 41, 93, 151, len(stream) - 3)))
+    reasoning_start = stream.index("先".encode())
+    text_start = stream.index("答".encode())
+    chunk_stream = _ChunkStream(
+        _split_bytes(
+            stream,
+            (
+                1,
+                5,
+                reasoning_start + 1,
+                reasoning_start + 2,
+                text_start + 1,
+                text_start + 2,
+                len(stream) - 3,
+            ),
+        )
+    )
 
     async def handler(request: httpx.Request) -> httpx.Response:
         captured["authorization"] = request.headers["authorization"]
@@ -267,6 +283,20 @@ def test_provider_maps_complete_request_and_normalizes_stream_across_byte_bounda
     assert [event for event in events if isinstance(event, ProviderDone)] == [
         ProviderDone("stop", "response-1")
     ]
+    assert [event.kind for event in events] == [
+        ProviderEventKind.STREAM_START,
+        ProviderEventKind.CONTENT_START,
+        ProviderEventKind.THINKING_START,
+        ProviderEventKind.THINKING_DELTA,
+        ProviderEventKind.THINKING_END,
+        ProviderEventKind.TEXT_START,
+        ProviderEventKind.TEXT_DELTA,
+        ProviderEventKind.USAGE,
+        ProviderEventKind.TEXT_END,
+        ProviderEventKind.CONTENT_END,
+        ProviderEventKind.DONE,
+        ProviderEventKind.STREAM_END,
+    ]
     assert chunk_stream.closed is True
 
 
@@ -343,6 +373,110 @@ def test_provider_emits_interleaved_incremental_tool_calls_for_canonical_assembl
         ToolCall("call-2", "bash", {"command": "python -V"}),
     )
     assert accumulator.message.stop_reason == "tool_use"
+
+
+def test_provider_accepts_null_fields_in_tool_call_continuations() -> None:
+    stream = _sse(
+        {
+            "id": "nullable-tool-delta",
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "read", "arguments": '{"path":"'},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+            "usage": None,
+        },
+        {
+            "id": "nullable-tool-delta",
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": None,
+                                "type": None,
+                                "function": {"name": None, "arguments": None},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+            "usage": None,
+        },
+        {
+            "id": "nullable-tool-delta",
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": None,
+                                "type": None,
+                                "function": {"name": None, "arguments": 'sample.py"}'},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+            "usage": None,
+        },
+        {
+            "id": "nullable-tool-delta",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": None,
+        },
+        "[DONE]",
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_ChunkStream((stream,)))
+
+    provider = DeepSeekProvider(
+        environment={"DEEPSEEK_API_KEY": "test-only-secret"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    events = _provider_events(provider)
+    accumulator = AssistantMessageAccumulator()
+    for event in events:
+        accumulator.apply(event)
+
+    assert not any(isinstance(event, ProviderError) for event in events)
+    assert accumulator.message.tool_calls == (ToolCall("call-1", "read", {"path": "sample.py"}),)
+    assert accumulator.message.stop_reason == "tool_use"
+    assert [event.kind for event in events] == [
+        ProviderEventKind.STREAM_START,
+        ProviderEventKind.CONTENT_START,
+        ProviderEventKind.TOOL_CALL_START,
+        ProviderEventKind.TOOL_CALL_DELTA,
+        ProviderEventKind.TOOL_CALL_DELTA,
+        ProviderEventKind.TOOL_CALL_DELTA,
+        ProviderEventKind.TOOL_CALL_END,
+        ProviderEventKind.CONTENT_END,
+        ProviderEventKind.DONE,
+        ProviderEventKind.STREAM_END,
+    ]
 
 
 @pytest.mark.parametrize(
