@@ -52,8 +52,47 @@ Tool 的 resume；凭据未进入 CLI JSON、Session 或 workspace。常规测�
 transport，不依赖外网或真实凭据。
 
 本能力借鉴 Pi 的 Provider normalization；简化为 DeepSeek + Fake 两个 Adapter；深化点
-是把同一 Python Kernel seam 用于真实 CLI、权限和恢复。它不引入 Provider 生态、模型
-比较、provider-specific prompt 优化、生产级 TUI/sandbox 或 SWE-bench 路径。
+是把同一 Python Kernel seam 用于真实 CLI、权限和恢复。这个本地运行入口本身不引入
+Provider 生态、模型比较、provider-specific prompt 优化或生产级 TUI/sandbox。
+
+## 运行一个 SWE-bench Verified 实例
+
+先安装官方 Harness optional dependency，并在 Host 环境中设置 `DEEPSEEK_API_KEY`：
+
+```console
+python -m pip install -e ".[swebench]"
+python -m coding_agent swebench run --instance <verified-instance> \
+  --artifacts <new-run-artifact-directory> --mode auto \
+  --timeout 1800 --harness-timeout 1800
+```
+
+该入口固定使用官方 `princeton-nlp/SWE-bench_Verified` 的 `test` split。instance metadata
+按代码记录的 dataset revision 加载，prediction 是一行 JSONL，字段严格为
+`instance_id`、`model_name_or_path` 和 `model_patch`。evaluator 会把该固定 revision 的单条
+instance snapshot 写成本地 JSON，再让官方 Harness 读取同一 snapshot。patch 来自
+evaluator-owned workspace 相对官方 `base_commit` 的真实 `git diff --binary`，因此包含
+working tree、index 和 agent commit；无 patch、非法 diff 或越界路径不会进入 Harness。
+
+运行前必须由用户手动启动 Docker Desktop Linux daemon，并用官方 SWE-bench 工具预先
+准备该 instance 的官方镜像。此命令只执行 `docker image inspect`，不会自动 pull/build
+大型镜像；镜像缺失时会给出 `environment_preparation_failed`。Adapter 把镜像中的
+`/testbed` 复制到新 artifact directory 所拥有的 workspace，验证 `base_commit` 与 clean
+状态，再以 `--network none` bind mount 给单一 agent container。文件 Tool 只操作该
+workspace，`bash` 只通过严格 argv 的 `docker exec` 运行；Provider key 和 Host secret
+不会进入 container、Tool subprocess 或 Harness subprocess。
+
+artifact bundle 保存 sanitized `config.json`、精确 `provenance.json` 与
+`kernel_configuration.json`、固定 revision 的 `official_instance.json`、append-only
+`session.jsonl`、`events.jsonl`、`tool_results.jsonl`、`workspace.patch`、
+`prediction.jsonl`、Harness argv/provenance、stdout/stderr、官方 summary、per-instance
+`report.json` 副本与最终 `manifest.json`。manifest 区分
+`environment_preparation_failed`、`agent_failed`、`timed_out`、`cancelled`、`no_patch`、
+`prediction_invalid`、`harness_invocation_failed`、`harness_rejected`、`harness_failed`
+和 `success`；未运行或未产出一致官方结果的 Harness 永远不会显示为通过。
+
+Pi Kernel 机制继续复用；SWE-bench CodingEnvironment 与输出契约是项目必要差异；结果证明能力但不反向扩大 Kernel 范围。
+该入口不包含排行榜、批量评测、模型比较、最低分数、
+prompt/Kernel benchmark 特化、费用决策、生产调度或自动启动 Docker Desktop。
 
 ## 固定 Extension 合约
 

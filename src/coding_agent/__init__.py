@@ -128,6 +128,18 @@ from coding_agent.session import (
     SessionStateError,
     SessionStore,
 )
+from coding_agent.swebench import (
+    SWE_BENCH_CONTRACT_COMMIT,
+    SWE_BENCH_DATASET,
+    SWE_BENCH_DATASET_REVISION,
+    SWE_BENCH_SPLIT,
+    ContainerCodingEnvironment,
+    SWEbenchDependencies,
+    SWEbenchEvaluator,
+    SWEbenchExecution,
+    SWEbenchInstance,
+    SWEbenchRunConfig,
+)
 from coding_agent.tool_runtime import ToolBatchResult, ToolRuntime
 from coding_agent.tools import Tool, ToolMode, ToolOutput, ToolSpec
 
@@ -230,6 +242,16 @@ __all__ = [
     "SessionRelationError",
     "SessionStateError",
     "SessionStore",
+    "SWE_BENCH_CONTRACT_COMMIT",
+    "SWE_BENCH_DATASET",
+    "SWE_BENCH_DATASET_REVISION",
+    "SWE_BENCH_SPLIT",
+    "ContainerCodingEnvironment",
+    "SWEbenchDependencies",
+    "SWEbenchEvaluator",
+    "SWEbenchExecution",
+    "SWEbenchInstance",
+    "SWEbenchRunConfig",
     "TokenUsage",
     "TargetScope",
     "ToolCall",
