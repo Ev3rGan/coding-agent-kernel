@@ -978,13 +978,13 @@ class AgentKernel:
                     )
                 history.append(ToolResultMessage(results=ordered_results))
                 tool_results = ToolResultMessage(results=ordered_results)
-                next_injected = (tool_results,)
+                next_injected = () if self._session is not None else (tool_results,)
                 steering = control.drain_steering()
                 if steering:
                     next_injected, next_active_branch = self._prepare_control_injection(
                         history,
                         steering,
-                        prefix=(tool_results,),
+                        prefix=next_injected,
                     )
                     async for control_event in self._inject_messages(run_id, steering):
                         yield control_event

@@ -240,6 +240,11 @@ class AgentRun(AsyncIterator[AgentSessionEvent]):
                             authoritative_message, run_id=self._run_id
                         )
                         await self._publish_session_events(self._session.drain_events())
+                elif agent_event.kind is AgentEventKind.TOOL_EXECUTION_END:
+                    tool_result = agent_event.tool_result
+                    if self._session is not None and tool_result is not None:
+                        self._session.record_tool_result(tool_result, run_id=self._run_id)
+                        await self._publish_session_events(self._session.drain_events())
                 elif agent_event.kind is AgentEventKind.ERROR:
                     failure = agent_event.error
 

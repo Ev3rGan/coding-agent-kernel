@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import os
+import sys
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from coding_agent.cli import main
@@ -10,6 +17,577 @@ from coding_agent.cli import main
 
 def _records(output: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in output.splitlines()]
+
+
+class _DeepSeekCliStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        midpoint = len(self._content) // 2
+        for chunk in (self._content[:midpoint], self._content[midpoint:]):
+            await asyncio.sleep(0)
+            yield chunk
+
+
+def _deepseek_stream(*payloads: dict[str, Any] | str) -> _DeepSeekCliStream:
+    content = b"".join(
+        b"data: "
+        + (payload if isinstance(payload, str) else json.dumps(payload)).encode()
+        + b"\n\n"
+        for payload in payloads
+    )
+    return _DeepSeekCliStream(content)
+
+
+def _deepseek_turn(
+    *,
+    delta: dict[str, Any],
+    finish_reason: str,
+    response_id: str,
+) -> _DeepSeekCliStream:
+    return _deepseek_stream(
+        {
+            "id": response_id,
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": None},
+            ],
+            "usage": None,
+        },
+        {
+            "id": response_id,
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": finish_reason},
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+        "[DONE]",
+    )
+
+
+def test_deepseek_run_cli_uses_public_kernel_path_permissions_session_and_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "sample.py").write_text("value = 1\n", encoding="utf-8")
+    session_file = tmp_path / "session.jsonl"
+    secret = "test-only-cli-secret"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr("sys.stdin", io.StringIO("approve\napprove\n"))
+    request_bodies: list[dict[str, Any]] = []
+    credential_probe = (
+        f'"{sys.executable}" -c '
+        "\"import os; print(os.getenv('DEEPSEEK_API_KEY', 'not-present'))\""
+    )
+    first = _deepseek_turn(
+        delta={
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path":"sample.py"}'},
+                },
+                {
+                    "index": 1,
+                    "id": "edit-1",
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "arguments": (
+                            '{"path":"sample.py","old":"value = 1\\n","new":"value = 2\\n"}'
+                        ),
+                    },
+                },
+                {
+                    "index": 2,
+                    "id": "bash-1",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps({"command": credential_probe}),
+                    },
+                },
+            ]
+        },
+        finish_reason="tool_calls",
+        response_id="cli-tools",
+    )
+    second = _deepseek_turn(
+        delta={"content": "Updated sample.py and verified the result."},
+        finish_reason="stop",
+        response_id="cli-final",
+    )
+    responses = iter((first, second))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads((await request.aread()).decode()))
+        return httpx.Response(200, stream=next(responses))
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "fix sample.py",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    captured = capsys.readouterr()
+    records = _records(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert (workspace / "sample.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert sum(record.get("event") == "permission_requested" for record in records) == 2
+    tool_results = [
+        record["tool_result"] for record in records if record.get("event") == "tool_execution_end"
+    ]
+    assert [result["status"] for result in tool_results] == ["success", "success", "success"]
+    assert tool_results[2]["output"]["stdout"].strip() == "not-present"
+    assert records[-3]["result"]["state"] == "settled"
+    assert records[-2]["session"]["resumed"] is False
+    assert records[-1]["workspace"]["changed_paths"] == ["sample.py"]
+    assert "-value = 1" in records[-1]["workspace"]["patch"]
+    assert "+value = 2" in records[-1]["workspace"]["patch"]
+    assert session_file.exists()
+    assert secret not in captured.out
+    assert secret not in session_file.read_text(encoding="utf-8")
+    assert len(request_bodies) == 2
+    assert [message["role"] for message in request_bodies[1]["messages"][-4:]] == [
+        "assistant",
+        "tool",
+        "tool",
+        "tool",
+    ]
+
+    session_id = records[-2]["session"]["session_id"]
+    assert os.environ["DEEPSEEK_API_KEY"] == secret
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    resumed_bodies: list[dict[str, Any]] = []
+
+    async def resume_handler(request: httpx.Request) -> httpx.Response:
+        resumed_bodies.append(json.loads((await request.aread()).decode()))
+        return httpx.Response(
+            200,
+            stream=_deepseek_turn(
+                delta={"content": "Resumed the durable Session."},
+                finish_reason="stop",
+                response_id="cli-resumed",
+            ),
+        )
+
+    resumed_exit = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "--resume",
+            session_id,
+            "continue the task",
+        ],
+        deepseek_transport=httpx.MockTransport(resume_handler),
+    )
+    resumed_records = _records(capsys.readouterr().out)
+
+    assert resumed_exit == 0
+    assert any(record.get("event") == "session_resumed" for record in resumed_records)
+    assert resumed_records[-2]["session"] == {
+        "session_id": session_id,
+        "path": str(session_file.resolve()),
+        "resumed": True,
+    }
+    assert resumed_bodies[0]["messages"][-1] == {
+        "role": "user",
+        "content": "continue the task",
+    }
+
+
+def test_deepseek_run_cli_keeps_each_tool_result_in_sequential_tool_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-sequential-tool-secret")
+    monkeypatch.setattr("sys.stdin", io.StringIO("approve\n"))
+    responses = iter(
+        (
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "Create the requested file.",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "sequential-write",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"path":"ticket08_live.txt","content":"LIVE_OK\\n"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+                response_id="sequential-write-response",
+            ),
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "Verify the written file.",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "sequential-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"ticket08_live.txt"}',
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+                response_id="sequential-read-response",
+            ),
+            _deepseek_turn(
+                delta={
+                    "reasoning_content": "The file content is correct.",
+                    "content": "Live sequential ToolCall verification completed.",
+                },
+                finish_reason="stop",
+                response_id="sequential-final-response",
+            ),
+        )
+    )
+    request_bodies: list[dict[str, Any]] = []
+
+    def has_complete_tool_history(body: dict[str, Any]) -> bool:
+        pending_call_ids: set[str] = set()
+        for message in body["messages"]:
+            role = message["role"]
+            if role == "assistant":
+                if pending_call_ids:
+                    return False
+                tool_calls = message.get("tool_calls", [])
+                if tool_calls and not isinstance(message.get("reasoning_content"), str):
+                    return False
+                pending_call_ids = {call["id"] for call in tool_calls}
+            elif role == "tool":
+                call_id = message.get("tool_call_id")
+                if call_id not in pending_call_ids:
+                    return False
+                pending_call_ids.remove(call_id)
+            elif pending_call_ids:
+                return False
+        return not pending_call_ids
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads((await request.aread()).decode())
+        request_bodies.append(body)
+        if not has_complete_tool_history(body):
+            return httpx.Response(400)
+        return httpx.Response(200, stream=next(responses))
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "create and verify the disposable file",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert len(request_bodies) == 3
+    assert [[message["role"] for message in body["messages"]] for body in request_bodies] == [
+        ["system", "user"],
+        ["system", "user", "assistant", "tool"],
+        ["system", "user", "assistant", "tool", "assistant", "tool"],
+    ]
+    assert exit_code == 0
+    assert (workspace / "ticket08_live.txt").read_text(encoding="utf-8") == "LIVE_OK\n"
+    assert records[-3]["result"]["state"] == "settled"
+    assert records[-1]["workspace"]["changed_paths"] == ["ticket08_live.txt"]
+
+    session_id = records[-2]["session"]["session_id"]
+    resumed_bodies: list[dict[str, Any]] = []
+
+    async def resume_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads((await request.aread()).decode())
+        resumed_bodies.append(body)
+        if not has_complete_tool_history(body):
+            return httpx.Response(400)
+        return httpx.Response(
+            200,
+            stream=_deepseek_turn(
+                delta={
+                    "reasoning_content": "The durable tool history is complete.",
+                    "content": "Resume verification completed.",
+                },
+                finish_reason="stop",
+                response_id="sequential-resume-response",
+            ),
+        )
+
+    resumed_exit = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "--resume",
+            session_id,
+            "verify the durable history",
+        ],
+        deepseek_transport=httpx.MockTransport(resume_handler),
+    )
+    resumed_records = _records(capsys.readouterr().out)
+
+    assert resumed_exit == 0
+    assert len(resumed_bodies) == 1
+    assert [message["role"] for message in resumed_bodies[0]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert any(record.get("event") == "session_resumed" for record in resumed_records)
+
+
+def test_deepseek_run_cli_missing_credential_fails_before_session_or_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--session-file",
+            str(session_file),
+            "task",
+        ]
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert records == [
+        {
+            "startup_error": {
+                "code": "deepseek_api_key_missing",
+                "message": "DEEPSEEK_API_KEY is required to use the DeepSeek provider.",
+            }
+        }
+    ]
+    assert not session_file.exists()
+
+
+def test_deepseek_run_cli_denial_is_durable_model_visible_and_side_effect_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    secret = "test-only-deny-secret"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    monkeypatch.setattr("sys.stdin", io.StringIO("deny\n"))
+    first = _deepseek_turn(
+        delta={
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "denied-write",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"denied.txt","content":"must not exist"}',
+                    },
+                }
+            ]
+        },
+        finish_reason="tool_calls",
+        response_id="deny-tool",
+    )
+    second = _deepseek_turn(
+        delta={"content": "The Host denied the write; no change was made."},
+        finish_reason="stop",
+        response_id="deny-final",
+    )
+    responses = iter((first, second))
+    request_bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads((await request.aread()).decode()))
+        return httpx.Response(200, stream=next(responses))
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "ask",
+            "--session-file",
+            str(session_file),
+            "do not bypass the Host",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert not (workspace / "denied.txt").exists()
+    denial = next(record for record in records if record.get("event") == "permission_resolved")
+    assert denial["permission_decision"]["resolution"] == "denied"
+    tool_result = next(
+        record["tool_result"] for record in records if record.get("event") == "tool_execution_end"
+    )
+    assert tool_result["status"] == "error"
+    assert tool_result["error"]["code"] == "permission_denied"
+    assert json.loads(request_bodies[1]["messages"][-1]["content"])["error"]["code"] == (
+        "permission_denied"
+    )
+    assert records[-1]["workspace"]["changed_paths"] == []
+    serialized_session = session_file.read_text(encoding="utf-8")
+    assert '"resolution":"denied"' in serialized_session
+    assert secret not in serialized_session
+
+
+def test_deepseek_run_cli_retry_exhaustion_is_structured_and_non_destructive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-retry-secret")
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadError("connection dropped")
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--session-file",
+            str(session_file),
+            "retry safely",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert attempts == 3
+    assert sum(record.get("event") == "provider_retry" for record in records) == 2
+    assert records[-3]["result"]["error"]["code"] == "provider_unavailable"
+    assert records[-1]["workspace"]["changed_paths"] == []
+
+
+def test_deepseek_run_cli_malformed_tool_call_fails_without_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_file = tmp_path / "session.jsonl"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-malformed-secret")
+    malformed = _deepseek_turn(
+        delta={
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "bad-call",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"path":'},
+                }
+            ]
+        },
+        finish_reason="tool_calls",
+        response_id="malformed-call",
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=malformed)
+
+    exit_code = main(
+        [
+            "run",
+            "--provider",
+            "deepseek",
+            "--workspace",
+            str(workspace),
+            "--session-file",
+            str(session_file),
+            "reject malformed tools",
+        ],
+        deepseek_transport=httpx.MockTransport(handler),
+    )
+    records = _records(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert records[-3]["result"]["error"]["code"] == "provider_exception"
+    assert not any(record.get("event") == "tool_execution_start" for record in records)
+    assert records[-1]["workspace"]["changed_paths"] == []
 
 
 def test_success_cli_renders_public_stream_and_result(capsys: Any) -> None:

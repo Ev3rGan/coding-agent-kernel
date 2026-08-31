@@ -1,5 +1,60 @@
 # Coding Agent Kernel
 
+## 用 DeepSeek 运行真实本地编码路径
+
+先在进程环境中设置 `DEEPSEEK_API_KEY`，再对 disposable 或明确授权的 workspace
+运行同一条公开 Kernel 路径：
+
+```console
+python -m coding_agent run --provider deepseek --workspace <workspace> --mode ask "<coding-task>"
+```
+
+CLI 使用固定的官方 `https://api.deepseek.com/chat/completions` endpoint，默认模型是
+`deepseek-v4-pro`，也只允许当前明确支持的 `deepseek-v4-pro` 和
+`deepseek-v4-flash` 标识。凭据不接受命令行参数或配置文件，只从当前进程环境读取；
+缺失时命令在创建 Session 或发起网络请求前以 `deepseek_api_key_missing` 退出。
+CLI 在 Provider 捕获凭据后，会在 Agent Run 期间从可被 Tool 子进程继承的环境中移除它，
+结束后再恢复 Host 进程环境。不要把 API key 写入 task、workspace、Session 或 shell history。
+
+每次新运行会创建 append-only JSONL Session，并在最终记录中打印 Session ID 和文件
+路径。authoritative assistant messages 与对应的 ToolResults 都会按活动分支持久化，使恢复
+后的 Provider history 继续保持完整的 assistant/tool 配对。使用同一个 store 恢复已关闭的
+Session：
+
+```console
+python -m coding_agent run --provider deepseek --workspace <workspace> --mode ask \
+  --session-file <sessions.jsonl> --resume <session-id> "<next-coding-task>"
+```
+
+Host 持续把 `AgentSessionEvent` 渲染成 JSON Lines。`ask` 模式在
+`permission_requested` 后从 stdin 接受一次 `approve` 或 `deny`；空输入和其他输入
+默认拒绝。最终输出包含 authoritative result、Session 信息、changed paths、文本 patch
+和单独列出的 binary paths。workspace snapshot 忽略 `.git`、symlink 和位于 workspace
+内的 Session 文件，不会为了生成 patch 修改仓库。
+
+Adapter 的协议依据是 DeepSeek 官方
+[Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)、
+[Thinking Mode](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)、
+[Tool Calls](https://api-docs.deepseek.com/guides/tool_calls/) 与
+[Error Codes](https://api-docs.deepseek.com/quick_start/error_codes/)。请求使用 Bearer auth、
+`stream=true` 和 `stream_options.include_usage=true`；SSE 可跨任意 byte boundary，
+`reasoning_content`、`content`、增量 `tool_calls`、usage、finish reason 与 `[DONE]`
+分别规范化到既有 Provider event contract。最终 ToolCall arguments 仍由 Kernel 的
+`AssistantMessageAccumulator` 组装并验证，然后经过 Extension Hook、最终参数重验证和
+Host permission resolution，Adapter 不执行 Tool 或复制 AgentLoop。
+
+HTTP 429、500/503、timeout/transport interruption 映射到既有有限 retry 分类；格式、
+认证、余额、API error 和 malformed stream 产生不可泄露 server body 或 key 的结构化
+失败。确定性测试使用注入的 HTTP transport，不会访问 DeepSeek 或产生费用。限界的真实
+凭据验收也已在 disposable workspace 完成：同一公共 CLI 的完整编码 run 依次执行
+read/inspect、批准后的 edit、bash 测试与最终说明，并另行验证 JSONL Session 关闭和无
+Tool 的 resume；凭据未进入 CLI JSON、Session 或 workspace。常规测试仍使用注入
+transport，不依赖外网或真实凭据。
+
+本能力借鉴 Pi 的 Provider normalization；简化为 DeepSeek + Fake 两个 Adapter；深化点
+是把同一 Python Kernel seam 用于真实 CLI、权限和恢复。它不引入 Provider 生态、模型
+比较、provider-specific prompt 优化、生产级 TUI/sandbox 或 SWE-bench 路径。
+
 ## 固定 Extension 合约
 
 `AgentKernel` 接受调用方按顺序显式构造的普通 Python Extension 实例。Extension

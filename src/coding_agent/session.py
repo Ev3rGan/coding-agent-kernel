@@ -17,7 +17,9 @@ from coding_agent.events import (
     AgentError,
     AgentSessionEvent,
     AssistantMessage,
+    ToolResult,
     assistant_message_record,
+    tool_result_record,
 )
 from coding_agent.json_contract import json_object_snapshot
 from coding_agent.permissions import PermissionDecision, validate_permission_decision_record
@@ -594,6 +596,23 @@ class Session:
         return self._append_entry(
             "message",
             {"role": "user", "text": text},
+            run_id=run_id,
+        )
+
+    def record_tool_result(
+        self,
+        result: ToolResult,
+        *,
+        run_id: str | None = None,
+    ) -> SessionEntry:
+        """Persist one authoritative ToolResult after tool_execution_end."""
+
+        return self._append_entry(
+            "message",
+            {
+                "role": "tool",
+                "results": [tool_result_record(result)],
+            },
             run_id=run_id,
         )
 

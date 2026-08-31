@@ -15,6 +15,13 @@ from coding_agent.context import (
     estimate_provider_request_characters,
 )
 from coding_agent.control import RetryPolicy
+from coding_agent.deepseek import (
+    DEEPSEEK_API_URL,
+    DEEPSEEK_MODELS,
+    DEFAULT_DEEPSEEK_MODEL,
+    DeepSeekConfigurationError,
+    DeepSeekProvider,
+)
 from coding_agent.environment import LocalCodingEnvironment
 from coding_agent.events import (
     AgentError,
@@ -148,6 +155,11 @@ __all__ = [
     "ContextPipeline",
     "ContextSettings",
     "DeterministicBranchSummarizer",
+    "DeepSeekConfigurationError",
+    "DeepSeekProvider",
+    "DEEPSEEK_API_URL",
+    "DEEPSEEK_MODELS",
+    "DEFAULT_DEEPSEEK_MODEL",
     "FakeProvider",
     "Block",
     "AgentSettledHookInput",
