@@ -57,7 +57,8 @@ Provider 生态、模型比较、provider-specific prompt 优化或生产级 TUI
 
 ## 运行一个 SWE-bench Verified 实例
 
-先安装官方 Harness optional dependency，并在 Host 环境中设置 `DEEPSEEK_API_KEY`：
+Host 必须已安装可执行的 `git`，用于验证 base commit 并生成最终 prediction patch。随后安装
+官方 Harness optional dependency，并在 Host 环境中设置 `DEEPSEEK_API_KEY`：
 
 ```console
 python -m pip install -e ".[swebench]"
@@ -65,6 +66,10 @@ python -m coding_agent swebench run --instance <verified-instance> \
   --artifacts <new-run-artifact-directory> --mode auto \
   --timeout 1800 --harness-timeout 1800
 ```
+
+`--mode auto` 会在 elevated Tool Execution 前通过 stdin 请求 Host 审批；非交互环境的 EOF
+按 deny 处理。若要在隔离、一次性且已明确授权的环境中无人值守运行，可显式选择
+`--mode full`；这会扩大 Tool authority，应由调用者承担该授权决定。
 
 该入口固定使用官方 `princeton-nlp/SWE-bench_Verified` 的 `test` split。instance metadata
 按代码记录的 dataset revision 加载，prediction 是一行 JSONL，字段严格为

@@ -23,8 +23,10 @@ from coding_agent.events import (
     ProviderToolCallEnd,
     ProviderToolCallStart,
 )
+from coding_agent.kernel import AgentKernel
 from coding_agent.permissions import PermissionMode
 from coding_agent.provider import FakeProvider, ProviderRequest
+from coding_agent.run import AgentRun
 from coding_agent.swebench import (
     SWE_BENCH_DATASET,
     SWE_BENCH_DATASET_REVISION,
@@ -105,6 +107,12 @@ class _FixtureInstanceLoader:
         )
 
 
+class _MissingMetadataInstanceLoader:
+    async def load(self, instance_id: str) -> SWEbenchInstance:
+        del instance_id
+        raise KeyError("FAIL_TO_PASS")
+
+
 class _FixturePreparedWorkspace:
     def __init__(self, root: Path) -> None:
         self.workspace = root
@@ -150,6 +158,18 @@ class _PatchPreparedWorkspace:
         self.closed = True
 
 
+class _FailingClosePreparedWorkspace(_PatchPreparedWorkspace):
+    async def close(self) -> None:
+        self.closed = True
+        raise OSError("workspace cleanup exploded")
+
+
+class _CancelledClosePreparedWorkspace(_PatchPreparedWorkspace):
+    async def close(self) -> None:
+        self.closed = True
+        raise asyncio.CancelledError("workspace cleanup cancelled")
+
+
 class _PatchWorkspaceFactory:
     def __init__(self, root: Path, patch: str) -> None:
         self.prepared = _PatchPreparedWorkspace(root, patch)
@@ -157,6 +177,16 @@ class _PatchWorkspaceFactory:
     async def prepare(self, instance: SWEbenchInstance, artifacts: Any) -> Any:
         del instance, artifacts
         return self.prepared
+
+
+class _FailingCloseWorkspaceFactory(_PatchWorkspaceFactory):
+    def __init__(self, root: Path, patch: str) -> None:
+        self.prepared = _FailingClosePreparedWorkspace(root, patch)
+
+
+class _CancelledCloseWorkspaceFactory(_PatchWorkspaceFactory):
+    def __init__(self, root: Path, patch: str) -> None:
+        self.prepared = _CancelledClosePreparedWorkspace(root, patch)
 
 
 class _NeverHarness:
@@ -199,7 +229,11 @@ class _OfficialResultCommandRunner:
         prediction_text = await asyncio.to_thread(prediction_path.read_text, encoding="utf-8")
         prediction = json.loads(prediction_text)
         model_dir = prediction["model_name_or_path"].replace("/", "__")
-        report_resolved = self.mode != "unresolved"
+        report_resolved = self.mode not in {
+            "unresolved",
+            "infra-failure",
+            "ambiguous-failure",
+        }
         summary_resolved = report_resolved and self.mode != "mismatch"
         summary = {
             "total_instances": 1,
@@ -215,6 +249,13 @@ class _OfficialResultCommandRunner:
             "error_ids": [instance_id] if self.mode == "error-overlap" else [],
             "empty_patch_ids": [],
             "incomplete_ids": [],
+            "infra_failure_ids": [instance_id] if self.mode == "infra-failure" else [],
+            "ambiguous_failure_ids": ([instance_id] if self.mode == "ambiguous-failure" else []),
+            "failure_reasons": (
+                {instance_id: f"fixture {self.mode}"}
+                if self.mode in {"infra-failure", "ambiguous-failure"}
+                else {}
+            ),
         }
         (cwd / f"{model_dir}.{run_id}.json").write_text(json.dumps(summary), encoding="utf-8")
         report_path = cwd / "logs" / "run_evaluation" / run_id / model_dir / instance_id
@@ -445,6 +486,80 @@ def test_swebench_cli_docker_daemon_failure_is_auditable_and_secret_free(
     assert secret not in serialized
 
 
+def test_swebench_cli_finalizes_artifacts_when_instance_metadata_is_invalid(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-placeholder")
+    runner = _ScriptedCommandRunner(
+        CommandOutcome(0, "Docker version 29.7.2\n", "", False),
+        CommandOutcome(0, '"29.7.2"\n', "", False),
+    )
+    dependencies = SWEbenchDependencies(
+        instance_loader=_MissingMetadataInstanceLoader(),
+        workspace_factory=_PatchWorkspaceFactory(workspace, "unused"),
+        harness_runner=_NeverHarness(),
+    )
+
+    exit_code = main(
+        [
+            "swebench",
+            "run",
+            "--instance",
+            "synthetic__fixture-1",
+            "--artifacts",
+            str(artifacts),
+        ],
+        swebench_command_runner=runner,
+        swebench_dependencies=dependencies,
+    )
+
+    assert exit_code == 3
+    assert _records(capsys.readouterr().out)[-1]["swebench"]["status"] == (
+        "environment_preparation_failed"
+    )
+    manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "environment_preparation_failed"
+    assert "KeyError" in manifest["diagnostic"]
+
+
+def test_swebench_cli_turns_preflight_keyboard_interrupt_into_cancelled_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-placeholder")
+
+    class InterruptingCommandRunner:
+        async def run(self, argv: tuple[str, ...], **options: Any) -> CommandOutcome:
+            del argv, options
+            raise KeyboardInterrupt
+
+    exit_code = main(
+        [
+            "swebench",
+            "run",
+            "--instance",
+            "synthetic__fixture-1",
+            "--artifacts",
+            str(artifacts),
+        ],
+        swebench_command_runner=InterruptingCommandRunner(),
+    )
+
+    assert exit_code == 5
+    assert _records(capsys.readouterr().out)[-1]["swebench"]["status"] == "cancelled"
+    manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["stage"] == "environment_preparation"
+    assert manifest["status"] == "cancelled"
+
+
 def test_strict_process_runner_bounds_output_and_terminates_timeout() -> None:
     runner = SubprocessCommandRunner()
 
@@ -576,7 +691,7 @@ def test_official_instance_loader_pins_verified_revision_and_hides_host_secrets(
 
     modules = {
         "datasets": SimpleNamespace(load_dataset=load_dataset),
-        "swebench.harness.test_spec.test_spec": SimpleNamespace(
+        "swebench.harness.utils": SimpleNamespace(
             make_test_spec=lambda datum: SimpleNamespace(
                 image=f"official/{datum['instance_id']}:latest"
             )
@@ -610,7 +725,7 @@ def test_official_instance_loader_rejects_unverified_harness_version(
     }
     modules = {
         "datasets": SimpleNamespace(load_dataset=lambda *args, **kwargs: [datum]),
-        "swebench.harness.test_spec.test_spec": SimpleNamespace(
+        "swebench.harness.utils": SimpleNamespace(
             make_test_spec=lambda item: SimpleNamespace(image="official/fixture:latest")
         ),
         "swebench.image_builder.constants": SimpleNamespace(
@@ -623,6 +738,16 @@ def test_official_instance_loader_rejects_unverified_harness_version(
 
     with pytest.raises(RuntimeError, match="unsupported SWE-bench version 5.0.3"):
         asyncio.run(OfficialInstanceLoader().load("synthetic__fixture-1"))
+
+
+def test_pinned_swebench_runtime_exports_official_test_spec_builder() -> None:
+    try:
+        harness_utils = importlib.import_module("swebench.harness.utils")
+    except ImportError:
+        pytest.skip("install the swebench optional dependency for this contract test")
+
+    assert importlib.metadata.version("swebench") == "5.0.2"
+    assert callable(harness_utils.make_test_spec)
 
 
 @pytest.mark.parametrize(
@@ -679,6 +804,258 @@ def test_evaluator_never_invokes_harness_without_a_valid_git_prediction(
     manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed"] is True
     assert manifest["status"] == expected_status
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected_status"),
+    [
+        ("", "no_patch"),
+        (
+            "diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n",
+            "environment_preparation_failed",
+        ),
+    ],
+)
+def test_evaluator_finalizes_when_workspace_cleanup_fails(
+    tmp_path: Path,
+    patch: str,
+    expected_status: str,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _FailingCloseWorkspaceFactory(workspace, patch)
+    harness = _NeverHarness()
+    evaluator = SWEbenchEvaluator(
+        FakeProvider.streamed_run(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=harness,
+        ),
+    )
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.FULL,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=deny,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == expected_status
+    assert harness.called is False
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == expected_status
+    assert "cleanup_failures.jsonl" in manifest["artifacts"]
+    [cleanup] = _records((artifacts.root / "cleanup_failures.jsonl").read_text(encoding="utf-8"))
+    assert cleanup["operation"] == "workspace.close"
+    assert cleanup["error_type"] == "OSError"
+    assert cleanup["diagnostic"] == "workspace cleanup exploded"
+
+
+def test_evaluator_finalizes_when_workspace_cleanup_is_cancelled(tmp_path: Path) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _CancelledCloseWorkspaceFactory(workspace, "")
+    evaluator = SWEbenchEvaluator(
+        FakeProvider.streamed_run(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=_NeverHarness(),
+        ),
+    )
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.FULL,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=deny,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "no_patch"
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "no_patch"
+    [cleanup] = _records((artifacts.root / "cleanup_failures.jsonl").read_text(encoding="utf-8"))
+    assert cleanup["operation"] == "workspace.close"
+    assert cleanup["error_type"] == "CancelledError"
+
+
+def test_evaluator_reports_cancelled_when_pre_harness_workspace_close_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _CancelledCloseWorkspaceFactory(
+        workspace,
+        "diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n",
+    )
+    harness = _NeverHarness()
+    evaluator = SWEbenchEvaluator(
+        FakeProvider.streamed_run(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=harness,
+        ),
+    )
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.FULL,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=deny,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "cancelled"
+    assert result.stage == "prediction"
+    assert harness.called is False
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "cancelled"
+
+
+def test_evaluator_preserves_primary_result_when_cleanup_audit_write_fails(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _FailingCloseWorkspaceFactory(workspace, "")
+    evaluator = SWEbenchEvaluator(
+        FakeProvider.streamed_run(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=_NeverHarness(),
+        ),
+    )
+    original_append_jsonl = ArtifactBundle.append_jsonl
+
+    def fail_cleanup_audit(
+        self: ArtifactBundle,
+        relative: str,
+        value: object,
+    ) -> Path:
+        if relative == "cleanup_failures.jsonl":
+            raise OSError("cleanup audit disk failure")
+        return original_append_jsonl(self, relative, value)
+
+    monkeypatch.setattr(ArtifactBundle, "append_jsonl", fail_cleanup_audit)
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.FULL,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=deny,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "no_patch"
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "no_patch"
+
+
+def test_evaluator_runs_from_source_tree_without_distribution_metadata(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _PatchWorkspaceFactory(workspace, "")
+    evaluator = SWEbenchEvaluator(
+        FakeProvider.streamed_run(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=_NeverHarness(),
+        ),
+    )
+
+    def missing_distribution(name: str) -> str:
+        assert name == "coding-agent-kernel"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.FULL,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=deny,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "no_patch"
+    kernel_configuration = json.loads(
+        (artifacts.root / "kernel_configuration.json").read_text(encoding="utf-8")
+    )
+    assert kernel_configuration["kernel_distribution_version"] == "source-tree"
 
 
 @pytest.mark.parametrize(
@@ -793,6 +1170,186 @@ def test_evaluator_closes_agent_session_when_permission_resolver_fails(tmp_path:
     )
 
 
+def test_evaluator_preserves_primary_failure_when_agent_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _PatchWorkspaceFactory(workspace, "unused")
+    provider = FakeProvider(
+        (
+            *_tool_call_events(
+                0,
+                "call-write",
+                "write",
+                {"path": "value.txt", "content": "after\n"},
+            ),
+            ProviderDone(),
+        )
+    )
+    evaluator = SWEbenchEvaluator(
+        provider,
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=_NeverHarness(),
+        ),
+    )
+
+    def fail_close_session(self: AgentKernel) -> None:
+        del self
+        raise OSError("session cleanup exploded")
+
+    monkeypatch.setattr(AgentKernel, "close_session", fail_close_session)
+
+    async def run() -> Any:
+        async def fail_permission(request_id: str) -> bool:
+            del request_id
+            raise RuntimeError("permission frontend disconnected")
+
+        return await evaluator.run(
+            SWEbenchRunConfig(
+                instance_id="synthetic__fixture-1",
+                model="deepseek-v4-pro",
+                mode=PermissionMode.ASK,
+                agent_timeout_seconds=10,
+                harness_timeout_seconds=10,
+            ),
+            artifacts,
+            permission_resolver=fail_permission,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "agent_failed"
+    assert "permission frontend disconnected" in result.diagnostic
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "agent_failed"
+    assert "cleanup_failures.jsonl" in manifest["artifacts"]
+    [cleanup] = _records((artifacts.root / "cleanup_failures.jsonl").read_text(encoding="utf-8"))
+    assert cleanup["operation"] == "kernel.close_session"
+    assert cleanup["error_type"] == "OSError"
+    assert cleanup["diagnostic"] == "session cleanup exploded"
+
+
+@pytest.mark.parametrize("failure_type", [OSError, asyncio.CancelledError])
+def test_evaluator_bounds_consumer_cleanup_when_agent_cancel_fails(
+    tmp_path: Path,
+    monkeypatch: Any,
+    failure_type: type[BaseException],
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_factory = _PatchWorkspaceFactory(workspace, "unused")
+    evaluator = SWEbenchEvaluator(
+        _BlockingProvider(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=workspace_factory,
+            harness_runner=_NeverHarness(),
+        ),
+    )
+
+    async def fail_cancel(self: AgentRun) -> None:
+        del self
+        raise failure_type("agent cancellation exploded")
+
+    monkeypatch.setattr(AgentRun, "cancel", fail_cancel)
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await asyncio.wait_for(
+            evaluator.run(
+                SWEbenchRunConfig(
+                    instance_id="synthetic__fixture-1",
+                    model="deepseek-v4-pro",
+                    mode=PermissionMode.FULL,
+                    agent_timeout_seconds=0.01,
+                    harness_timeout_seconds=10,
+                ),
+                artifacts,
+                permission_resolver=deny,
+            ),
+            timeout=0.5,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "timed_out"
+    manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["status"] == "timed_out"
+    cleanup_records = _records(
+        (artifacts.root / "cleanup_failures.jsonl").read_text(encoding="utf-8")
+    )
+    assert any(
+        record["operation"] == "agent_run.cancel" and record["error_type"] == failure_type.__name__
+        for record in cleanup_records
+    )
+
+
+def test_evaluator_bounds_agent_cancel_itself(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    artifacts = ArtifactBundle.create(tmp_path / "artifacts")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    evaluator = SWEbenchEvaluator(
+        _BlockingProvider(),
+        SWEbenchDependencies(
+            instance_loader=_FixtureInstanceLoader(),
+            workspace_factory=_PatchWorkspaceFactory(workspace, "unused"),
+            harness_runner=_NeverHarness(),
+        ),
+    )
+
+    async def block_cancel(self: AgentRun) -> None:
+        del self
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(AgentRun, "cancel", block_cancel)
+    monkeypatch.setattr("coding_agent.swebench._CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+    async def run() -> Any:
+        async def deny(request_id: str) -> bool:
+            del request_id
+            return False
+
+        return await asyncio.wait_for(
+            evaluator.run(
+                SWEbenchRunConfig(
+                    instance_id="synthetic__fixture-1",
+                    model="deepseek-v4-pro",
+                    mode=PermissionMode.FULL,
+                    agent_timeout_seconds=0.01,
+                    harness_timeout_seconds=10,
+                ),
+                artifacts,
+                permission_resolver=deny,
+            ),
+            timeout=0.5,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "timed_out"
+    cleanup_records = _records(
+        (artifacts.root / "cleanup_failures.jsonl").read_text(encoding="utf-8")
+    )
+    assert any(
+        record["operation"] == "agent_run.cancel" and record["error_type"] == "TimeoutError"
+        for record in cleanup_records
+    )
+
+
 def test_evaluator_interruption_is_cancelled_auditable_and_closes_workspace(
     tmp_path: Path,
 ) -> None:
@@ -854,6 +1411,8 @@ def test_evaluator_interruption_is_cancelled_auditable_and_closes_workspace(
         ("unresolved", "harness_failed", False),
         ("mismatch", "harness_rejected", None),
         ("error-overlap", "harness_rejected", None),
+        ("infra-failure", "harness_rejected", None),
+        ("ambiguous-failure", "harness_rejected", None),
     ],
 )
 def test_official_harness_runner_preserves_failure_and_rejection_semantics(

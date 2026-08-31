@@ -396,7 +396,22 @@ def _swebench_run(
                 "official_contract_commit": SWE_BENCH_CONTRACT_COMMIT,
             },
         )
-        diagnostic = asyncio.run(check_docker_daemon(command_runner))
+
+        def finalize_interruption(stage: SWEbenchStage) -> int:
+            diagnostic = "evaluation interrupted by user"
+            bundle.finalize(
+                status="cancelled",
+                stage=stage,
+                exit_code=5,
+                diagnostic=diagnostic,
+            )
+            _print_record(_swebench_record(stage, "cancelled", diagnostic, bundle.root))
+            return 5
+
+        try:
+            diagnostic = asyncio.run(check_docker_daemon(command_runner))
+        except KeyboardInterrupt:
+            return finalize_interruption("environment_preparation")
         if diagnostic is not None:
             bundle.finalize(
                 status="environment_preparation_failed",
@@ -416,24 +431,31 @@ def _swebench_run(
         if dependencies is None:
             dependencies = production_dependencies(command_runner)
 
+        latest_stage: SWEbenchStage = "instance_loading"
+
         def render_status(stage: SWEbenchStage, status: SWEbenchStatus, diagnostic: str) -> None:
+            nonlocal latest_stage
+            latest_stage = stage
             _print_record(_swebench_record(stage, status, diagnostic, bundle.root))
 
         evaluator = SWEbenchEvaluator(provider, dependencies)
-        execution = asyncio.run(
-            evaluator.run(
-                SWEbenchRunConfig(
-                    instance_id=args.instance,
-                    model=args.model,
-                    mode=PermissionMode(args.mode),
-                    agent_timeout_seconds=args.timeout,
-                    harness_timeout_seconds=args.harness_timeout,
-                ),
-                bundle,
-                permission_resolver=_read_permission_decision,
-                on_status=render_status,
+        try:
+            execution = asyncio.run(
+                evaluator.run(
+                    SWEbenchRunConfig(
+                        instance_id=args.instance,
+                        model=args.model,
+                        mode=PermissionMode(args.mode),
+                        agent_timeout_seconds=args.timeout,
+                        harness_timeout_seconds=args.harness_timeout,
+                    ),
+                    bundle,
+                    permission_resolver=_read_permission_decision,
+                    on_status=render_status,
+                )
             )
-        )
+        except KeyboardInterrupt:
+            return finalize_interruption(latest_stage)
         render_status(
             execution.stage,
             execution.status,

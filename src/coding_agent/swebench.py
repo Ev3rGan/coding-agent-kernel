@@ -46,6 +46,7 @@ SWE_BENCH_CONTRACT_COMMIT = "7a21e05772954cc81471ae19d56f436cecf43c54"
 SWE_BENCH_DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
 SWE_BENCH_HARNESS_VERSION = "5.0.2"
 _MAX_PREDICTION_PATCH_BYTES = 10 * 1024 * 1024
+_CLEANUP_TIMEOUT_SECONDS = 5.0
 SWEbenchStage = Literal[
     "configuration",
     "provider_configuration",
@@ -342,6 +343,38 @@ class ArtifactBundle:
             },
         )
 
+    def record_cleanup_failure(
+        self,
+        *,
+        operation: str,
+        stage: SWEbenchStage,
+        exc: BaseException,
+    ) -> str:
+        """Audit a cleanup error without replacing an already finalized outcome."""
+
+        diagnostic = f"{type(exc).__name__}: {exc}"
+        try:
+            self.append_jsonl(
+                "cleanup_failures.jsonl",
+                {
+                    "operation": operation,
+                    "stage": stage,
+                    "error_type": type(exc).__name__,
+                    "diagnostic": str(exc),
+                },
+            )
+            manifest = json.loads((self.root / "manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("completed") is True:
+                self.finalize(
+                    status=cast(SWEbenchStatus, manifest["status"]),
+                    stage=cast(SWEbenchStage, manifest["stage"]),
+                    exit_code=cast(int, manifest["exit_code"]),
+                    diagnostic=cast(str, manifest["diagnostic"]),
+                )
+        except (Exception, asyncio.CancelledError):
+            pass
+        return f"{operation} failed: {diagnostic}"
+
 
 def default_artifacts_path(instance_id: str) -> Path:
     state_root = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
@@ -501,7 +534,7 @@ class OfficialInstanceLoader:
     def _load_sync(instance_id: str) -> SWEbenchInstance:
         try:
             datasets = importlib.import_module("datasets")
-            test_spec_module = importlib.import_module("swebench.harness.test_spec.test_spec")
+            test_spec_module = importlib.import_module("swebench.harness.utils")
             image_constants = importlib.import_module("swebench.image_builder.constants")
             harness_version = importlib.metadata.version("swebench")
         except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
@@ -1011,6 +1044,8 @@ class OfficialHarnessRunner:
             "error_ids",
             "empty_patch_ids",
             "incomplete_ids",
+            "infra_failure_ids",
+            "ambiguous_failure_ids",
         )
         if any(not isinstance(summary.get(name), list) for name in identifier_fields):
             return HarnessEvaluation(
@@ -1021,6 +1056,18 @@ class OfficialHarnessRunner:
                 None,
             )
         membership = {name: instance.instance_id in summary[name] for name in identifier_fields}
+        for field, description in (
+            ("infra_failure_ids", "infrastructure failure"),
+            ("ambiguous_failure_ids", "ambiguous infrastructure failure"),
+        ):
+            if membership[field]:
+                return HarnessEvaluation(
+                    "harness_rejected",
+                    "harness_result",
+                    7,
+                    f"official Harness reported an {description} for the instance",
+                    None,
+                )
         lifecycle_valid = (
             membership["submitted_ids"]
             and membership["completed_ids"]
@@ -1082,6 +1129,7 @@ class SWEbenchEvaluator:
         kernel: AgentKernel | None = None
         agent_run: AgentRun | None = None
         consumer: asyncio.Task[AgentRunResult] | None = None
+        current_stage: SWEbenchStage = "instance_loading"
 
         def status(stage: SWEbenchStage, value: SWEbenchStatus, diagnostic: str) -> None:
             if on_status is not None:
@@ -1103,15 +1151,79 @@ class SWEbenchEvaluator:
 
         async def stop_agent() -> None:
             nonlocal kernel
+            cancel_failed = False
             if agent_run is not None:
-                await agent_run.cancel()
+                try:
+                    await asyncio.wait_for(agent_run.cancel(), timeout=_CLEANUP_TIMEOUT_SECONDS)
+                except (Exception, asyncio.CancelledError) as exc:
+                    cancel_failed = True
+                    artifacts.record_cleanup_failure(
+                        operation="agent_run.cancel", stage=current_stage, exc=exc
+                    )
             if consumer is not None:
-                await asyncio.gather(consumer, return_exceptions=True)
+                if cancel_failed and not consumer.done():
+                    consumer.cancel()
+                try:
+                    done, pending = await asyncio.wait({consumer}, timeout=_CLEANUP_TIMEOUT_SECONDS)
+                except (Exception, asyncio.CancelledError) as exc:
+                    artifacts.record_cleanup_failure(
+                        operation="agent_run.consumer", stage=current_stage, exc=exc
+                    )
+                    consumer.cancel()
+                else:
+                    if pending:
+                        consumer.cancel()
+                        artifacts.record_cleanup_failure(
+                            operation="agent_run.consumer",
+                            stage=current_stage,
+                            exc=TimeoutError(
+                                f"consumer cleanup exceeded {_CLEANUP_TIMEOUT_SECONDS:g} seconds"
+                            ),
+                        )
+                        try:
+                            done_after_cancel, pending = await asyncio.wait(
+                                pending, timeout=_CLEANUP_TIMEOUT_SECONDS
+                            )
+                            done.update(done_after_cancel)
+                        except (Exception, asyncio.CancelledError) as exc:
+                            artifacts.record_cleanup_failure(
+                                operation="agent_run.consumer",
+                                stage=current_stage,
+                                exc=exc,
+                            )
+                    for task in done:
+                        if not task.cancelled():
+                            task.exception()
             if kernel is not None:
-                kernel.close_session()
-                kernel = None
+                try:
+                    kernel.close_session()
+                except (Exception, asyncio.CancelledError) as exc:
+                    artifacts.record_cleanup_failure(
+                        operation="kernel.close_session", stage=current_stage, exc=exc
+                    )
+                finally:
+                    kernel = None
 
-        current_stage: SWEbenchStage = "instance_loading"
+        async def close_workspace(*, preserve_terminal_outcome: bool) -> str | None:
+            nonlocal prepared
+            workspace = prepared
+            prepared = None
+            if workspace is None:
+                return None
+            try:
+                await workspace.close()
+            except asyncio.CancelledError as exc:
+                if not preserve_terminal_outcome:
+                    raise
+                return artifacts.record_cleanup_failure(
+                    operation="workspace.close", stage=current_stage, exc=exc
+                )
+            except Exception as exc:
+                return artifacts.record_cleanup_failure(
+                    operation="workspace.close", stage=current_stage, exc=exc
+                )
+            return None
+
         try:
             status("instance_loading", "running", "loading official Verified instance metadata")
             instance = await self._dependencies.instance_loader.load(config.instance_id)
@@ -1148,6 +1260,10 @@ class SWEbenchEvaluator:
             context_settings = ContextSettings(
                 project_context=(f"Workspace root: {instance.container_workdir}",)
             )
+            try:
+                kernel_distribution_version = importlib.metadata.version("coding-agent-kernel")
+            except importlib.metadata.PackageNotFoundError:
+                kernel_distribution_version = "source-tree"
             kernel_configuration = {
                 "provider": "deepseek",
                 "model": config.model,
@@ -1156,7 +1272,7 @@ class SWEbenchEvaluator:
                 "permission_mode": config.mode.value,
                 "enabled_tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
                 "context_settings": _jsonable(context_settings),
-                "kernel_distribution_version": importlib.metadata.version("coding-agent-kernel"),
+                "kernel_distribution_version": kernel_distribution_version,
             }
             artifacts.write_json("kernel_configuration.json", kernel_configuration)
             kernel = AgentKernel.with_new_session(
@@ -1232,8 +1348,14 @@ class SWEbenchEvaluator:
                 )
                 + "\n",
             )
-            await prepared.close()
-            prepared = None
+            cleanup_failure = await close_workspace(preserve_terminal_outcome=False)
+            if cleanup_failure is not None:
+                return failure(
+                    "environment_preparation_failed",
+                    "environment_preparation",
+                    3,
+                    cleanup_failure,
+                )
             patch_digest = hashlib.sha256(patch.encode("utf-8")).hexdigest()[:12]
             run_id = f"coding-agent-{patch_digest}-{uuid.uuid4().hex[:12]}"
             artifacts.write_json(
@@ -1273,7 +1395,7 @@ class SWEbenchEvaluator:
         except asyncio.CancelledError:
             await stop_agent()
             return failure("cancelled", current_stage, 5, "evaluator was cancelled")
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             await stop_agent()
             classifications: dict[SWEbenchStage, tuple[SWEbenchStatus, int]] = {
                 "instance_loading": ("environment_preparation_failed", 3),
@@ -1290,8 +1412,7 @@ class SWEbenchEvaluator:
                 f"{current_stage} failed: {type(exc).__name__}: {exc}",
             )
         finally:
-            if prepared is not None:
-                await prepared.close()
+            await close_workspace(preserve_terminal_outcome=True)
 
 
 def production_dependencies(command_runner: CommandRunner) -> SWEbenchDependencies:
