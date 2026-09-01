@@ -16,6 +16,7 @@ from coding_agent import (
     LocalCodingEnvironment,
     ProviderDone,
     ProviderError,
+    ProviderStreamEvent,
     ProviderTextDelta,
     ProviderToolCallDelta,
     ProviderToolCallEnd,
@@ -115,7 +116,7 @@ def test_stream_without_done_becomes_a_protocol_failure() -> None:
 def test_host_can_disable_turn_limit_when_external_timeout_owns_budget(tmp_path: Path) -> None:
     (tmp_path / "value.txt").write_text("ready\n", encoding="utf-8")
 
-    def tool_turn(number: int) -> tuple[object, ...]:
+    def tool_turn(number: int) -> tuple[ProviderStreamEvent, ...]:
         return (
             ProviderToolCallStart(index=0),
             ProviderToolCallDelta(

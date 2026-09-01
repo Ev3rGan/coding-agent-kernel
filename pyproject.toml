@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,11 +9,29 @@ description = "An independently implemented headless coding-agent kernel"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Ev3rGan" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["agent-kernel", "coding-agent", "llm", "swe-bench"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = ["httpx>=0.27,<1"]
+
+[project.urls]
+Homepage = "https://github.com/Ev3rGan/coding-agent-kernel"
+Issues = "https://github.com/Ev3rGan/coding-agent-kernel/issues"
+Repository = "https://github.com/Ev3rGan/coding-agent-kernel"
 
 [project.optional-dependencies]
 swebench = ["swebench==5.0.2"]
 dev = [
+    "build>=1.2",
     "mypy>=1.15",
     "pytest>=8.3",
     "ruff>=0.11",

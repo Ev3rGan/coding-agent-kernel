@@ -1,5 +1,34 @@
 # Coding Agent Kernel
 
+An independently implemented, headless Python Coding Agent Kernel for observable Agent Runs,
+Tool Execution, durable Sessions, deterministic Model Context, and Host-controlled Permission
+Modes.
+
+> **Status:** experimental `0.x` software under active development. Public interfaces and
+> persisted formats may change before `1.0`; this project does not claim production sandboxing
+> or guaranteed SWE-bench outcomes.
+
+## Installation
+
+Python 3.11 or newer is required. From a source checkout:
+
+```console
+python -m pip install .
+python -m coding_agent --help
+```
+
+Use `python -m pip install -e ".[dev]"` for development. The SWE-bench evaluator is an
+optional, heavier install: `python -m pip install -e ".[swebench]"`.
+
+## Navigation
+
+- [Run a real local coding path with DeepSeek](#用-deepseek-运行真实本地编码路径)
+- [Run one SWE-bench Verified instance](#运行一个-swe-bench-verified-实例)
+- [Inspect deterministic local demos](#observable-headless-agent-run)
+- [Understand Host permission modes](#host-permission-modes)
+- [Contribute](CONTRIBUTING.md), [report a vulnerability](SECURITY.md), or read the
+  [Code of Conduct](CODE_OF_CONDUCT.md) and [license](LICENSE)
+
 ## 用 DeepSeek 运行真实本地编码路径
 
 先在进程环境中设置 `DEEPSEEK_API_KEY`，再对 disposable 或明确授权的 workspace
@@ -15,6 +44,9 @@ CLI 使用固定的官方 `https://api.deepseek.com/chat/completions` endpoint�
 缺失时命令在创建 Session 或发起网络请求前以 `deepseek_api_key_missing` 退出。
 CLI 在 Provider 捕获凭据后，会在 Agent Run 期间从可被 Tool 子进程继承的环境中移除它，
 结束后再恢复 Host 进程环境。不要把 API key 写入 task、workspace、Session 或 shell history。
+CLI 不会自动读取或解析 `.env`。可信 Host 可以从受保护的 secret store 或本地 `.env`
+加载凭据，并只注入新建 `coding-agent` 子进程的环境；不要把该文件或其内容暴露给
+workspace、Tool 或日志。
 
 每次新运行会创建 append-only JSONL Session，并在最终记录中打印 Session ID 和文件
 路径。authoritative assistant messages 与对应的 ToolResults 都会按活动分支持久化，使恢复
@@ -71,7 +103,7 @@ python -m coding_agent swebench run --instance <verified-instance> \
 按 deny 处理。若要在隔离、一次性且已明确授权的环境中无人值守运行，可显式选择
 `--mode full`；这会扩大 Tool authority，应由调用者承担该授权决定。
 
-该入口固定使用官方 `princeton-nlp/SWE-bench_Verified` 的 `test` split。instance metadata
+该入口固定使用官方 `SWE-bench/SWE-bench_Verified` 的 `test` split。instance metadata
 按代码记录的 dataset revision 加载，prediction 是一行 JSONL，字段严格为
 `instance_id`、`model_name_or_path` 和 `model_patch`。evaluator 会把该固定 revision 的单条
 instance snapshot 写成本地 JSON，再让官方 Harness 读取同一 snapshot。patch 来自
@@ -85,6 +117,10 @@ working tree、index 和 agent commit；无 patch、非法 diff 或越界路径�
 状态，再以 `--network none` bind mount 给单一 agent container。文件 Tool 只操作该
 workspace，`bash` 只通过严格 argv 的 `docker exec` 运行；Provider key 和 Host secret
 不会进入 container、Tool subprocess 或 Harness subprocess。
+
+Windows Host 还必须使用 Docker Desktop 的 Linux containers，并在准备镜像或运行前启用
+Windows Developer Mode，使官方 instance repository 中的符号链接可以被正确创建和保留。
+缺少这些前置条件时应先修复环境，不要把降级的 checkout 当作有效评测 workspace。
 
 artifact bundle 保存 sanitized `config.json`、精确 `provenance.json` 与
 `kernel_configuration.json`、固定 revision 的 `official_instance.json`、append-only
@@ -411,3 +447,11 @@ The thin CLI observes the public Event Stream and invokes only `AgentRun` contro
 Pending messages stay in two run-scoped FIFO queues and enter Session history only
 when injected at their authoritative drain point. Cancellation drops uninjected
 messages and converges Provider, Tool, and retry work on one terminal result.
+
+## Community and governance
+
+Contributions are welcome through the process in [CONTRIBUTING.md](CONTRIBUTING.md).
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security concerns privately
+as described in [SECURITY.md](SECURITY.md), not in a public issue.
+
+This project is licensed under the [Apache License 2.0](LICENSE).

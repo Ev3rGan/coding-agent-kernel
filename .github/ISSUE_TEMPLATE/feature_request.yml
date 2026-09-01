@@ -1,0 +1,64 @@
+name: Feature request
+description: Propose a scoped capability or improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the problem and desired outcome, not only an implementation.
+        **Do not include API keys, tokens, `.env` contents, private code, or other secrets.**
+        Proposals that change a frozen Parent specification need an explicit specification amendment.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete limitation or user need should be addressed?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and who benefits from it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed scope
+      description: What should be included in the smallest complete change?
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What adjacent behavior should explicitly remain unchanged or out of scope?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: Which commands, events, Session records, or failure cases would prove the outcome?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds or other designs and why they are insufficient.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security, compatibility, network, or cost impact
+      description: Identify permission, secret, migration, external-service, Docker, or paid-run implications.
+    validations:
+      required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add sanitized references, examples, or diagrams that clarify the request.

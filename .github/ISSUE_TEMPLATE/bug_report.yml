@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible defect in Coding Agent Kernel
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the project. Search existing Issues first.
+        **Do not paste API keys, tokens, `.env` contents, private code, or other secrets.**
+        Report security vulnerabilities privately using `SECURITY.md` instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what user-visible impact did it have?
+      placeholder: A concise description of the defect and its impact.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide the package version or exact Git commit SHA.
+      placeholder: 0.1.0 or 0123456789abcdef...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include operating system, Python version, and relevant Docker version if used.
+      placeholder: Windows 11, Python 3.11.9, Docker Desktop 4.x
+    validations:
+      required: true
+  - type: dropdown
+    id: permission_mode
+    attributes:
+      label: Permission Mode
+      description: Which Host-selected mode was active when the defect occurred?
+      options:
+        - Not applicable
+        - plan
+        - ask
+        - auto
+        - full
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest deterministic sequence that reproduces the problem.
+      placeholder: |
+        1. Install ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including exit status or structured error code?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Paste minimal logs, Event Stream records, or a traceback after removing secrets and private paths.
+      render: shell
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Note regressions, workarounds, frequency, or other relevant constraints.
