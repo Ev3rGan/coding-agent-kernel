@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import importlib.metadata
 import json
+import os
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -748,6 +749,43 @@ def test_pinned_swebench_runtime_exports_official_test_spec_builder() -> None:
 
     assert importlib.metadata.version("swebench") == "5.0.2"
     assert callable(harness_utils.make_test_spec)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CODING_AGENT_RUN_NETWORK_TESTS") != "1",
+    reason="set CODING_AGENT_RUN_NETWORK_TESTS=1 to verify the pinned official dataset row",
+)
+def test_pinned_verified_row_builds_swebench_5_0_2_test_spec() -> None:
+    try:
+        datasets = importlib.import_module("datasets")
+        harness_utils = importlib.import_module("swebench.harness.utils")
+    except ImportError:
+        pytest.skip("install the swebench optional dependency for this network contract test")
+
+    dataset = datasets.load_dataset(
+        SWE_BENCH_DATASET,
+        split=f"{SWE_BENCH_SPLIT}[:1]",
+        revision=SWE_BENCH_DATASET_REVISION,
+    )
+    datum = dict(dataset[0])
+    spec = harness_utils.make_test_spec(datum)
+
+    assert SWE_BENCH_DATASET == "SWE-bench/SWE-bench_Verified"
+    assert SWE_BENCH_DATASET_REVISION == "78f471bf655a3137b2e8a75af1501690ec009ec3"
+    assert {
+        "instance_id",
+        "image",
+        "repo",
+        "version",
+        "FAIL_TO_PASS",
+        "PASS_TO_PASS",
+        "log_parser",
+        "eval_type",
+        "eval_script",
+    } <= datum.keys()
+    assert datum["instance_id"] == "astropy__astropy-12907"
+    assert spec.image == datum["image"]
+    assert spec.image == "swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
 
 
 @pytest.mark.parametrize(

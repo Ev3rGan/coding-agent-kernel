@@ -40,10 +40,10 @@ from coding_agent.session import JsonlSessionStore
 from coding_agent.tool_runtime import ToolRuntime
 
 _INSTANCE_ID = re.compile(r"[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9]+")
-SWE_BENCH_DATASET = "princeton-nlp/SWE-bench_Verified"
+SWE_BENCH_DATASET = "SWE-bench/SWE-bench_Verified"
 SWE_BENCH_SPLIT = "test"
 SWE_BENCH_CONTRACT_COMMIT = "7a21e05772954cc81471ae19d56f436cecf43c54"
-SWE_BENCH_DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+SWE_BENCH_DATASET_REVISION = "78f471bf655a3137b2e8a75af1501690ec009ec3"
 SWE_BENCH_HARNESS_VERSION = "5.0.2"
 _MAX_PREDICTION_PATCH_BYTES = 10 * 1024 * 1024
 _CLEANUP_TIMEOUT_SECONDS = 5.0
