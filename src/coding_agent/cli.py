@@ -8,6 +8,7 @@ import dataclasses
 import difflib
 import getpass
 import json
+import math
 import os
 import subprocess
 import sys
@@ -55,6 +56,24 @@ from coding_agent.kernel import AgentKernel
 from coding_agent.permissions import PermissionMode
 from coding_agent.provider import FakeProvider, ModelMessage, ToolResultMessage, UserMessage
 from coding_agent.session import JsonlSessionStore, Session, SessionError
+from coding_agent.swebench import (
+    SWE_BENCH_CONTRACT_COMMIT,
+    SWE_BENCH_DATASET,
+    SWE_BENCH_SPLIT,
+    ArtifactBundle,
+    CommandRunner,
+    SubprocessCommandRunner,
+    SWEbenchConfigurationError,
+    SWEbenchDependencies,
+    SWEbenchEvaluator,
+    SWEbenchRunConfig,
+    SWEbenchStage,
+    SWEbenchStatus,
+    check_docker_daemon,
+    default_artifacts_path,
+    production_dependencies,
+    validate_instance_id,
+)
 from coding_agent.tool_runtime import ToolRuntime
 
 
@@ -190,6 +209,22 @@ def _print_record(record: dict[str, Any]) -> None:
     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
 
 
+def _swebench_record(
+    stage: SWEbenchStage,
+    status: SWEbenchStatus,
+    diagnostic: str,
+    artifacts: Path | None,
+) -> dict[str, Any]:
+    return {
+        "swebench": {
+            "stage": stage,
+            "status": status,
+            "diagnostic": diagnostic,
+            "artifacts": None if artifacts is None else str(artifacts),
+        }
+    }
+
+
 def _startup_error(code: str, message: str) -> int:
     _print_record({"startup_error": {"code": code, "message": message}})
     return 2
@@ -296,6 +331,137 @@ def _deepseek_run(args: argparse.Namespace, transport: httpx.AsyncBaseTransport 
     inherited_api_key = os.environ.pop("DEEPSEEK_API_KEY", None)
     try:
         return _run_deepseek_session(args, provider)
+    finally:
+        if inherited_api_key is not None:
+            os.environ["DEEPSEEK_API_KEY"] = inherited_api_key
+
+
+def _swebench_run(
+    args: argparse.Namespace,
+    transport: httpx.AsyncBaseTransport | None,
+    command_runner: CommandRunner | None,
+    dependencies: SWEbenchDependencies | None,
+) -> int:
+    try:
+        validate_instance_id(args.instance)
+    except SWEbenchConfigurationError as exc:
+        _print_record(_swebench_record("configuration", "prediction_invalid", str(exc), None))
+        return 2
+    if not all(
+        math.isfinite(value) and value > 0 for value in (args.timeout, args.harness_timeout)
+    ):
+        _print_record(
+            _swebench_record(
+                "configuration",
+                "prediction_invalid",
+                "agent and Harness timeouts must be finite positive seconds",
+                None,
+            )
+        )
+        return 2
+    try:
+        provider = DeepSeekProvider(model=args.model, transport=transport)
+    except DeepSeekConfigurationError as exc:
+        _print_record(_swebench_record("provider_configuration", "agent_failed", str(exc), None))
+        return 2
+    if command_runner is None:
+        command_runner = SubprocessCommandRunner()
+    inherited_api_key = os.environ.pop("DEEPSEEK_API_KEY", None)
+    try:
+        artifacts_path = Path(args.artifacts or default_artifacts_path(args.instance))
+        try:
+            bundle = ArtifactBundle.create(artifacts_path)
+        except OSError as exc:
+            _print_record(
+                _swebench_record(
+                    "configuration",
+                    "environment_preparation_failed",
+                    f"artifact directory could not be created: {exc}",
+                    None,
+                )
+            )
+            return 2
+        bundle.write_json(
+            "config.json",
+            {
+                "version": 1,
+                "instance_id": args.instance,
+                "dataset": SWE_BENCH_DATASET,
+                "split": SWE_BENCH_SPLIT,
+                "provider": "deepseek",
+                "model": args.model,
+                "permission_mode": args.mode,
+                "agent_timeout_seconds": args.timeout,
+                "harness_timeout_seconds": args.harness_timeout,
+                "official_contract_commit": SWE_BENCH_CONTRACT_COMMIT,
+            },
+        )
+
+        def finalize_interruption(stage: SWEbenchStage) -> int:
+            diagnostic = "evaluation interrupted by user"
+            bundle.finalize(
+                status="cancelled",
+                stage=stage,
+                exit_code=5,
+                diagnostic=diagnostic,
+            )
+            _print_record(_swebench_record(stage, "cancelled", diagnostic, bundle.root))
+            return 5
+
+        try:
+            diagnostic = asyncio.run(check_docker_daemon(command_runner))
+        except KeyboardInterrupt:
+            return finalize_interruption("environment_preparation")
+        if diagnostic is not None:
+            bundle.finalize(
+                status="environment_preparation_failed",
+                stage="environment_preparation",
+                exit_code=3,
+                diagnostic=diagnostic,
+            )
+            _print_record(
+                _swebench_record(
+                    "environment_preparation",
+                    "environment_preparation_failed",
+                    diagnostic,
+                    bundle.root,
+                )
+            )
+            return 3
+        if dependencies is None:
+            dependencies = production_dependencies(command_runner)
+
+        latest_stage: SWEbenchStage = "instance_loading"
+
+        def render_status(stage: SWEbenchStage, status: SWEbenchStatus, diagnostic: str) -> None:
+            nonlocal latest_stage
+            latest_stage = stage
+            _print_record(_swebench_record(stage, status, diagnostic, bundle.root))
+
+        evaluator = SWEbenchEvaluator(provider, dependencies)
+        try:
+            execution = asyncio.run(
+                evaluator.run(
+                    SWEbenchRunConfig(
+                        instance_id=args.instance,
+                        model=args.model,
+                        mode=PermissionMode(args.mode),
+                        agent_timeout_seconds=args.timeout,
+                        harness_timeout_seconds=args.harness_timeout,
+                    ),
+                    bundle,
+                    permission_resolver=_read_permission_decision,
+                    on_status=render_status,
+                )
+            )
+        except KeyboardInterrupt:
+            return finalize_interruption(latest_stage)
+        render_status(
+            execution.stage,
+            execution.status,
+            execution.diagnostic,
+        )
+        return execution.exit_code
     finally:
         if inherited_api_key is not None:
             os.environ["DEEPSEEK_API_KEY"] = inherited_api_key
@@ -1485,6 +1651,35 @@ def _parser() -> argparse.ArgumentParser:
     session_action = run.add_mutually_exclusive_group()
     session_action.add_argument("--session-id", help="explicit ID for a new Session")
     session_action.add_argument("--resume", metavar="SESSION_ID", help="resume a closed Session")
+    swebench = commands.add_parser("swebench", help="run a SWE-bench Verified instance")
+    swebench_commands = swebench.add_subparsers(dest="swebench_command", required=True)
+    swebench_run = swebench_commands.add_parser("run", help="run one official Verified instance")
+    swebench_run.add_argument("--instance", required=True, help="SWE-bench Verified instance ID")
+    swebench_run.add_argument("--artifacts", type=Path, help="new immutable run-artifact directory")
+    swebench_run.add_argument(
+        "--model",
+        choices=DEEPSEEK_MODELS,
+        default=DEFAULT_DEEPSEEK_MODEL,
+        help="official DeepSeek model identifier",
+    )
+    swebench_run.add_argument(
+        "--mode",
+        choices=tuple(mode.value for mode in PermissionMode),
+        default=PermissionMode.AUTO.value,
+        help="Host-selected run-scoped Permission Mode",
+    )
+    swebench_run.add_argument(
+        "--timeout",
+        type=float,
+        default=1800.0,
+        help="maximum Agent Run seconds",
+    )
+    swebench_run.add_argument(
+        "--harness-timeout",
+        type=float,
+        default=1800.0,
+        help="official Harness per-instance timeout seconds",
+    )
     demo = commands.add_parser("demo", help="run deterministic local demonstrations")
     demos = demo.add_subparsers(dest="demo", required=True)
     streamed_run = demos.add_parser("streamed-run", help="observe one Fake Provider Agent Run")
@@ -1562,12 +1757,21 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     deepseek_transport: httpx.AsyncBaseTransport | None = None,
+    swebench_command_runner: CommandRunner | None = None,
+    swebench_dependencies: SWEbenchDependencies | None = None,
 ) -> int:
     """Parse Host arguments, drive AgentRun, and render public events."""
 
     args = _parser().parse_args(argv)
     if args.command == "run":
         return _deepseek_run(args, deepseek_transport)
+    if args.command == "swebench" and args.swebench_command == "run":
+        return _swebench_run(
+            args,
+            deepseek_transport,
+            swebench_command_runner,
+            swebench_dependencies,
+        )
     if args.command == "demo" and args.demo == "streamed-run":
         return asyncio.run(_streamed_run_demo(args.case))
     if args.command == "demo" and args.demo == "tool-loop":
