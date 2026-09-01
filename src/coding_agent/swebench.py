@@ -11,8 +11,6 @@ import json
 import os
 import re
 import shlex
-import signal
-import subprocess
 import sys
 import threading
 import uuid
@@ -31,6 +29,8 @@ from coding_agent.environment import (
     ProcessChunk,
     ProcessResult,
     WorkspacePathError,
+    _kill_process_group,
+    _windows_process_group_creation_flags,
     raise_if_cancelled,
 )
 from coding_agent.events import AgentRunResult, AgentRunState, AgentSessionEvent
@@ -148,7 +148,7 @@ class SubprocessCommandRunner:
             raise ValueError("process argv and output limit must be valid")
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            kwargs["creationflags"] = _windows_process_group_creation_flags()
         else:
             kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(
@@ -236,7 +236,7 @@ class SubprocessCommandRunner:
             )
             await killer.wait()
         else:
-            os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            _kill_process_group(process.pid)
         await process.wait()
 
 

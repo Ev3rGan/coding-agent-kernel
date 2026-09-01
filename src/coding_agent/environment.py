@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 
 class WorkspacePathError(ValueError):
@@ -36,6 +37,25 @@ class ProcessResult:
 
 
 ChunkCallback = Callable[[ProcessChunk], Awaitable[None]]
+_ProcessGroupKiller = Callable[[int, int], None]
+
+
+def _windows_process_group_creation_flags() -> int:
+    flags: object = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", None)
+    if not isinstance(flags, int) or isinstance(flags, bool):
+        raise RuntimeError("subprocess.CREATE_NEW_PROCESS_GROUP is unavailable")
+    return flags
+
+
+def _kill_process_group(process_group_id: int) -> None:
+    candidate: object = getattr(os, "killpg", None)
+    if not callable(candidate):
+        raise RuntimeError("os.killpg is unavailable")
+    signal_number: object = getattr(signal, "SIGKILL", None)
+    if not isinstance(signal_number, int) or isinstance(signal_number, bool):
+        raise RuntimeError("signal.SIGKILL is unavailable")
+    kill_process_group = cast(_ProcessGroupKiller, candidate)
+    kill_process_group(process_group_id, signal_number)
 
 
 def raise_if_cancelled(cancel_event: asyncio.Event | None) -> None:
@@ -140,7 +160,7 @@ class LocalCodingEnvironment:
                 cwd=self.resolve_path(cwd),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=_windows_process_group_creation_flags(),
             )
         else:
             process = await asyncio.create_subprocess_shell(
@@ -215,5 +235,5 @@ class LocalCodingEnvironment:
             )
             await killer.wait()
         else:
-            os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            _kill_process_group(process.pid)
         await process.wait()
