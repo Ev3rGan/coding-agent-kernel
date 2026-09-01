@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
+from pathlib import Path
 
 from coding_agent import (
     AgentKernel,
@@ -11,9 +13,14 @@ from coding_agent import (
     AgentSessionEventKind,
     FakeProvider,
     InMemorySessionStore,
+    LocalCodingEnvironment,
     ProviderDone,
     ProviderError,
     ProviderTextDelta,
+    ProviderToolCallDelta,
+    ProviderToolCallEnd,
+    ProviderToolCallStart,
+    ToolRuntime,
 )
 
 
@@ -103,6 +110,44 @@ def test_stream_without_done_becomes_a_protocol_failure() -> None:
     assert result.error.code == "provider_stream_incomplete"
     assert events[-2].kind is AgentSessionEventKind.AGENT_END
     assert events[-1].kind is AgentSessionEventKind.RUN_FAILED
+
+
+def test_host_can_disable_turn_limit_when_external_timeout_owns_budget(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("ready\n", encoding="utf-8")
+
+    def tool_turn(number: int) -> tuple[object, ...]:
+        return (
+            ProviderToolCallStart(index=0),
+            ProviderToolCallDelta(
+                index=0,
+                call_id_delta=f"read-{number}",
+                tool_name_delta="read",
+                arguments_delta=json.dumps({"path": "value.txt"}),
+            ),
+            ProviderToolCallEnd(index=0),
+            ProviderDone(stop_reason="tool_use"),
+        )
+
+    provider = FakeProvider(
+        tuple(tool_turn(number) for number in range(1, 22))
+        + ((ProviderTextDelta("complete"), ProviderDone()),)
+    )
+    kernel = AgentKernel(
+        provider,
+        tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+    )
+
+    async def collect() -> tuple[list[AgentSessionEvent], AgentRunResult]:
+        run = kernel.create_run("read until complete", max_turns=None)
+        return [event async for event in run], await run.result()
+
+    events, result = asyncio.run(collect())
+
+    assert len(provider.requests) == 22
+    assert result.state is AgentRunState.SETTLED
+    assert result.message is not None
+    assert result.message.text == "complete"
+    assert events[-1].kind is AgentSessionEventKind.RUN_SETTLED
 
 
 def test_run_state_space_names_all_required_states() -> None:

@@ -14,12 +14,13 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol, cast
 
 from coding_agent.context import ContextSettings
@@ -30,6 +31,7 @@ from coding_agent.environment import (
     ProcessChunk,
     ProcessResult,
     WorkspacePathError,
+    raise_if_cancelled,
 )
 from coding_agent.events import AgentRunResult, AgentRunState, AgentSessionEvent
 from coding_agent.kernel import AgentKernel
@@ -47,6 +49,23 @@ SWE_BENCH_DATASET_REVISION = "78f471bf655a3137b2e8a75af1501690ec009ec3"
 SWE_BENCH_HARNESS_VERSION = "5.0.2"
 _MAX_PREDICTION_PATCH_BYTES = 10 * 1024 * 1024
 _CLEANUP_TIMEOUT_SECONDS = 5.0
+_OFFICIAL_RUNTIME_IMPORT_LOCK = threading.Lock()
+_WINDOWS_HARNESS_BOOTSTRAP = r"""
+import pathlib
+import runpy
+
+_original_write_text = pathlib.Path.write_text
+
+
+def _write_text(self, data, encoding=None, errors=None, newline="\n"):
+    return _original_write_text(
+        self, data, encoding=encoding, errors=errors, newline=newline
+    )
+
+
+pathlib.Path.write_text = _write_text
+runpy.run_module("swebench.harness.run_evaluation", run_name="__main__")
+"""
 SWEbenchStage = Literal[
     "configuration",
     "provider_configuration",
@@ -446,6 +465,36 @@ class ContainerCodingEnvironment(LocalCodingEnvironment):
             raise WorkspacePathError(f"path escapes workspace: {path}")
         return candidate
 
+    async def write_text(
+        self,
+        path: str,
+        content: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> int:
+        """Write exact UTF-8 bytes so a Windows Host cannot inject CRLF into Linux files."""
+
+        # LocalCodingEnvironment deliberately uses host-native text semantics. This
+        # Adapter cannot delegate there because its Linux workspace contract requires
+        # exact bytes; the cancellation test locks the shared atomic-write invariants.
+        raise_if_cancelled(cancel_event)
+        target = self.resolve_path(path)
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+        raise_if_cancelled(cancel_event)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        encoded = content.encode("utf-8")
+        write_task = asyncio.create_task(asyncio.to_thread(temporary.write_bytes, encoded))
+        try:
+            await asyncio.shield(write_task)
+        except asyncio.CancelledError:
+            await write_task
+            await asyncio.to_thread(temporary.unlink, missing_ok=True)
+            raise
+        if cancel_event is not None and cancel_event.is_set():
+            await asyncio.to_thread(temporary.unlink, missing_ok=True)
+            raise asyncio.CancelledError
+        temporary.replace(target)
+        return len(encoded)
+
     async def run_command(
         self,
         command: str,
@@ -524,6 +573,19 @@ def _without_host_secrets() -> Any:
         os.environ.update(sensitive)
 
 
+@contextmanager
+def _preserving_event_loop_policy() -> Any:
+    """Serialize and contain process-global policy changes made by optional imports."""
+
+    with _OFFICIAL_RUNTIME_IMPORT_LOCK:
+        original = asyncio.get_event_loop_policy()
+        try:
+            yield
+        finally:
+            if asyncio.get_event_loop_policy() is not original:
+                asyncio.set_event_loop_policy(original)
+
+
 class OfficialInstanceLoader:
     """Load one pinned Verified datum and derive its official TestSpec image."""
 
@@ -532,16 +594,17 @@ class OfficialInstanceLoader:
 
     @staticmethod
     def _load_sync(instance_id: str) -> SWEbenchInstance:
-        try:
-            datasets = importlib.import_module("datasets")
-            test_spec_module = importlib.import_module("swebench.harness.utils")
-            image_constants = importlib.import_module("swebench.image_builder.constants")
-            harness_version = importlib.metadata.version("swebench")
-        except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
-            raise RuntimeError(
-                "official SWE-bench runtime is unavailable; install the project with "
-                "the 'swebench' optional dependency"
-            ) from exc
+        with _preserving_event_loop_policy():
+            try:
+                datasets = importlib.import_module("datasets")
+                test_spec_module = importlib.import_module("swebench.harness.utils")
+                image_constants = importlib.import_module("swebench.image_builder.constants")
+                harness_version = importlib.metadata.version("swebench")
+            except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
+                raise RuntimeError(
+                    "official SWE-bench runtime is unavailable; install the project with "
+                    "the 'swebench' optional dependency"
+                ) from exc
         if harness_version != SWE_BENCH_HARNESS_VERSION:
             raise RuntimeError(
                 f"unsupported SWE-bench version {harness_version}; "
@@ -698,6 +761,7 @@ async def _checked_command(
     runner: CommandRunner,
     argv: tuple[str, ...],
     *,
+    operation: str | None = None,
     cwd: Path | None = None,
     timeout_seconds: float = 120.0,
     output_limit_bytes: int = 4 * 1024 * 1024,
@@ -711,11 +775,109 @@ async def _checked_command(
         on_chunk=None,
         output_limit_bytes=output_limit_bytes,
     )
+    label = operation or f"command {argv[0]!r}"
     if outcome.exit_code != 0:
-        raise RuntimeError(f"command {argv[0]!r} exited with status {outcome.exit_code}")
+        detail = outcome.stderr or outcome.stdout
+        raise RuntimeError(
+            f"{label} failed with exit status {outcome.exit_code}: {_diagnostic_excerpt(detail)}"
+        )
     if outcome.output_truncated:
-        raise SWEbenchConfigurationError(f"command {argv[0]!r} output was truncated")
+        raise SWEbenchConfigurationError(f"{label} output was truncated")
     return outcome
+
+
+_SECRET_DIAGNOSTIC = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|AUTH|PASSWORD)[A-Z0-9_]*)\s*[:=]\s*\S+"
+)
+_RAW_DIFF_METADATA = re.compile(r":([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) (M)")
+
+
+def _diagnostic_excerpt(value: str, *, limit: int = 2048) -> str:
+    redacted = _SECRET_DIAGNOSTIC.sub(r"\1=<redacted>", value.strip())
+    flattened = " | ".join(line.strip() for line in redacted.splitlines() if line.strip())
+    if len(flattened) <= limit:
+        return flattened or "no command output"
+    return flattened[:limit] + "... [diagnostic truncated]"
+
+
+def _validate_mode_only_image_delta(raw_delta: str) -> None:
+    for record in raw_delta.splitlines():
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        match = _RAW_DIFF_METADATA.fullmatch(metadata)
+        if separator != "\t" or not path or match is None:
+            raise RuntimeError(
+                "official image commit delta could not be validated as mode-only: "
+                f"{_diagnostic_excerpt(record)}"
+            )
+        old_mode, new_mode, old_blob, new_blob, _ = match.groups()
+        if (
+            old_blob != new_blob
+            or old_mode == new_mode
+            or {old_mode, new_mode} != {"100644", "100755"}
+        ):
+            raise RuntimeError(
+                "official image HEAD changes repository content or type relative to the "
+                f"instance base commit: {_diagnostic_excerpt(record)}"
+            )
+
+
+def _validate_tracked_symlinks(workspace: Path, staged_files: str) -> None:
+    for record in staged_files.split("\0"):
+        if not record:
+            continue
+        metadata, separator, relative = record.partition("\t")
+        fields = metadata.split()
+        if separator != "\t" or len(fields) != 3 or fields[2] != "0":
+            raise RuntimeError("normalized workspace Git index contains an invalid entry")
+        mode = fields[0]
+        if mode != "120000":
+            continue
+        relative_path = PurePosixPath(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts or "\\" in relative:
+            raise RuntimeError(f"tracked symlink path is unsafe: {_diagnostic_excerpt(relative)}")
+        link = workspace.joinpath(*relative_path.parts)
+        if not link.is_symlink():
+            raise RuntimeError(
+                f"tracked symlink was not materialized safely: {_diagnostic_excerpt(relative)}"
+            )
+        target = os.readlink(link)
+        target_path = Path(target)
+        if target_path.is_absolute() or target_path.drive:
+            raise RuntimeError(
+                f"tracked symlink escapes workspace: {_diagnostic_excerpt(relative)}"
+            )
+        try:
+            resolved_target = (link.parent / target_path).resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"tracked symlink cannot be resolved safely: {_diagnostic_excerpt(relative)}"
+            ) from exc
+        if resolved_target != workspace and workspace not in resolved_target.parents:
+            raise RuntimeError(
+                f"tracked symlink escapes workspace: {_diagnostic_excerpt(relative)}"
+            )
+
+
+def _resolve_git_path(value: str, *, workspace: Path) -> Path:
+    path = Path(value.strip())
+    if not path.is_absolute():
+        path = workspace / path
+    return path.resolve()
+
+
+def _validate_owned_git_directory(workspace: Path) -> None:
+    git_directory = workspace / ".git"
+    for root, directories, files in os.walk(git_directory, followlinks=False):
+        for name in (*directories, *files):
+            entry = Path(root) / name
+            if entry.is_symlink():
+                relative = entry.relative_to(git_directory).as_posix()
+                raise RuntimeError(
+                    "copied workspace Git directory contains a symlink: "
+                    f"{_diagnostic_excerpt(relative)}"
+                )
 
 
 class DockerPreparedWorkspace:
@@ -802,6 +964,10 @@ class DockerWorkspaceFactory:
         workspace = (artifacts.root / "workspace").resolve()
         if "," in str(workspace):
             raise SWEbenchConfigurationError("artifact workspace path cannot contain a comma")
+        if workspace.parent != artifacts.root or workspace.exists():
+            raise SWEbenchConfigurationError(
+                "artifact workspace must be a new evaluator-owned directory"
+            )
         image = await self._command_runner.run(
             ("docker", "image", "inspect", instance.image),
             cwd=None,
@@ -839,8 +1005,103 @@ class DockerWorkspaceFactory:
                     "-f",
                     "/dev/null",
                 ),
+                operation="creating the official image inspection container",
             )
             seed_created = True
+            await _checked_command(
+                self._command_runner,
+                ("docker", "start", seed_name),
+                operation="starting the official image inspection container",
+            )
+            seed_head = await _checked_command(
+                self._command_runner,
+                (
+                    "docker",
+                    "exec",
+                    "--workdir",
+                    instance.container_workdir,
+                    seed_name,
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                ),
+                operation="reading the official image workspace HEAD",
+            )
+            image_head = seed_head.stdout.strip()
+            image_status = await _checked_command(
+                self._command_runner,
+                (
+                    "docker",
+                    "exec",
+                    "--workdir",
+                    instance.container_workdir,
+                    seed_name,
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ),
+                operation="checking the official image workspace status",
+            )
+            if image_status.stdout:
+                raise RuntimeError(
+                    "official image workspace is dirty; refusing to normalize it: "
+                    f"{_diagnostic_excerpt(image_status.stdout)}"
+                )
+            await _checked_command(
+                self._command_runner,
+                (
+                    "docker",
+                    "exec",
+                    "--workdir",
+                    instance.container_workdir,
+                    seed_name,
+                    "git",
+                    "cat-file",
+                    "-e",
+                    f"{instance.base_commit}^{{commit}}",
+                ),
+                operation="verifying the instance base commit exists in the official image",
+            )
+            await _checked_command(
+                self._command_runner,
+                (
+                    "docker",
+                    "exec",
+                    "--workdir",
+                    instance.container_workdir,
+                    seed_name,
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    instance.base_commit,
+                    image_head,
+                ),
+                operation="verifying the instance base commit is an ancestor of image HEAD",
+            )
+            image_delta = await _checked_command(
+                self._command_runner,
+                (
+                    "docker",
+                    "exec",
+                    "--workdir",
+                    instance.container_workdir,
+                    seed_name,
+                    "git",
+                    "diff",
+                    "--raw",
+                    "--no-abbrev",
+                    "--no-renames",
+                    instance.base_commit,
+                    image_head,
+                    "--",
+                    ".",
+                ),
+                operation="validating the official image commit delta",
+                output_limit_bytes=4 * 1024 * 1024,
+            )
+            _validate_mode_only_image_delta(image_delta.stdout)
             await _checked_command(
                 self._command_runner,
                 (
@@ -849,6 +1110,7 @@ class DockerWorkspaceFactory:
                     f"{seed_name}:{instance.container_workdir}/.",
                     str(workspace),
                 ),
+                operation="copying the official image workspace to the evaluator artifact",
             )
         finally:
             if seed_created:
@@ -863,20 +1125,88 @@ class DockerWorkspaceFactory:
                 )
         if not workspace.is_dir():
             raise RuntimeError("official instance image did not provide the target workspace")
-        head = await _checked_command(
+        if (workspace / ".git").is_symlink() or not (workspace / ".git").is_dir():
+            raise RuntimeError("copied workspace does not contain an owned Git directory")
+        _validate_owned_git_directory(workspace)
+        top_level = await _checked_command(
             self._command_runner,
-            ("git", "rev-parse", "HEAD"),
+            ("git", "rev-parse", "--show-toplevel"),
             cwd=workspace,
+            operation="verifying the copied workspace Git root",
         )
-        if head.stdout.strip() != instance.base_commit:
-            raise RuntimeError("prepared workspace HEAD does not match the instance base commit")
+        if _resolve_git_path(top_level.stdout, workspace=workspace) != workspace:
+            raise RuntimeError("copied workspace Git root escapes the evaluator-owned workspace")
+        common_dir = await _checked_command(
+            self._command_runner,
+            ("git", "rev-parse", "--git-common-dir"),
+            cwd=workspace,
+            operation="verifying the copied workspace Git object directory",
+        )
+        if _resolve_git_path(common_dir.stdout, workspace=workspace) != _resolve_git_path(
+            ".git", workspace=workspace
+        ):
+            raise RuntimeError("copied workspace Git object directory is not evaluator-owned")
+        copied_head = await _checked_command(
+            self._command_runner,
+            ("git", "rev-parse", "--verify", "HEAD^{commit}"),
+            cwd=workspace,
+            operation="verifying the copied workspace HEAD",
+        )
+        if copied_head.stdout.strip() != image_head:
+            raise RuntimeError(
+                "copied workspace HEAD differs from the validated official image HEAD"
+            )
+        await _checked_command(
+            self._command_runner,
+            ("git", "config", "--local", "core.filemode", "false"),
+            cwd=workspace,
+            operation="configuring cross-platform Git file mode handling",
+        )
+        await _checked_command(
+            self._command_runner,
+            ("git", "config", "--local", "core.autocrlf", "false"),
+            cwd=workspace,
+            operation="configuring cross-platform Git line ending handling",
+        )
+        await _checked_command(
+            self._command_runner,
+            ("git", "config", "--local", "core.symlinks", "true"),
+            cwd=workspace,
+            operation="configuring tracked symlink checkout",
+        )
+        await _checked_command(
+            self._command_runner,
+            ("git", "reset", "--hard", instance.base_commit),
+            cwd=workspace,
+            operation="normalizing the evaluator-owned workspace to the instance base commit",
+        )
+        normalized_head = await _checked_command(
+            self._command_runner,
+            ("git", "rev-parse", "--verify", "HEAD^{commit}"),
+            cwd=workspace,
+            operation="verifying the normalized workspace HEAD",
+        )
+        if normalized_head.stdout.strip() != instance.base_commit:
+            raise RuntimeError("normalized workspace HEAD does not match the instance base commit")
         clean = await _checked_command(
             self._command_runner,
-            ("git", "status", "--porcelain"),
+            ("git", "status", "--porcelain=v1", "--untracked-files=all"),
             cwd=workspace,
+            operation="verifying the normalized workspace status",
         )
         if clean.stdout:
-            raise RuntimeError("prepared workspace is not clean at the instance base commit")
+            raise RuntimeError(
+                "normalized workspace is not clean at the instance base commit: "
+                f"{_diagnostic_excerpt(clean.stdout)}"
+            )
+        staged_files = await _checked_command(
+            self._command_runner,
+            ("git", "ls-files", "--stage", "-z"),
+            cwd=workspace,
+            operation="enumerating tracked symlinks in the normalized workspace",
+            output_limit_bytes=4 * 1024 * 1024,
+        )
+        _validate_tracked_symlinks(workspace, staged_files.stdout)
         mount = f"type=bind,source={workspace},target={instance.container_workdir}"
         try:
             await _checked_command(
@@ -899,10 +1229,12 @@ class DockerWorkspaceFactory:
                     "-f",
                     "/dev/null",
                 ),
+                operation="creating the controlled agent container",
             )
             await _checked_command(
                 self._command_runner,
                 ("docker", "start", agent_name),
+                operation="starting the controlled agent container",
             )
         except BaseException:
             await self._command_runner.run(
@@ -944,10 +1276,13 @@ class OfficialHarnessRunner:
         dataset_path = artifacts.write_json(
             "official_instance.json", [dict(instance.dataset_record)]
         )
+        harness_entrypoint = (
+            (sys.executable, "-c", _WINDOWS_HARNESS_BOOTSTRAP)
+            if os.name == "nt"
+            else (sys.executable, "-m", "swebench.harness.run_evaluation")
+        )
         argv = (
-            sys.executable,
-            "-m",
-            "swebench.harness.run_evaluation",
+            *harness_entrypoint,
             "--dataset_name",
             str(dataset_path),
             "--split",
@@ -1258,7 +1593,18 @@ class SWEbenchEvaluator:
             runtime.enable("grep", "find", "ls")
             store = JsonlSessionStore(artifacts.root / "session.jsonl")
             context_settings = ContextSettings(
-                project_context=(f"Workspace root: {instance.container_workdir}",)
+                system_prompt=(
+                    "You are a headless coding agent. Work directly on the requested task in "
+                    "the provided workspace. Inspect only what is needed, make the necessary "
+                    "edits, and run focused tests. Once the task is complete, finish with a "
+                    "concise response without calling another tool."
+                ),
+                tool_guidelines=(
+                    "Use only the active tools described in this request. Prefer focused file "
+                    "inspection and targeted tests. Avoid repeating equivalent inspection "
+                    "commands after their result is already known."
+                ),
+                project_context=(f"Workspace root: {instance.container_workdir}",),
             )
             try:
                 kernel_distribution_version = importlib.metadata.version("coding-agent-kernel")
@@ -1270,6 +1616,7 @@ class SWEbenchEvaluator:
                 "workspace": instance.container_workdir,
                 "instance_id": instance.instance_id,
                 "permission_mode": config.mode.value,
+                "max_turns": None,
                 "enabled_tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
                 "context_settings": _jsonable(context_settings),
                 "kernel_distribution_version": kernel_distribution_version,
@@ -1289,7 +1636,11 @@ class SWEbenchEvaluator:
                 "running",
                 "AgentKernel is processing the Verified problem statement",
             )
-            run = kernel.create_run(instance.problem_statement, permission_mode=config.mode)
+            run = kernel.create_run(
+                instance.problem_statement,
+                permission_mode=config.mode,
+                max_turns=None,
+            )
             agent_run = run
 
             async def consume() -> AgentRunResult:

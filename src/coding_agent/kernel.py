@@ -393,6 +393,7 @@ class AgentKernel:
         prompt: str,
         *,
         permission_mode: PermissionMode | str = PermissionMode.AUTO,
+        max_turns: int | None = 20,
     ) -> AgentRun:
         """Start one Agent Run for the supplied user input."""
 
@@ -400,6 +401,8 @@ class AgentKernel:
             selected_permission_mode = PermissionMode(permission_mode)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid Permission Mode: {permission_mode!r}") from exc
+        if max_turns is not None and (type(max_turns) is not int or max_turns <= 0):
+            raise ValueError("max_turns must be a positive integer or None")
         run_id = f"run-{next(self._run_numbers)}"
         input_error: AgentError | None = None
         try:
@@ -458,6 +461,7 @@ class AgentKernel:
                         first_request=first_request,
                         context_error=context_error,
                         permission_mode=selected_permission_mode,
+                        max_turns=max_turns,
                     )
                 )
             ),
@@ -484,13 +488,15 @@ class AgentKernel:
         first_request: ProviderRequest | None,
         context_error: AgentError | None,
         permission_mode: PermissionMode,
+        max_turns: int | None,
     ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
         next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
         next_active_branch: tuple[SessionEntry, ...] | None = None
 
-        for turn_number in range(1, 21):
+        turn_numbers = count(1) if max_turns is None else range(1, max_turns + 1)
+        for turn_number in turn_numbers:
             turn_id = f"{run_id}-turn-{turn_number}"
             message_id = f"{turn_id}-message-1"
             accumulator = AssistantMessageAccumulator()
@@ -1017,11 +1023,13 @@ class AgentKernel:
             yield AgentEvent(kind=AgentEventKind.AGENT_END, run_id=run_id)
             return
 
-        error = ProviderError("turn_limit", "Agent Run exceeded 20 Turns.")
+        if max_turns is None:  # pragma: no cover - itertools.count() is unbounded
+            raise RuntimeError("unbounded Agent Run exhausted its turn iterator")
+        error = ProviderError("turn_limit", f"Agent Run exceeded {max_turns} Turns.")
         for failure_event in _provider_failure_events(
             run_id=run_id,
-            turn_id=f"{run_id}-turn-20",
-            message_id=f"{run_id}-turn-20-message-1",
+            turn_id=f"{run_id}-turn-{max_turns}",
+            message_id=f"{run_id}-turn-{max_turns}-message-1",
             message=message,
             provider_error=error,
         ):
