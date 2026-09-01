@@ -1,11 +1,53 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from coding_agent import LocalCodingEnvironment, ToolBatchResult, ToolCall, ToolRuntime
+from coding_agent.environment import (
+    _kill_process_group,
+    _windows_process_group_creation_flags,
+)
+
+
+def test_process_group_helpers_bind_platform_apis_with_explicit_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
+    calls: list[tuple[int, int]] = []
+
+    def record_kill(process_group_id: int, signal_number: int) -> None:
+        calls.append((process_group_id, signal_number))
+
+    monkeypatch.setattr(os, "killpg", record_kill, raising=False)
+    monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+
+    assert _windows_process_group_creation_flags() == 512
+    _kill_process_group(123)
+
+    assert calls == [(123, 9)]
+
+
+def test_process_group_helpers_fail_closed_when_platform_apis_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(subprocess, "CREATE_NEW_PROCESS_GROUP", raising=False)
+    monkeypatch.delattr(os, "killpg", raising=False)
+
+    with pytest.raises(RuntimeError, match="CREATE_NEW_PROCESS_GROUP is unavailable"):
+        _windows_process_group_creation_flags()
+    with pytest.raises(RuntimeError, match="os.killpg is unavailable"):
+        _kill_process_group(123)
+
+    monkeypatch.setattr(os, "killpg", lambda process_group_id, signal_number: None, raising=False)
+    monkeypatch.delattr(signal, "SIGKILL", raising=False)
+    with pytest.raises(RuntimeError, match="signal.SIGKILL is unavailable"):
+        _kill_process_group(123)
 
 
 def test_environment_rejects_nul_path_before_normalization(tmp_path: Path) -> None:
