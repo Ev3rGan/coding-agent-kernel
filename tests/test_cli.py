@@ -641,12 +641,17 @@ def test_mixed_batch_cli_exposes_both_modes_and_ordered_results(capsys: Any) -> 
     exit_code = main(["demo", "tool-loop", "--case", "mixed-batch"])
     records = _records(capsys.readouterr().out)
     endings = [record for record in records if record.get("event") == "tool_execution_end"]
+    parallel_endings = [record for record in endings if record["batch_mode"] == "parallel"]
+    sequential_endings = [record for record in endings if record["batch_mode"] == "sequential"]
 
     assert exit_code == 0
     assert {record["batch_mode"] for record in endings} == {"parallel", "sequential"}
-    assert [record["tool_result"]["call_id"] for record in endings] == [
+    assert len(parallel_endings) == 2
+    assert {record["tool_result"]["call_id"] for record in parallel_endings} == {
         "read-a",
         "read-b",
+    }
+    assert [record["tool_result"]["call_id"] for record in sequential_endings] == [
         "read-before",
         "write",
         "read-after",

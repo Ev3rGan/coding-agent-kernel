@@ -15,6 +15,24 @@ from coding_agent.environment import (
 )
 
 
+class _ReadBFirstEnvironment(LocalCodingEnvironment):
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self._read_b_completed = asyncio.Event()
+
+    async def read_text(
+        self,
+        path: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> str:
+        if path == "a.txt":
+            await self._read_b_completed.wait()
+        content = await super().read_text(path, cancel_event)
+        if path == "b.txt":
+            self._read_b_completed.set()
+        return content
+
+
 def test_process_group_helpers_bind_platform_apis_with_explicit_types(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -98,23 +116,24 @@ def test_pure_read_batch_is_parallel_but_model_results_keep_call_order(tmp_path:
     workspace = tmp_path
     (workspace / "a.txt").write_text("A", encoding="utf-8")
     (workspace / "b.txt").write_text("B", encoding="utf-8")
-    runtime = ToolRuntime(LocalCodingEnvironment(workspace))
 
-    batch = asyncio.run(
-        runtime.execute_batch(
+    async def execute_batch() -> ToolBatchResult:
+        runtime = ToolRuntime(_ReadBFirstEnvironment(workspace))
+        return await runtime.execute_batch(
             (
-                ToolCall("b", "read", {"path": "b.txt"}),
-                ToolCall("a", "read", {"path": "a.txt"}),
+                ToolCall("read-a", "read", {"path": "a.txt"}),
+                ToolCall("read-b", "read", {"path": "b.txt"}),
             )
         )
-    )
+
+    batch = asyncio.run(execute_batch())
 
     assert batch.mode == "parallel"
-    assert set(batch.completion_order) == {"a", "b"}
-    assert tuple(result.call_id for result in batch.results) == ("b", "a")
+    assert batch.completion_order == ("read-b", "read-a")
+    assert tuple(result.call_id for result in batch.results) == ("read-a", "read-b")
     assert tuple(result.output for result in batch.results) == (
-        {"content": "B"},
         {"content": "A"},
+        {"content": "B"},
     )
 
 
