@@ -72,6 +72,7 @@ class CompactionStrategy:
 class CompactionMetrics:
     characters_before: int = 0
     characters_after: int = 0
+    final_characters: int | None = None
     covered_count: int = 0
     retained_count: int = 0
     compaction_depth: int = 0
@@ -83,6 +84,9 @@ class CompactionMetrics:
         return {
             "characters_before": self.characters_before,
             "characters_after": self.characters_after,
+            "final_characters": (
+                self.characters_after if self.final_characters is None else self.final_characters
+            ),
             "covered_count": self.covered_count,
             "retained_count": self.retained_count,
             "compaction_depth": self.compaction_depth,
@@ -293,15 +297,23 @@ def _decode_metrics(
         raise CompactionContractError("has invalid metrics")
     characters_before = cast(int, value["characters_before"])
     characters_after = cast(int, value["characters_after"])
+    final_characters_value = value.get("final_characters", characters_after)
     trigger = value.get("trigger")
     thrashing = value.get("thrashing_detected")
+    expected_thrashing = expected_depth > 1 and characters_before - characters_after < max(
+        32, characters_before // 20
+    )
     if (
         characters_after > characters_before
+        or type(final_characters_value) is not int
+        or final_characters_value < 0
+        or final_characters_value > characters_before
         or value.get("covered_count") != covered_count
         or value.get("retained_count") != retained_count
         or value.get("compaction_depth") != expected_depth
         or trigger not in {"automatic", "manual"}
-        or thrashing is not False
+        or type(thrashing) is not bool
+        or thrashing is not expected_thrashing
     ):
         raise CompactionContractError("has invalid lifecycle metrics")
     usage_value = value.get("summary_usage")
@@ -319,12 +331,13 @@ def _decode_metrics(
     return CompactionMetrics(
         characters_before=characters_before,
         characters_after=characters_after,
+        final_characters=final_characters_value,
         covered_count=covered_count,
         retained_count=retained_count,
         compaction_depth=expected_depth,
         summary_usage=usage,
         trigger=cast(Literal["automatic", "manual"], trigger),
-        thrashing_detected=False,
+        thrashing_detected=thrashing,
     )
 
 

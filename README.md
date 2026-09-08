@@ -144,6 +144,16 @@ handler；没有目录扫描、entry point、自动发现或热重载。Hook 只
 Extension Tool 继续使用既有 `ToolRuntime` 的 schema、调度、取消与 structured
 `ToolResult` 路径；custom entry 继续使用 append-only Session/Store 路径。
 
+当前 system prompt、Tool guideline 与 project context 都从 `ContextSettings` 在每次
+请求重新投影，active Tool schema 则从当前 Tool runtime/Extension registry 重新投影；
+额外的 runtime/Extension authority 以带 source、resource ID 与 revision 的
+`ContextResource` 表示。Extension 必须在 `CONTEXT_RESOURCE` Hook 提供这类资源，使其
+在 conversation budget 分配和 Compaction 前可见；后置
+`context`/`provider_request` Hook 不能替换当前权威资源。
+为兼容在新增 `resources` 字段前就存在、通过构造新 `ModelContext` 或
+`ProviderRequest` 返回结果的 Extension，空资源元组按“未携带该新字段”处理并恢复
+canonical resources；任何非空替换仍会被拒绝。
+
 ### 同步 callout 与线程契约
 
 Extension 的 `register()`、Hook handler 和 custom `SessionEntry` validator 都是同步
@@ -216,12 +226,16 @@ Session 是持久、权威的树；Agent Run 是一次活跃执行；Active Bran
 本实现借鉴 Pi 的 tree 与确定性投影语义，但使用独立 Python 文件格式，并通过
 双 SessionStore seam 强化恢复性与可测性。
 
-## 确定性 Model Context 与 Compaction
+## Model Context 与语义 Compaction
 
 每次 Provider 调用都经过唯一的 Context pipeline，固定按 system prompt、active
 Tool 描述/guideline、项目资源、Active Branch 投影、当前 injected messages 和
 ProviderRequest conversion 组装。`ModelContext` 是不可变值，不持有完整 Session
 或 mutable queue。sibling branch 与尚未注入的 pending message 不进入请求。
+
+`ContextPipeline.build()` 是异步 API；从旧同步 pipeline 迁移的直接调用方必须
+`await pipeline.build(...)`。这是生产 Compaction 通过现有异步 `ModelProvider`
+生成语义 checkpoint 所必需的调用约定变化，`AgentKernel` 与 CLI 已封装该迁移。
 
 运行成功与确定性摘要失败场景：
 
@@ -233,14 +247,25 @@ python -m coding_agent demo context-compaction --case summary-error
 成功场景展示 compaction 前后以 canonical JSON characters 计量的预算（不是精确
 token 数）、持久化 checkpoint、`compaction_succeeded` 事件、两条 sibling
 branches、pending/injected 排除与包含证据，以及仍保留的原始 entries。Active
-Branch 使用最近有效 checkpoint 的 summary 加 checkpoint 后 entries；checkpoint
-记录版本、覆盖范围和 summary，不删除旧历史。
+Branch 使用最近有效 checkpoint 的 summary 加 retained recent turns；checkpoint
+记录 v2 summary schema、累计 coverage、first-kept boundary、lineage、typed evidence、
+strategy 和 metrics，不删除旧历史。重复压缩只输入 previous checkpoint state 与新增
+covered span。若真实摘要的 JSON 编码使初选 retained window 超预算，pipeline 会按完整
+turn 缩小窗口并重新生成摘要；Provider usage 按所有尝试累计。
+
+`characters_before` 与 `characters_after` 是 canonical pipeline 在 Compaction 前后的
+同阶段估计；`final_characters` 是所有 Context/ProviderRequest Hook 完成后的实际请求
+估计。低收益但已经 bounded 的重复压缩会持久化 `thrashing_detected=true` 并继续当前
+Run；只有仍超预算且没有新 span 可压缩时才产生 `compaction_thrashing` 失败。当前公开
+入口只产生 `trigger=automatic`，wire contract 为未来 Host-driven manual trigger 保留
+`manual` 值，但 #33 不增加 manual CLI。
 
 失败场景在 Provider 调用前发出结构化 `compaction_failed`，退出码为 1；它不写入
 无效 checkpoint、不删除或改写原始 entries，也不会降级到第二套 builder。Session
-仍可关闭、恢复和导航。这里借鉴 Pi 的确定性投影与 compaction 语义，简化
-provider-specific prompt 优化，并深化为可观察的 Python Context seam。长期记忆、
-向量检索与 Extension registration 仍不在本能力内。
+仍可关闭、恢复和导航。retained recent entries 直接以原始 message 进入最终
+ProviderRequest，默认 semantic summary prompt 不重复发送这些内容。这里借鉴 Pi 的
+确定性投影与 compaction 语义，简化 provider-specific prompt 优化，并深化为可观察的
+Python Context seam。长期记忆与向量检索仍不在本能力内。
 
 ## 控制进行中的 Agent Run
 
@@ -293,6 +318,16 @@ and Hook handlers only. Every transform or supplement is revalidated before the 
 handler, custom Tools remain inside ToolRuntime, and custom entries remain inside the
 append-only Session/Store path. `ExtensionEvent` is drained independently from the
 Kernel and is never inserted into the public AgentSessionEvent stream.
+
+The system prompt, Tool guidelines, and project context are rebuilt from
+`ContextSettings` on every request, while active Tool schemas are re-projected from
+the current Tool runtime and Extension registry. Additional runtime and Extension
+authority is represented by source-identified, revisioned `ContextResource` values.
+Extensions add such authority through the pre-budget `CONTEXT_RESOURCE` Hook; later
+Context and Provider-request Hooks cannot replace it. For compatibility with
+Extensions written before the `resources` field, an empty tuple on a reconstructed
+value is treated as omission and the canonical resources are restored, while any
+non-empty replacement is rejected.
 
 Run `python -m coding_agent demo extensions`, then use `--case ordering` and
 `--case invalid-mutation` to inspect successful capability use, deterministic
@@ -428,16 +463,26 @@ semantics, uses an independent Python persistence format, and deepens
 recoverability and testability through matching in-memory and JSONL store
 seams.
 
-## Deterministic Model Context and Compaction
+## Model Context and semantic Compaction
 
 `python -m coding_agent demo context-compaction` shows the single Context
-pipeline, a character-count budget, a persisted versioned checkpoint, two
+pipeline, a character-count budget, a persisted v2 semantic checkpoint, two
 sibling branches, pending-message exclusion, explicit injection, and preserved
 raw history. The final Fake Provider request contains only the bounded Active
 Branch projection. The `--case summary-error` case fails before the Provider,
 emits a structured compaction failure, writes no invalid checkpoint, and leaves
 the Session resumable. The estimator counts canonical JSON characters and does
 not claim tokenizer-exact token counts.
+
+`ContextPipeline.build()` is asynchronous; direct callers migrating from the
+former synchronous pipeline must use `await pipeline.build(...)`. Repeated
+compaction retains complete recent turns and retries with a smaller turn window
+when the real JSON-encoded summary does not fit. `characters_before` and
+`characters_after` compare the canonical pipeline before and after compaction;
+`final_characters` records the validated request after all Context and
+Provider-request Hooks. A bounded low-reduction checkpoint records
+`thrashing_detected=true` and continues; `compaction_thrashing` is reserved for
+an over-budget Context with no new span to compact.
 
 ## Controlling an active Agent Run
 

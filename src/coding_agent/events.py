@@ -870,11 +870,12 @@ class AgentSessionEvent:
         error: AgentError,
         *,
         stage: str,
+        compaction_started: bool = False,
         run_id: str | None = None,
     ) -> AgentSessionEvent:
         kind = (
             AgentSessionEventKind.COMPACTION_FAILED
-            if stage == "compaction"
+            if compaction_started or stage == "compaction"
             else AgentSessionEventKind.CONTEXT_FAILED
         )
         return cls(

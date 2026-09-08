@@ -226,6 +226,7 @@ strategy:
 metrics:
   characters_before: int
   characters_after: int
+  final_characters: int
   covered_count: int
   retained_count: int
   compaction_depth: int
@@ -245,6 +246,11 @@ metrics:
 - checkpoint、最终 Model Context 和持久化 payload 使用同一份已验证 plan；
 - 预算、schema、coverage 或 Extension transform 失败时不写入部分 checkpoint。
 
+`characters_before` 与 `characters_after` 分别记录 canonical pipeline 在压缩前、压缩后且
+后置 Context/ProviderRequest Hook 之前的同口径字符估计；`final_characters` 记录所有 Hook
+完成后的最终 ProviderRequest 估计。这样既能检查 Compaction 自身收益，也不会把最终请求
+大小伪装成同阶段值。
+
 ## 7. 重复压缩与过时事实
 
 第二次及后续压缩只输入：
@@ -261,7 +267,13 @@ metrics:
 - 已完成 next step 不继续作为下一步；
 - 当前文件、symbol、错误与测试结果优先采用新证据；
 - 不复制 `summary:` wrapper；
-- 连续压缩后若 context size 没有显著下降，报告 compaction thrashing 并停止自动重试。
+- 连续压缩后若 context size 没有显著下降但结果已经 bounded，checkpoint 记录
+  `thrashing_detected=true` 并继续当前 Run，不再为本次请求自动重试 Compaction；只有结果
+  仍超预算且没有新的 conversation span 可压缩时，才报告 `compaction_thrashing` 并失败。
+
+retained recent entries 直接以原始 message 出现在最终 ProviderRequest。默认语义摘要请求不
+重复发送它们，避免摘要与近期原文重叠；CompactionInput 保留该边界，供验证和自定义 engine
+检查 cut point。
 
 Durable Session 可以保留 checkpoint lineage，但 Provider request 只看最新 checkpoint 和相应近期 raw span。
 
@@ -302,6 +314,9 @@ Host 和 artifact 至少可以检查：
 - start/succeeded/failed；
 - failure code/stage；
 - 是否触发 thrashing guard。
+
+当前 #33 实现的公开入口只产生 `trigger=automatic`。v2 wire contract 接受 `manual`，用于未来
+Host 驱动的显式压缩入口；本 Ticket 不新增 manual CLI 或 Run control。
 
 敏感 prompt、Provider credential 和不必要的完整 Tool output 不进入公开事件或 artifact。
 
@@ -355,6 +370,11 @@ Fake Provider、pytest、strict typing、lint、format、replay fixtures 和 CLI
 8. 完成确定性测试、全量质量门禁和安装后 CLI 验收。
 9. 由 Git custody 发布、审阅并合并实现 PR；PR 使用 `Relates to #33`，不自动关闭 Issue。
 10. 从 exact merged main 完成两个额外 Verified 实例的真实 post-merge 验收，再决定关闭 #33。
+
+实现中的 retained-window 初选只是调用摘要 Provider 前的预算估计。真实语义摘要完成后必须用
+canonical JSON character estimator 重新验证；若因转义成本而超预算，按完整 turn 缩小 retained
+window、把新覆盖的 turn 纳入下一次摘要并累计 Provider usage，直到形成 bounded 请求或确认连
+零 retained turn 也无法满足预算。
 
 ## 13. 非目标
 

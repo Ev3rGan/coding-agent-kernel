@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from functools import partial
 from itertools import count
-from typing import Literal, TypeVar, cast
+from typing import Literal
 
 from coding_agent.callout import dispose_awaitable
 from coding_agent.compaction import CompactionPlan
@@ -71,6 +71,9 @@ from coding_agent.provider import (
     ProviderRequest,
     ToolResultMessage,
     UserMessage,
+    isolated_provider_close,
+    isolated_provider_events,
+    isolated_provider_factory,
 )
 from coding_agent.run import AgentRun
 from coding_agent.session import Session, SessionEntry, SessionRelationError, SessionStore
@@ -79,82 +82,6 @@ from coding_agent.tool_runtime import ToolRuntime
 
 async def _put_progress(queue: asyncio.Queue[ToolProgress], progress: ToolProgress) -> None:
     await queue.put(progress)
-
-
-class _ProviderOwnedCancellationError(RuntimeError):
-    pass
-
-
-T = TypeVar("T")
-
-
-async def _isolated_provider_operation(
-    operation: Callable[[], Awaitable[T]],
-    *,
-    cancellation_message: str,
-) -> T:
-    """Run one Provider-owned awaitable in a child task on the authoritative loop."""
-
-    async def invoke() -> T:
-        return await operation()
-
-    worker = asyncio.create_task(invoke())
-    try:
-        return await worker
-    except asyncio.CancelledError as exc:
-        current = asyncio.current_task()
-        if current is not None and current.cancelling():
-            raise
-        raise _ProviderOwnedCancellationError(cancellation_message) from exc
-    finally:
-        if not worker.done():
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
-
-
-async def _isolated_provider_events(
-    stream: AsyncIterator[object],
-) -> AsyncIterator[object]:
-    """Keep Provider-owned task cancellation distinct from Host Run cancellation."""
-
-    while True:
-
-        async def read_one() -> object:
-            return await anext(stream)
-
-        try:
-            yield await _isolated_provider_operation(
-                read_one,
-                cancellation_message="Provider cancelled its own stream task",
-            )
-        except StopAsyncIteration:
-            return
-
-
-async def _isolated_provider_close(close: Callable[[], object]) -> None:
-    async def close_one() -> None:
-        result = close()
-        if not inspect.isawaitable(result):
-            raise TypeError("Provider stream aclose must be awaitable")
-        await cast(Awaitable[object], result)
-
-    await _isolated_provider_operation(
-        close_one,
-        cancellation_message="Provider cancelled its own cleanup task",
-    )
-
-
-async def _isolated_provider_factory(
-    provider: ModelProvider,
-    request: ProviderRequest,
-) -> object:
-    async def create_provider_stream() -> object:
-        return provider.stream(request)
-
-    return await _isolated_provider_operation(
-        create_provider_stream,
-        cancellation_message="Provider stream factory attempted cancellation",
-    )
 
 
 def _provider_failure_events(
@@ -576,7 +503,7 @@ class AgentKernel:
                 transformed_by: list[str] = []
                 tool_transformers: dict[int, list[str]] = {}
                 try:
-                    provider_stream_candidate = await _isolated_provider_factory(
+                    provider_stream_candidate = await isolated_provider_factory(
                         self._provider,
                         copy.deepcopy(authoritative_request),
                     )
@@ -588,7 +515,7 @@ class AgentKernel:
                     provider_stream = provider_stream_candidate
                     close_provider_stream = getattr(provider_stream, "aclose", None)
                     try:
-                        async for raw_provider_event in _isolated_provider_events(provider_stream):
+                        async for raw_provider_event in isolated_provider_events(provider_stream):
                             # Validate the provider's own stream independently so a
                             # later raw fault is never attributed to an earlier,
                             # harmless Extension transform.
@@ -662,7 +589,7 @@ class AgentKernel:
                     except BaseException:
                         if callable(close_provider_stream):
                             try:
-                                await _isolated_provider_close(close_provider_stream)
+                                await isolated_provider_close(close_provider_stream)
                             except BaseException as close_error:
                                 self._extension_runtime.record_provider_cleanup_failure(close_error)
                                 # Preserve the authoritative dispatch/cancel failure.
@@ -671,7 +598,7 @@ class AgentKernel:
                     else:
                         if callable(close_provider_stream):
                             try:
-                                await _isolated_provider_close(close_provider_stream)
+                                await isolated_provider_close(close_provider_stream)
                             except BaseException as close_error:
                                 self._extension_runtime.record_provider_cleanup_failure(close_error)
                                 if failure is None:
@@ -1060,21 +987,22 @@ class AgentKernel:
                 str(exc),
                 stage="context",
             ) from exc
-        result = await self._context_pipeline.build(
-            ContextInput(
-                settings=self._context_settings,
-                active_branch=(
-                    ()
-                    if self._session is None
-                    else self._session.active_branch
-                    if active_branch is None
-                    else active_branch
-                ),
-                active_tools=self._tool_schemas(),
-                authoritative_resources=authoritative_resources,
-                injected_messages=injected_messages,
-                pending_messages=pending_messages,
+        context_input = ContextInput(
+            settings=self._context_settings,
+            active_branch=(
+                ()
+                if self._session is None
+                else self._session.active_branch
+                if active_branch is None
+                else active_branch
             ),
+            active_tools=self._tool_schemas(),
+            authoritative_resources=authoritative_resources,
+            injected_messages=injected_messages,
+            pending_messages=pending_messages,
+        )
+        result = await self._context_pipeline.build(
+            context_input,
             on_compaction_start=(
                 None
                 if session is None
@@ -1083,6 +1011,8 @@ class AgentKernel:
         )
         context = result.context
         compaction = None
+        canonical_compaction_messages: tuple[ModelMessage, ...] | None = None
+        canonical_covered_messages: tuple[ModelMessage, ...] = ()
         if result.compaction is not None:
             if self._session is None:  # pragma: no cover - no branch can produce a plan
                 raise RuntimeError("Compaction requires a durable Session.")
@@ -1106,7 +1036,13 @@ class AgentKernel:
                     str(exc),
                     stage="compaction",
                 ) from exc
-            context = self._context_with_compaction(context, compaction)
+            reprojected = self._context_pipeline.reproject_compaction(context_input, compaction)
+            if reprojected.compaction is None:  # pragma: no cover - construction invariant
+                raise RuntimeError("Compaction reprojection returned no validated plan.")
+            context = reprojected.context
+            compaction = reprojected.compaction
+            canonical_compaction_messages = context.provider_request.messages
+            canonical_covered_messages = reprojected.covered_messages
         try:
             context = self._extension_runtime.transform_context(context)
         except ExtensionBlockedError as exc:
@@ -1149,7 +1085,7 @@ class AgentKernel:
                 compaction,
                 metrics=replace(
                     compaction.metrics,
-                    characters_after=context.estimated_characters,
+                    final_characters=context.estimated_characters,
                 ),
             )
             try:
@@ -1160,61 +1096,41 @@ class AgentKernel:
                     f"Final Context does not match the validated compaction plan: {exc}",
                     stage="context",
                 ) from exc
-            self._validate_compaction_projection(context, compaction)
+            if canonical_compaction_messages is None:  # pragma: no cover - construction invariant
+                raise RuntimeError("Compaction projection has no canonical message snapshot.")
+            self._validate_compaction_projection(
+                context,
+                compaction,
+                canonical_messages=canonical_compaction_messages,
+                covered_messages=canonical_covered_messages,
+            )
         if compaction is not None:
             self._require_session().record_compaction(compaction, run_id=run_id)
         self._model_contexts.append(context)
         return context.provider_request
 
     @staticmethod
-    def _context_with_compaction(
-        context: ModelContext,
-        compaction: CompactionPlan,
-    ) -> ModelContext:
-        request = context.provider_request
-        if not request.messages or not isinstance(request.messages[0], BranchSummaryMessage):
-            raise ContextConstructionError(
-                "extension_compaction_rejected",
-                "Compaction transform has no canonical summary message to replace.",
-                stage="compaction",
-            )
-        transformed_request = ProviderRequest(
-            messages=(BranchSummaryMessage(text=compaction.summary), *request.messages[1:]),
-            tools=request.tools,
-            system_prompt=request.system_prompt,
-            tool_guidelines=request.tool_guidelines,
-            project_context=request.project_context,
-            resources=request.resources,
-        )
-        estimated = estimate_provider_request_characters(transformed_request)
-        if estimated > context.max_characters:
-            raise ContextConstructionError(
-                "extension_compaction_rejected",
-                "Transformed compaction summary exceeds the canonical Context budget.",
-                stage="compaction",
-            )
-        return ModelContext(
-            provider_request=transformed_request,
-            estimated_characters=estimated,
-            max_characters=context.max_characters,
-            assembly_order=context.assembly_order,
-        )
-
-    @staticmethod
     def _validate_compaction_projection(
         context: ModelContext,
         compaction: CompactionPlan,
+        *,
+        canonical_messages: tuple[ModelMessage, ...],
+        covered_messages: tuple[ModelMessage, ...],
     ) -> None:
         messages = context.provider_request.messages
+        supplemental_messages = messages[len(canonical_messages) :]
         if (
-            not messages
+            len(messages) < len(canonical_messages)
             or not isinstance(messages[0], BranchSummaryMessage)
             or messages[0].text != compaction.summary
+            or messages[: len(canonical_messages)] != canonical_messages
+            or sum(isinstance(message, BranchSummaryMessage) for message in messages) != 1
+            or any(message in covered_messages for message in supplemental_messages)
         ):
             raise ContextConstructionError(
                 "extension_context_rejected",
-                "Context and Provider request handlers must preserve the validated checkpoint "
-                "summary projection.",
+                "Context and Provider request handlers must preserve the canonical checkpoint "
+                "message projection without restoring covered raw history.",
                 stage="context",
             )
 

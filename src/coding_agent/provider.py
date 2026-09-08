@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable, Sequence
+import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 from coding_agent.events import (
     AssistantMessage,
@@ -77,6 +78,86 @@ class ModelProvider(Protocol):
     def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         """Stream one scripted or model-backed response."""
         ...
+
+
+class ProviderOwnedCancellationError(RuntimeError):
+    """A Provider cancelled its child task rather than the authoritative Host task."""
+
+
+T = TypeVar("T")
+
+
+async def isolated_provider_operation(
+    operation: Callable[[], Awaitable[T]],
+    *,
+    cancellation_message: str,
+) -> T:
+    """Run one Provider-owned awaitable without adopting Provider-owned cancellation."""
+
+    async def invoke() -> T:
+        return await operation()
+
+    worker = asyncio.create_task(invoke())
+    try:
+        return await worker
+    except asyncio.CancelledError as exc:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        raise ProviderOwnedCancellationError(cancellation_message) from exc
+    finally:
+        if not worker.done():
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+
+async def isolated_provider_events(
+    stream: AsyncIterator[object],
+) -> AsyncIterator[object]:
+    """Read Provider events in child tasks while preserving Host cancellation."""
+
+    while True:
+
+        async def read_one() -> object:
+            return await anext(stream)
+
+        try:
+            yield await isolated_provider_operation(
+                read_one,
+                cancellation_message="Provider cancelled its own stream task",
+            )
+        except StopAsyncIteration:
+            return
+
+
+async def isolated_provider_close(close: Callable[[], object]) -> None:
+    """Close a Provider stream without adopting cleanup cancellation."""
+
+    async def close_one() -> None:
+        result = close()
+        if not inspect.isawaitable(result):
+            raise TypeError("Provider stream aclose must be awaitable")
+        await cast(Awaitable[object], result)
+
+    await isolated_provider_operation(
+        close_one,
+        cancellation_message="Provider cancelled its own cleanup task",
+    )
+
+
+async def isolated_provider_factory(
+    provider: ModelProvider,
+    request: ProviderRequest,
+) -> object:
+    """Call a Provider stream factory in a cancellation-isolated child task."""
+
+    async def create_provider_stream() -> object:
+        return provider.stream(request)
+
+    return await isolated_provider_operation(
+        create_provider_stream,
+        cancellation_message="Provider stream factory attempted cancellation",
+    )
 
 
 class FakeProvider:

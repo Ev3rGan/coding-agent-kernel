@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from typing import Final, Literal, Protocol, cast
 
+from coding_agent.callout import dispose_awaitable
 from coding_agent.compaction import (
     COMPACTION_SUMMARY_HEADINGS,
     CompactionCheckpoint,
@@ -48,6 +49,9 @@ from coding_agent.provider import (
     ProviderRequest,
     ToolResultMessage,
     UserMessage,
+    isolated_provider_close,
+    isolated_provider_events,
+    isolated_provider_factory,
 )
 from coding_agent.session import SessionEntry
 
@@ -130,6 +134,7 @@ class ModelContext:
 class ContextBuildResult:
     context: ModelContext
     compaction: CompactionPlan | None = None
+    covered_messages: tuple[ModelMessage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,11 +234,17 @@ class ProviderCompactionEngine:
         usage: TokenUsage | None = None
         done = False
         try:
-            stream = self.provider.stream(request)
+            stream_candidate = await isolated_provider_factory(self.provider, request)
+            if inspect.isawaitable(stream_candidate):
+                dispose_awaitable(stream_candidate)
+                raise TypeError("Provider.stream must return an async iterator")
+            if not isinstance(stream_candidate, AsyncIterator):
+                raise TypeError("Provider.stream must return an async iterator")
+            stream = stream_candidate
             close_stream = getattr(stream, "aclose", None)
             primary_error: BaseException | None = None
             try:
-                async for raw_event in stream:
+                async for raw_event in isolated_provider_events(stream):
                     event = validate_provider_stream_event(raw_event)
                     if isinstance(event, ProviderTextDelta):
                         text_parts.append(event.delta)
@@ -268,10 +279,7 @@ class ProviderCompactionEngine:
             finally:
                 if callable(close_stream):
                     try:
-                        close_result = close_stream()
-                        if not inspect.isawaitable(close_result):
-                            raise TypeError("Compaction Provider stream aclose must be awaitable")
-                        await close_result
+                        await isolated_provider_close(close_stream)
                     except BaseException:
                         if primary_error is None:
                             raise
@@ -585,63 +593,86 @@ class ContextPipeline:
             max(256, context_input.settings.max_characters // 2),
         )
         turns = _conversation_turns(uncovered)
-        retained, retained_messages = self._select_retained_turns(
+        retained = self._select_retained_turns(
             context_input,
             turns,
             summary_budget=summary_budget,
         )
-        retained_ids = {entry.entry_id for entry in retained}
-        newly_covered = tuple(entry for entry in uncovered if entry.entry_id not in retained_ids)
-        if not newly_covered:
+        if len(retained) == len(uncovered):
             raise ContextConstructionError(
                 "context_budget_exceeded",
                 "Model Context exceeds its character budget and has no safe old turn to compact.",
                 stage="context",
             )
-        _validate_safe_cut(newly_covered, retained)
-
         if on_compaction_start is not None:
             on_compaction_start()
-        compaction_input = CompactionInput(
-            previous_checkpoint=previous,
-            newly_covered_entries=newly_covered,
-            retained_recent_entries=retained,
-            authoritative_resources=(
-                *context_input.settings.authoritative_resources,
-                *context_input.authoritative_resources,
-            ),
-            max_summary_characters=summary_budget,
-        )
-        try:
-            draft = await self._engine.compact(compaction_input)
-        except ContextConstructionError:
-            raise
-        except Exception as exc:
-            raise ContextConstructionError(
-                "compaction_summary_failed",
-                f"Compaction summary failed: {type(exc).__name__}: {exc}",
-                stage="compaction",
-            ) from exc
-        _validate_summary(draft.summary, summary_budget)
+        retained_turns = _conversation_turns(retained)
+        summary_usage: TokenUsage | None = None
+        while True:
+            retained = tuple(entry for turn in retained_turns for entry in turn)
+            retained_ids = {entry.entry_id for entry in retained}
+            newly_covered = tuple(
+                entry for entry in uncovered if entry.entry_id not in retained_ids
+            )
+            if not newly_covered:
+                raise ContextConstructionError(
+                    "context_budget_exceeded",
+                    "Model Context exceeds its character budget and has no safe old turn "
+                    "to compact.",
+                    stage="context",
+                )
+            _validate_safe_cut(newly_covered, retained)
+            compaction_input = CompactionInput(
+                previous_checkpoint=previous,
+                newly_covered_entries=newly_covered,
+                retained_recent_entries=retained,
+                authoritative_resources=(
+                    *context_input.settings.authoritative_resources,
+                    *context_input.authoritative_resources,
+                ),
+                max_summary_characters=summary_budget,
+            )
+            try:
+                draft = await self._engine.compact(compaction_input)
+            except ContextConstructionError:
+                raise
+            except Exception as exc:
+                raise ContextConstructionError(
+                    "compaction_summary_failed",
+                    f"Compaction summary failed: {type(exc).__name__}: {exc}",
+                    stage="compaction",
+                ) from exc
+            _validate_summary(draft.summary, summary_budget)
+            summary_usage = _add_token_usage(summary_usage, draft.usage)
 
-        compacted_request = self._request(
-            context_input,
-            (BranchSummaryMessage(text=draft.summary), *retained_messages),
-        )
-        characters_after = estimate_provider_request_characters(compacted_request)
-        if characters_after > context_input.settings.max_characters:
-            raise ContextConstructionError(
-                "context_budget_exceeded",
-                "Compacted Model Context still exceeds its character budget.",
-                stage="context",
-            )
+            compacted_request: ProviderRequest | None = None
+            characters_after = 0
+            for shed_tool_outputs in (False, True):
+                retained_messages = _project_entries(
+                    retained,
+                    shed_tool_outputs=shed_tool_outputs,
+                )
+                candidate_request = self._request(
+                    context_input,
+                    (BranchSummaryMessage(text=draft.summary), *retained_messages),
+                )
+                candidate_characters = estimate_provider_request_characters(candidate_request)
+                if candidate_characters <= context_input.settings.max_characters:
+                    compacted_request = candidate_request
+                    characters_after = candidate_characters
+                    break
+            if compacted_request is not None:
+                break
+            if not retained_turns:
+                raise ContextConstructionError(
+                    "context_budget_exceeded",
+                    "Compacted Model Context still exceeds its character budget.",
+                    stage="context",
+                )
+            retained_turns = retained_turns[1:]
+
         reduction = characters_before - characters_after
-        if previous is not None and reduction < max(32, characters_before // 20):
-            raise ContextConstructionError(
-                "compaction_thrashing",
-                "Repeated compaction did not reduce Context size enough to make progress.",
-                stage="compaction",
-            )
+        thrashing_detected = previous is not None and reduction < max(32, characters_before // 20)
 
         coverage = (*previous_coverage, *(entry.entry_id for entry in newly_covered))
         evidence = _merge_evidence(
@@ -659,10 +690,12 @@ class ContextPipeline:
             metrics=CompactionMetrics(
                 characters_before=characters_before,
                 characters_after=characters_after,
+                final_characters=characters_after,
                 covered_count=len(coverage),
                 retained_count=len(retained),
                 compaction_depth=depth,
-                summary_usage=draft.usage,
+                summary_usage=summary_usage,
+                thrashing_detected=thrashing_detected,
             ),
         )
         return ContextBuildResult(
@@ -672,6 +705,68 @@ class ContextPipeline:
                 max_characters=context_input.settings.max_characters,
             ),
             plan,
+            _project_entries(
+                tuple(entry for entry in context_input.active_branch if entry.entry_id in coverage)
+            ),
+        )
+
+    def reproject_compaction(
+        self,
+        context_input: ContextInput,
+        plan: CompactionPlan,
+    ) -> ContextBuildResult:
+        """Rebuild the canonical request from one Session-validated final plan."""
+
+        conversation_entries = tuple(
+            entry for entry in context_input.active_branch if entry.kind == "message"
+        )
+        covered_count = len(plan.covered_entry_ids)
+        covered_entries = conversation_entries[:covered_count]
+        retained_entries = conversation_entries[covered_count:]
+        projected_request: ProviderRequest | None = None
+        characters_after = 0
+        for shed_tool_outputs in (False, True):
+            retained_messages = _project_entries(
+                retained_entries,
+                shed_tool_outputs=shed_tool_outputs,
+            )
+            candidate_request = self._request(
+                context_input,
+                (BranchSummaryMessage(text=plan.summary), *retained_messages),
+            )
+            candidate_characters = estimate_provider_request_characters(candidate_request)
+            if candidate_characters <= context_input.settings.max_characters:
+                projected_request = candidate_request
+                characters_after = candidate_characters
+                break
+        if projected_request is None:
+            raise ContextConstructionError(
+                "extension_compaction_rejected",
+                "Transformed compaction plan exceeds the canonical Context budget.",
+                stage="compaction",
+            )
+
+        metrics = replace(
+            plan.metrics,
+            characters_after=characters_after,
+            final_characters=characters_after,
+            covered_count=covered_count,
+            retained_count=len(retained_entries),
+            thrashing_detected=(
+                plan.metrics.compaction_depth > 1
+                and plan.metrics.characters_before - characters_after
+                < max(32, plan.metrics.characters_before // 20)
+            ),
+        )
+        reprojected_plan = replace(plan, metrics=metrics)
+        return ContextBuildResult(
+            ModelContext(
+                provider_request=projected_request,
+                estimated_characters=characters_after,
+                max_characters=context_input.settings.max_characters,
+            ),
+            reprojected_plan,
+            _project_entries(covered_entries),
         )
 
     @staticmethod
@@ -697,12 +792,11 @@ class ContextPipeline:
         turns: tuple[tuple[SessionEntry, ...], ...],
         *,
         summary_budget: int,
-    ) -> tuple[tuple[SessionEntry, ...], tuple[ModelMessage, ...]]:
+    ) -> tuple[SessionEntry, ...]:
         if not turns:
-            return (), ()
+            return ()
         summary_placeholder = BranchSummaryMessage(text="x" * summary_budget)
         selected: tuple[tuple[SessionEntry, ...], ...] = ()
-        selected_messages: tuple[ModelMessage, ...] = ()
         for turn in reversed(turns):
             candidate_turns = (turn, *selected)
             candidate_entries = tuple(entry for group in candidate_turns for entry in group)
@@ -715,7 +809,6 @@ class ContextPipeline:
                 context_input.settings.max_characters
             ):
                 selected = candidate_turns
-                selected_messages = messages
                 continue
             shed_messages = _project_entries(candidate_entries, shed_tool_outputs=True)
             shed_request = ContextPipeline._request(
@@ -726,11 +819,9 @@ class ContextPipeline:
                 context_input.settings.max_characters
             ):
                 selected = candidate_turns
-                selected_messages = shed_messages
                 continue
             break
-        entries = tuple(entry for turn in selected for entry in turn)
-        return entries, selected_messages
+        return tuple(entry for turn in selected for entry in turn)
 
     @staticmethod
     def _project_active_branch(
@@ -1046,6 +1137,20 @@ def _validate_summary(summary: str, max_characters: int) -> None:
             f"Compaction summary {exc}.",
             stage="compaction",
         ) from exc
+
+
+def _add_token_usage(
+    accumulated: TokenUsage | None,
+    current: TokenUsage | None,
+) -> TokenUsage | None:
+    if current is None:
+        return accumulated
+    if accumulated is None:
+        return current
+    return TokenUsage(
+        input_tokens=accumulated.input_tokens + current.input_tokens,
+        output_tokens=accumulated.output_tokens + current.output_tokens,
+    )
 
 
 def _extract_evidence(entries: tuple[SessionEntry, ...]) -> CompactionEvidence:

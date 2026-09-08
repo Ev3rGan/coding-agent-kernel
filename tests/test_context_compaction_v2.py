@@ -20,6 +20,8 @@ from coding_agent import (
     CompactionDraft,
     CompactionHookInput,
     CompactionInput,
+    CompactionMetrics,
+    CompactionPlan,
     ContextHookInput,
     ContextInput,
     ContextPipeline,
@@ -112,6 +114,23 @@ class _ClosableSummaryProvider:
         return stream
 
 
+class _SelfCancellingSummaryProvider:
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
+    def stream(self, request):  # type: ignore[no-untyped-def]
+        self.requests.append(request)
+
+        async def events() -> AsyncIterator[object]:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+            yield ProviderDone()  # pragma: no cover - self-cancellation must win
+
+        return events()
+
+
 class _SkillResourceExtension:
     name = "skill-resource"
 
@@ -178,7 +197,12 @@ class _CompactedContextSupplementExtension:
 
     def _supplement(self, hook_input: ContextHookInput) -> Supplement[ContextSupplement]:
         del hook_input
-        return Supplement(ContextSupplement(project_context=("CURRENT_PROJECT_STATE",)))
+        return Supplement(
+            ContextSupplement(
+                messages=(UserMessage(text="CURRENT_EXTENSION_ANNOTATION"),),
+                project_context=("CURRENT_PROJECT_STATE",),
+            )
+        )
 
 
 class _BlockProviderRequestExtension:
@@ -208,6 +232,24 @@ class _RewriteCheckpointSummaryExtension:
                     request,
                     messages=(BranchSummaryMessage(text="forged summary"), *request.messages[1:]),
                 ),
+            )
+        )
+
+
+class _AppendCompactionMessageExtension:
+    name = "append-compaction-message"
+
+    def __init__(self, message: BranchSummaryMessage | UserMessage) -> None:
+        self._message = message
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.PROVIDER_REQUEST, self._append)
+
+    def _append(self, hook_input: ProviderRequestHookInput) -> Transform[object]:
+        return Transform(
+            replace(
+                hook_input.request,
+                messages=(*hook_input.request.messages, self._message),
             )
         )
 
@@ -256,6 +298,29 @@ class _SplitToolTransactionExtension:
                     hook_input.plan.metrics,
                     covered_count=2,
                     retained_count=2,
+                ),
+            )
+        )
+
+
+class _ExpandCompactionCoverageExtension:
+    name = "expand-compaction-coverage"
+
+    def register(self, registry: ExtensionRegistry) -> None:
+        registry.register_hook(Hook.COMPACTION_START, self._expand)
+
+    def _expand(self, hook_input: CompactionHookInput) -> Transform[object]:
+        assert hook_input.plan is not None
+        return Transform(
+            replace(
+                hook_input.plan,
+                covered_entry_ids=("old-user", "old-answer", "recent-user", "recent-answer"),
+                summary=_summary("extension-expanded"),
+                first_kept_entry_id=None,
+                metrics=replace(
+                    hook_input.plan.metrics,
+                    covered_count=4,
+                    retained_count=0,
                 ),
             )
         )
@@ -648,6 +713,120 @@ def test_safe_cut_never_splits_tool_transaction_and_sheds_only_regenerable_outpu
     assert len(json.dumps(retained_output)) < 700
 
 
+def test_compaction_reduces_retained_window_when_json_escaped_summary_exceeds_budget() -> None:
+    session = _session_with_ids(
+        "root",
+        "old-user",
+        "old-answer",
+        "recent-1-user",
+        "recent-1-answer",
+        "recent-2-user",
+        "recent-2-answer",
+        "recent-3-user",
+        "recent-3-answer",
+    )
+    _record_turn(session, "old investigation " * 100, "old evidence " * 100)
+    _record_turn(session, "recent one " * 10, "recent result one " * 10)
+    _record_turn(session, "recent two " * 10, "recent result two " * 10)
+    _record_turn(session, "recent three " * 10, "recent result three " * 10)
+    base_summary = "\n".join(f"## {heading}\n-" for heading in _SUMMARY_HEADINGS)
+    newline_heavy_summary = base_summary + ("\n" * 180)
+    engine = _RecordingCompactionEngine((newline_heavy_summary,) * 4)
+    pipeline = ContextPipeline(engine)
+
+    built = _build(
+        pipeline,
+        ContextInput(
+            settings=ContextSettings(max_characters=1_200, max_summary_characters=500),
+            active_branch=session.active_branch,
+        ),
+    )
+
+    assert built.context.bounded is True
+    assert built.compaction is not None
+    assert built.compaction.first_kept_entry_id is None
+    assert built.compaction.metrics.retained_count == 0
+    assert len(engine.inputs) == 2
+    assert built.compaction.metrics.summary_usage == TokenUsage(34, 18)
+
+
+def test_bounded_repeated_compaction_does_not_fail_for_low_size_reduction() -> None:
+    session = _session_with_ids(
+        "root",
+        "old-user",
+        "old-answer",
+        "checkpoint",
+        "new-user",
+        "new-answer",
+        "checkpoint-2",
+    )
+    _record_turn(session, "old question", "old answer")
+    base_summary = "\n".join(f"## {heading}\n-" for heading in _SUMMARY_HEADINGS)
+    previous_summary = base_summary + ("p" * (500 - len(base_summary)))
+    session.record_compaction(
+        CompactionPlan(
+            covered_entry_ids=("old-user", "old-answer"),
+            summary=previous_summary,
+            first_kept_entry_id=None,
+            metrics=CompactionMetrics(
+                characters_before=2_000,
+                characters_after=645,
+                covered_count=2,
+                retained_count=0,
+                compaction_depth=1,
+            ),
+        )
+    )
+    _record_turn(session, "n" * 180, "r" * 180)
+    current_summary = base_summary + ("\\" * (600 - len(base_summary)))
+
+    built = _build(
+        ContextPipeline(_RecordingCompactionEngine((current_summary,))),
+        ContextInput(
+            settings=ContextSettings(max_characters=1_220, max_summary_characters=600),
+            active_branch=session.active_branch,
+        ),
+    )
+
+    assert built.context.bounded is True
+    assert built.compaction is not None
+    assert built.compaction.previous_checkpoint_id == "checkpoint"
+    assert built.compaction.metrics.characters_after <= 1_220
+    assert built.compaction.metrics.thrashing_detected is True
+    invalid = replace(
+        built.compaction,
+        metrics=replace(built.compaction.metrics, thrashing_detected=False),
+    )
+    with pytest.raises(SessionRelationError, match="lifecycle metrics"):
+        session.record_compaction(invalid)
+
+    checkpoint = session.record_compaction(built.compaction)
+    metrics = checkpoint.payload["metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["thrashing_detected"] is True
+
+
+def test_first_compaction_rejects_forged_thrashing_metric() -> None:
+    session = _session_with_ids("root", "user", "answer", "checkpoint")
+    _record_turn(session, "question", "answer")
+    plan = CompactionPlan(
+        covered_entry_ids=("user", "answer"),
+        summary=_summary("first"),
+        first_kept_entry_id=None,
+        metrics=CompactionMetrics(
+            characters_before=1_000,
+            characters_after=990,
+            covered_count=2,
+            retained_count=0,
+            compaction_depth=1,
+            thrashing_detected=True,
+        ),
+    )
+
+    with pytest.raises(SessionRelationError, match="lifecycle metrics"):
+        session.record_compaction(plan)
+
+
 def test_single_oversized_tool_turn_is_shed_without_an_empty_compaction_checkpoint() -> None:
     session = _session_with_ids("root", "user", "call", "result", "answer")
     session.record_user_message("inspect the only failing turn")
@@ -890,6 +1069,36 @@ def test_summary_provider_failure_is_observable_atomic_and_precedes_coding_turn(
     assert AgentSessionEventKind.MESSAGE_UPDATE not in kinds
 
 
+def test_summary_provider_self_cancellation_is_an_observable_compaction_failure() -> None:
+    session = _session_with_ids("root", "old-user", "old-answer")
+    _record_turn(session, "Django regression " * 100, "diagnosis " * 100)
+    original_ids = tuple(entry.entry_id for entry in session.active_branch)
+    session.drain_events()
+    provider = _SelfCancellingSummaryProvider()
+    kernel = AgentKernel(
+        provider,
+        session=session,
+        context_settings=ContextSettings(max_characters=900, max_summary_characters=500),
+    )
+
+    async def collect() -> tuple[list[AgentSessionEvent], AgentRunResult]:
+        run = kernel.create_run("continue the Django fix")
+        events = [event async for event in run]
+        return events, await run.result()
+
+    events, result = asyncio.run(collect())
+
+    assert result.state is AgentRunState.FAILED
+    assert result.error is not None
+    assert result.error.code == "compaction_provider_failed"
+    assert "Provider cancelled its own stream task" in result.error.message
+    assert len(provider.requests) == 1
+    assert tuple(entry.entry_id for entry in session.active_branch) == original_ids
+    kinds = [event.kind for event in events]
+    assert AgentSessionEventKind.COMPACTION_STARTED in kinds
+    assert AgentSessionEventKind.COMPACTION_FAILED in kinds
+
+
 def test_summary_provider_stream_is_validated_and_closed_on_failure() -> None:
     session = _session_with_ids("root", "old-user", "old-answer")
     _record_turn(session, "Django regression " * 100, "diagnosis " * 100)
@@ -972,6 +1181,49 @@ def test_extension_cannot_persist_an_unstructured_v2_summary() -> None:
     assert provider.requests == []
 
 
+def test_extension_changed_coverage_is_reprojected_from_the_final_plan() -> None:
+    session = _session_with_ids(
+        "root",
+        "old-user",
+        "old-answer",
+        "recent-user",
+        "recent-answer",
+        "checkpoint",
+        "current",
+        "answer",
+    )
+    _record_turn(session, "old question " * 100, "old answer " * 100)
+    _record_turn(session, "recent raw user", "recent raw answer")
+    provider = FakeProvider(((ProviderDone(),),))
+    kernel = AgentKernel(
+        provider,
+        session=session,
+        context_pipeline=ContextPipeline(_RecordingCompactionEngine((_summary("initial"),))),
+        context_settings=ContextSettings(max_characters=1_200, max_summary_characters=500),
+        extensions=(_ExpandCompactionCoverageExtension(),),
+    )
+
+    async def collect() -> AgentRunResult:
+        run = kernel.create_run("continue the Django fix")
+        async for _ in run:
+            pass
+        return await run.result()
+
+    assert asyncio.run(collect()).state is AgentRunState.SETTLED
+    checkpoint = next(entry for entry in session.active_branch if entry.kind == "compaction")
+    assert checkpoint.payload["covered_entry_ids"] == [
+        "old-user",
+        "old-answer",
+        "recent-user",
+        "recent-answer",
+    ]
+    assert checkpoint.payload["first_kept_entry_id"] is None
+    assert provider.requests[0].messages == (
+        BranchSummaryMessage(text=_summary("extension-expanded")),
+        UserMessage(text="continue the Django fix"),
+    )
+
+
 def test_persisted_characters_after_matches_final_supplemented_provider_request() -> None:
     session = _session_with_ids("root", "old-user", "old-answer", "checkpoint", "current", "answer")
     _record_turn(session, "Django regression " * 100, "diagnosis " * 100)
@@ -994,7 +1246,9 @@ def test_persisted_characters_after_matches_final_supplemented_provider_request(
     checkpoint = next(entry for entry in session.active_branch if entry.kind == "compaction")
     metrics = checkpoint.payload["metrics"]
     assert isinstance(metrics, dict)
-    assert metrics["characters_after"] == estimate_provider_request_characters(provider.requests[0])
+    assert metrics["final_characters"] == estimate_provider_request_characters(provider.requests[0])
+    assert metrics["characters_after"] < metrics["final_characters"]
+    assert provider.requests[0].messages[-1] == UserMessage(text="CURRENT_EXTENSION_ANNOTATION")
 
 
 @pytest.mark.parametrize(
@@ -1003,6 +1257,14 @@ def test_persisted_characters_after_matches_final_supplemented_provider_request(
         (_BlockProviderRequestExtension(), "extension_provider_blocked"),
         (_RewriteCheckpointSummaryExtension(), "extension_context_rejected"),
         (_LateProviderResourceExtension(), "extension_provider_rejected"),
+        (
+            _AppendCompactionMessageExtension(BranchSummaryMessage(text="duplicate summary")),
+            "extension_context_rejected",
+        ),
+        (
+            _AppendCompactionMessageExtension(UserMessage(text="reintroduced covered raw")),
+            "extension_context_rejected",
+        ),
     ],
 )
 def test_extension_failure_before_provider_dispatch_does_not_persist_checkpoint(
@@ -1010,7 +1272,7 @@ def test_extension_failure_before_provider_dispatch_does_not_persist_checkpoint(
     expected_code: str,
 ) -> None:
     session = _session_with_ids("root", "old-user", "old-answer", "checkpoint", "current", "answer")
-    _record_turn(session, "Django regression " * 100, "diagnosis " * 100)
+    _record_turn(session, "reintroduced covered raw", "diagnosis " * 200)
     provider = FakeProvider(
         (
             (ProviderTextDelta(_summary("semantic")), ProviderDone()),
@@ -1020,23 +1282,26 @@ def test_extension_failure_before_provider_dispatch_does_not_persist_checkpoint(
     kernel = AgentKernel(
         provider,
         session=session,
-        context_settings=ContextSettings(max_characters=900, max_summary_characters=500),
+        context_settings=ContextSettings(max_characters=1_600, max_summary_characters=500),
         extensions=(extension,),  # type: ignore[arg-type]
     )
 
-    async def collect() -> AgentRunResult:
+    async def collect() -> tuple[list[AgentSessionEvent], AgentRunResult]:
         run = kernel.create_run("continue the Django fix")
-        async for _ in run:
-            pass
-        return await run.result()
+        events = [event async for event in run]
+        return events, await run.result()
 
-    result = asyncio.run(collect())
+    events, result = asyncio.run(collect())
 
     assert result.state is AgentRunState.FAILED
     assert result.error is not None
     assert result.error.code == expected_code
     assert len(provider.requests) == 1
     assert all(entry.kind != "compaction" for entry in session.active_branch)
+    kinds = [event.kind for event in events]
+    assert AgentSessionEventKind.COMPACTION_STARTED in kinds
+    assert AgentSessionEventKind.COMPACTION_FAILED in kinds
+    assert AgentSessionEventKind.CONTEXT_FAILED not in kinds
 
 
 def test_session_revalidation_rejects_extension_cut_inside_tool_transaction() -> None:

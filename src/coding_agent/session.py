@@ -579,6 +579,7 @@ class Session:
         self._next_sequence = 1
         self._closed = False
         self._events: list[AgentSessionEvent] = []
+        self._compactions_in_progress: set[str | None] = set()
         self._entry_types: dict[str, SessionEntryValidator] = {}
         self.register_entry_types(entry_types or {})
 
@@ -813,6 +814,7 @@ class Session:
                 run_id=run_id,
             )
         )
+        self._compactions_in_progress.discard(run_id)
         return entry
 
     def validate_compaction(self, plan: CompactionPlan) -> None:
@@ -840,6 +842,7 @@ class Session:
     def record_compaction_started(self, *, run_id: str | None = None) -> None:
         """Queue the automatic compaction lifecycle boundary before summary generation."""
 
+        self._compactions_in_progress.add(run_id)
         self._events.append(
             AgentSessionEvent.from_compaction_started(
                 self.session_id,
@@ -857,12 +860,15 @@ class Session:
     ) -> None:
         """Queue an observable failure without appending an invalid checkpoint."""
 
+        compaction_started = run_id in self._compactions_in_progress
+        self._compactions_in_progress.discard(run_id)
         self._events.append(
             AgentSessionEvent.from_context_failure(
                 self.session_id,
                 tuple(entry.entry_id for entry in self.active_branch),
                 error,
                 stage=stage,
+                compaction_started=compaction_started,
                 run_id=run_id,
             )
         )
