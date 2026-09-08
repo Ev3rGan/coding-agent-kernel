@@ -1,0 +1,26 @@
+{
+  "context_settings": {
+    "max_characters": 100000,
+    "project_context": [
+      "Workspace root: /testbed"
+    ],
+    "system_prompt": "You are a headless coding agent.",
+    "tool_guidelines": "Use only the active tools described in this request."
+  },
+  "enabled_tools": [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "find",
+    "ls"
+  ],
+  "instance_id": "django__django-11133",
+  "kernel_distribution_version": "0.1.0",
+  "max_turns": null,
+  "model": "deepseek-v4-pro",
+  "permission_mode": "full",
+  "provider": "deepseek",
+  "workspace": "/testbed"
+}

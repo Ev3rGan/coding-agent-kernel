@@ -1,0 +1,6 @@
+{
+  "dataset": "<external-artifact-root>\\issue-33-815b166f-scikit-learn-14141-v1-c20000\\official_instance.json",
+  "split": "test",
+  "task_repo": null,
+  "created_at": "2026-09-08T17:37:05+00:00"
+}

@@ -1,0 +1,33 @@
+{
+  "ambiguous_failure_ids": [],
+  "ambiguous_failure_instances": 0,
+  "completed_ids": [
+    "pallets__flask-5014"
+  ],
+  "completed_instances": 1,
+  "empty_patch_ids": [],
+  "empty_patch_instances": 0,
+  "error_ids": [],
+  "error_instances": 0,
+  "failure_reasons": {},
+  "incomplete_ids": [],
+  "infra_failure_ids": [],
+  "infra_failure_instances": 0,
+  "resolved_ids": [
+    "pallets__flask-5014"
+  ],
+  "resolved_instances": 1,
+  "schema_version": 2,
+  "submitted_ids": [
+    "pallets__flask-5014"
+  ],
+  "submitted_instances": 1,
+  "total_instances": 1,
+  "unremoved_images": [
+    "swebench/sweb.eval.x86_64.pallets_1776_flask-5014:latest"
+  ],
+  "unresolved_ids": [],
+  "unresolved_instances": 0,
+  "unstopped_containers": [],
+  "unstopped_instances": 0
+}

@@ -1,0 +1,33 @@
+{
+  "artifacts": [
+    "config.json",
+    "events.jsonl",
+    "harness/deepseek-v4-pro.coding-agent-3f64666ae90c-dbf0febcdebe.json",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/eval.sh",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/patch.diff",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/report.json",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/run_instance.log",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/test_output.txt",
+    "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/run.json",
+    "harness_argv.json",
+    "harness_instance_result.json",
+    "harness_invocation.json",
+    "harness_process.json",
+    "harness_stderr.log",
+    "harness_stdout.log",
+    "harness_summary.json",
+    "kernel_configuration.json",
+    "official_instance.json",
+    "prediction.jsonl",
+    "provenance.json",
+    "session.jsonl",
+    "tool_results.jsonl",
+    "workspace.patch"
+  ],
+  "completed": true,
+  "diagnostic": "official Harness resolved the instance",
+  "exit_code": 0,
+  "stage": "complete",
+  "status": "success",
+  "version": 1
+}

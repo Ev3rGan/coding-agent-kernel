@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "source_artifact_id": "issue-33-815b166f-scikit-learn-14141-v1-c20000",
+  "sanitization": {
+    "excluded_event_kinds": [
+      "message_update",
+      "tool_execution_update"
+    ],
+    "path_replacements": [
+      "<external-artifact-root>",
+      "<user-profile>"
+    ],
+    "excluded_directories": [
+      "workspace"
+    ]
+  },
+  "source_files": [
+    {
+      "path": "config.json",
+      "archived_path": "config.json",
+      "bytes": 402,
+      "sha256": "8a8c014adaa8f0ff22e7a97f30c406291e398ca573ae0fdb6ee93fd1cf0bbfb8"
+    },
+    {
+      "path": "harness_argv.json",
+      "archived_path": "harness_argv.json",
+      "bytes": 1361,
+      "sha256": "3cec9c2c414ae33d4272fc33db34276c1049a272e9d93ca480bb5c6e6209e20d"
+    },
+    {
+      "path": "harness_instance_result.json",
+      "archived_path": "harness_instance_result.json",
+      "bytes": 781,
+      "sha256": "3b09177fea0ebf1a393c06f44d745f966fed7e12c8b35f9a001bf3f2ee9ba130"
+    },
+    {
+      "path": "harness_invocation.json",
+      "archived_path": "harness_invocation.json",
+      "bytes": 344,
+      "sha256": "03a755d5b46c3379b4208f010d85dd16471bc8d3256820c3e7d8b392a80730fa"
+    },
+    {
+      "path": "harness_process.json",
+      "archived_path": "harness_process.json",
+      "bytes": 50,
+      "sha256": "0d65ebd8f925d0200642343bdd5b50e4aaf3e7f51114be11f29f5133940d2e4d"
+    },
+    {
+      "path": "harness_stderr.log",
+      "archived_path": "harness_stderr.log",
+      "bytes": 388,
+      "sha256": "7b14ad33a10b38df096b569509330791e1e143468aa502ec4a80f909fa3b9591"
+    },
+    {
+      "path": "harness_stdout.log",
+      "archived_path": "harness_stdout.log",
+      "bytes": 457,
+      "sha256": "f371eebfc2754abbda33325becff1947c82ee2923a65127bb0f10673bad89026"
+    },
+    {
+      "path": "harness_summary.json",
+      "archived_path": "harness_summary.json",
+      "bytes": 816,
+      "sha256": "c3d33fcf4155bffc4df214930cd7cf8b328961d58f5286231d825b04a2aab116"
+    },
+    {
+      "path": "kernel_configuration.json",
+      "archived_path": "kernel_configuration.json",
+      "bytes": 1033,
+      "sha256": "f726c711e0ccd51de08c62391af34b5cf4e4c4804f6d9186e7e130240af7c7d9"
+    },
+    {
+      "path": "manifest.json",
+      "archived_path": "manifest.json",
+      "bytes": 1474,
+      "sha256": "9a851743e357d5a2d8895e61b6e1d627a29380b1bb122133e2acc82373b26e06"
+    },
+    {
+      "path": "official_instance.json",
+      "archived_path": "official_instance.json",
+      "bytes": 3016,
+      "sha256": "b77163f5fabb0f02401c136f48865887c0c5725854a22b2902f964723241527e"
+    },
+    {
+      "path": "prediction.jsonl",
+      "archived_path": "prediction.jsonl",
+      "bytes": 947,
+      "sha256": "6235a03c5a1dd67755841949493d4897f002f32e96c243cea4a7261fefd3cb8f"
+    },
+    {
+      "path": "provenance.json",
+      "archived_path": "provenance.json",
+      "bytes": 490,
+      "sha256": "0ee97b9b1f7aaae03704ff3d2823ced543085951acc6e94fe4bda07777dbf31a"
+    },
+    {
+      "path": "session.jsonl",
+      "archived_path": "session.jsonl",
+      "bytes": 83001,
+      "sha256": "09dd7a88039a98170a4d261f203c1ea7daff42a7938b7f358a90d711db643544"
+    },
+    {
+      "path": "tool_results.jsonl",
+      "archived_path": "tool_results.jsonl",
+      "bytes": 32463,
+      "sha256": "ccedcec4fae9cf33d8fc09e589d6e7e6cc8fa403893e54d3fc02b56ae0d16fde"
+    },
+    {
+      "path": "workspace.patch",
+      "archived_path": "workspace.patch",
+      "bytes": 808,
+      "sha256": "d55190afda9b2ce864207d5fd9721d0001c747b6afeff812d6741a3808a52295"
+    },
+    {
+      "path": "harness/deepseek-v4-pro.coding-agent-d55190afda9b-7649827f9cf9.json",
+      "archived_path": "official-harness/aggregate-report.json",
+      "bytes": 919,
+      "sha256": "b7e3e03f254fb7daa22879bd134e5a2c302dd0d7c82bfd4cda84b50c4d9d099c"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/run.json",
+      "archived_path": "official-harness/run.json",
+      "bytes": 222,
+      "sha256": "2513472576a4f7bb2486e2a3c2bc251dbe4aca1dde97b74626def74cf60ea420"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/deepseek-v4-pro/scikit-learn__scikit-learn-14141/eval.sh",
+      "archived_path": "official-harness/eval.sh",
+      "bytes": 1242,
+      "sha256": "e7d4aee3bf61036e5ba57f5d988bc84a272afb45f5468afedf9199cc2e18665e"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/deepseek-v4-pro/scikit-learn__scikit-learn-14141/patch.diff",
+      "archived_path": "official-harness/patch.diff",
+      "bytes": 808,
+      "sha256": "d55190afda9b2ce864207d5fd9721d0001c747b6afeff812d6741a3808a52295"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/deepseek-v4-pro/scikit-learn__scikit-learn-14141/report.json",
+      "archived_path": "official-harness/report.json",
+      "bytes": 1001,
+      "sha256": "28b382091a174f30c2d00dc8c47d2ff2800051fcb98721fffdea9409c4527613"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/deepseek-v4-pro/scikit-learn__scikit-learn-14141/run_instance.log",
+      "archived_path": "official-harness/run_instance.log",
+      "bytes": 4187,
+      "sha256": "f5a933ac58ed190cac189b62f94b50ed13efb8b11bcac1ca960763694530235f"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-d55190afda9b-7649827f9cf9/deepseek-v4-pro/scikit-learn__scikit-learn-14141/test_output.txt",
+      "archived_path": "official-harness/test_output.txt",
+      "bytes": 52165,
+      "sha256": "c5af77e1176be3ee2732091bad428306f08b158983024bb7d6977055506544f0"
+    }
+  ],
+  "events": {
+    "archived_path": "events.lifecycle.jsonl",
+    "source_sha256": "5a87df9a29ad1e56d3cd817bf57073919c0eb59a32c01a7a45471fb173499b73",
+    "source_path": "events.jsonl",
+    "archived_lines": 234,
+    "source_bytes": 3624857,
+    "source_lines": 2298
+  }
+}

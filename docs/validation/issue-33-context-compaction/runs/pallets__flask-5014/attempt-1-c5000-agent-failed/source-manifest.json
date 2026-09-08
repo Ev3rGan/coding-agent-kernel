@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "source_artifact_id": "issue-33-815b166f-flask-5014-v1",
+  "sanitization": {
+    "excluded_directories": [
+      "workspace"
+    ],
+    "path_replacements": [
+      "<external-artifact-root>",
+      "<user-profile>"
+    ],
+    "excluded_event_kinds": [
+      "message_update",
+      "tool_execution_update"
+    ]
+  },
+  "source_files": [
+    {
+      "path": "config.json",
+      "archived_path": "config.json",
+      "bytes": 388,
+      "sha256": "ece26529f87504e9b7a25afc5e36dc929ba9eac689062c7c0b3aa19439a34229"
+    },
+    {
+      "path": "kernel_configuration.json",
+      "archived_path": "kernel_configuration.json",
+      "bytes": 1019,
+      "sha256": "e769e35f66eab347b7566237419f9e36f714338c3276e9e404a54f0cceb36218"
+    },
+    {
+      "path": "manifest.json",
+      "archived_path": "manifest.json",
+      "bytes": 425,
+      "sha256": "088a6a5a216c20c3d451905f7231c2c1aabcdf7f97aee69ee7d6f19598d25cbb"
+    },
+    {
+      "path": "provenance.json",
+      "archived_path": "provenance.json",
+      "bytes": 452,
+      "sha256": "e90010b70b8c73faf1e7db8bf26d8ce19b767906a224f3150266df77053b67ee"
+    },
+    {
+      "path": "session.jsonl",
+      "archived_path": "session.jsonl",
+      "bytes": 321953,
+      "sha256": "1c883036de6a304fa2966d41af0dd5c085a5aafed83288438007bd2377da21a9"
+    },
+    {
+      "path": "tool_results.jsonl",
+      "archived_path": "tool_results.jsonl",
+      "bytes": 249849,
+      "sha256": "d9fceedc6b6fda21fba3e98bee08bb40e5d04b8ddee7721c959f5ddd3e1edb6c"
+    }
+  ],
+  "events": {
+    "source_lines": 1126,
+    "source_bytes": 1684128,
+    "source_path": "events.jsonl",
+    "archived_lines": 238,
+    "source_sha256": "382668496c50ba64ba3a6889ab45e590cb663d44e69268836e863f2234485822",
+    "archived_path": "events.lifecycle.jsonl"
+  }
+}

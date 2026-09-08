@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "issue": 33,
+  "candidate": {
+    "merge_commit": "815b166f45627a17f5c5f7641e508497648ddba3",
+    "remote_main_at_validation": "815b166f45627a17f5c5f7641e508497648ddba3",
+    "package_version": "0.1.0",
+    "python_version": "3.12.10",
+    "wheel_sha256": "3fc99aa73f6626e035cb6507bf5b2190cc5fdf98f8f47e13354d33c35bc798ba"
+  },
+  "evaluation": {
+    "adapter": "deepseek-v4-pro",
+    "dataset": "SWE-bench/SWE-bench_Verified",
+    "dataset_revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+    "harness_version": "5.0.2",
+    "official_contract_commit": "7a21e05772954cc81471ae19d56f436cecf43c54"
+  },
+  "runs": [
+    {
+      "artifact_id": "issue-33-815b166f-flask-5014-v1",
+      "audit": "runs/pallets__flask-5014/attempt-1-c5000-agent-failed/audit.json",
+      "context_max_characters": 5000,
+      "exit_code": 4,
+      "instance_id": "pallets__flask-5014",
+      "status": "agent_failed",
+      "v2_checkpoints": 8
+    },
+    {
+      "artifact_id": "issue-33-815b166f-flask-5014-v2-c20000",
+      "audit": "runs/pallets__flask-5014/attempt-2-c20000-resolved/audit.json",
+      "context_max_characters": 20000,
+      "exit_code": 0,
+      "fail_to_pass": "1/1",
+      "instance_id": "pallets__flask-5014",
+      "pass_to_pass": "59/59",
+      "resolved": true,
+      "status": "success",
+      "v2_checkpoints": 3
+    },
+    {
+      "artifact_id": "issue-33-815b166f-scikit-learn-14141-v1-c20000",
+      "audit": "runs/scikit-learn__scikit-learn-14141/attempt-1-c20000-resolved/audit.json",
+      "context_max_characters": 20000,
+      "exit_code": 0,
+      "fail_to_pass": "1/1",
+      "instance_id": "scikit-learn__scikit-learn-14141",
+      "pass_to_pass": "2/2",
+      "resolved": true,
+      "status": "success",
+      "v2_checkpoints": 1
+    }
+  ],
+  "technical_acceptance_gates_pass": true,
+  "issue_may_close_only_after_evidence_pr_merge_and_issue_update": true
+}

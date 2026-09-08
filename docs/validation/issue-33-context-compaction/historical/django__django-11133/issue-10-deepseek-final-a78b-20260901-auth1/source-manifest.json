@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "source_artifact_id": "issue-10-deepseek-final-a78b-20260901-auth1",
+  "sanitization": {
+    "excluded_event_kinds": [
+      "message_update",
+      "tool_execution_update"
+    ],
+    "excluded_directories": [
+      "workspace"
+    ],
+    "path_replacements": [
+      "<external-artifact-root>",
+      "<user-profile>"
+    ]
+  },
+  "source_files": [
+    {
+      "path": "config.json",
+      "archived_path": "config.json",
+      "bytes": 355,
+      "sha256": "e1158127b72f517ed0a854db1ba1633b2e90c1a9229569f77979340fa4c0a21e"
+    },
+    {
+      "path": "kernel_configuration.json",
+      "archived_path": "kernel_configuration.json",
+      "bytes": 565,
+      "sha256": "19e79d81be47acda003970210298f64dd60c24947f471dee35b572c182b306c6"
+    },
+    {
+      "path": "manifest.json",
+      "archived_path": "manifest.json",
+      "bytes": 347,
+      "sha256": "a2c0020964e16074b01709af5f7973d1a81445bfe027f71f9c3eaff6b4d9cd0f"
+    },
+    {
+      "path": "provenance.json",
+      "archived_path": "provenance.json",
+      "bytes": 454,
+      "sha256": "a2287b7235889f71f2b86652c44e64b3f344d4a2b3f95caf7669f5e9cdc652f9"
+    },
+    {
+      "path": "session.jsonl",
+      "archived_path": "session.jsonl",
+      "bytes": 318894,
+      "sha256": "2374eb6de1ca7f31cfe45893cb99e250a87c79a0a1f7de3cbf2c31fa82e82b1e"
+    },
+    {
+      "path": "tool_results.jsonl",
+      "archived_path": "tool_results.jsonl",
+      "bytes": 268159,
+      "sha256": "75989274b95ee3f408ce8296723381774094bef67a6fbc4c1dc0f1ab99f119c0"
+    }
+  ],
+  "events": {
+    "source_bytes": 5364857,
+    "source_sha256": "311eb8a7415e623ab2cb8e8f48e8c19c279a280c6485fb850ae767ce4c492532",
+    "archived_lines": 251,
+    "archived_path": "events.lifecycle.jsonl",
+    "source_path": "events.jsonl",
+    "source_lines": 3270
+  }
+}

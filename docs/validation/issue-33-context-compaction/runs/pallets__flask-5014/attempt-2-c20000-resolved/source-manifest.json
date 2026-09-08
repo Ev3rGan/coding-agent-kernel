@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "source_artifact_id": "issue-33-815b166f-flask-5014-v2-c20000",
+  "sanitization": {
+    "excluded_event_kinds": [
+      "message_update",
+      "tool_execution_update"
+    ],
+    "path_replacements": [
+      "<external-artifact-root>",
+      "<user-profile>"
+    ],
+    "excluded_directories": [
+      "workspace"
+    ]
+  },
+  "source_files": [
+    {
+      "path": "config.json",
+      "archived_path": "config.json",
+      "bytes": 389,
+      "sha256": "177c1ae0ae9c526d6e93c2dfab0d56c7b857650142781b04b9c8d469a56951a7"
+    },
+    {
+      "path": "harness_argv.json",
+      "archived_path": "harness_argv.json",
+      "bytes": 1332,
+      "sha256": "e341d50953622d06583ca15f33d54a7356b602e8fabb8b7a2a5d66fa7b281d45"
+    },
+    {
+      "path": "harness_instance_result.json",
+      "archived_path": "harness_instance_result.json",
+      "bytes": 4958,
+      "sha256": "98c5b2acb39ea8f55dc725148dcc9a7c20bf8f453cd2c525072abde81bf3b9a9"
+    },
+    {
+      "path": "harness_invocation.json",
+      "archived_path": "harness_invocation.json",
+      "bytes": 331,
+      "sha256": "4505efe42ab1ca29c6cd070b2cc14674b3b953c20e33b6418860ab36ff90838c"
+    },
+    {
+      "path": "harness_process.json",
+      "archived_path": "harness_process.json",
+      "bytes": 50,
+      "sha256": "0d65ebd8f925d0200642343bdd5b50e4aaf3e7f51114be11f29f5133940d2e4d"
+    },
+    {
+      "path": "harness_stderr.log",
+      "archived_path": "harness_stderr.log",
+      "bytes": 388,
+      "sha256": "c1fe931fc7ec4c762438cb0adba97460ee46178396ff562b09772748d5eb14c9"
+    },
+    {
+      "path": "harness_stdout.log",
+      "archived_path": "harness_stdout.log",
+      "bytes": 457,
+      "sha256": "590f214ddb1dbff89dd96482f279a18429fdd8e9f47c2a05cd50e3e77b6b25ff"
+    },
+    {
+      "path": "harness_summary.json",
+      "archived_path": "harness_summary.json",
+      "bytes": 764,
+      "sha256": "1ddc6e5cad26bf36fd4152b54358e97bd2628953ba1e9257dc62d5591d4e0c9a"
+    },
+    {
+      "path": "kernel_configuration.json",
+      "archived_path": "kernel_configuration.json",
+      "bytes": 1020,
+      "sha256": "7bb1aeb6a5b382bae34f657b4c63e2dceb9192d7f709b0901aabfcc5dbc7f8e8"
+    },
+    {
+      "path": "manifest.json",
+      "archived_path": "manifest.json",
+      "bytes": 1409,
+      "sha256": "f87bbc2830a551b7280f2c38b781f1a0bf362aabda8235dc5b48d4ddbd02b4e0"
+    },
+    {
+      "path": "official_instance.json",
+      "archived_path": "official_instance.json",
+      "bytes": 7060,
+      "sha256": "780a95f88f2a89727a86ac2f0501821730ddce516582b3e9428a8eccfe58043b"
+    },
+    {
+      "path": "prediction.jsonl",
+      "archived_path": "prediction.jsonl",
+      "bytes": 1119,
+      "sha256": "9cd0f8a7ba97efe3d74f054784215133f5898359afaaf05f5db8f29d3b248f43"
+    },
+    {
+      "path": "provenance.json",
+      "archived_path": "provenance.json",
+      "bytes": 452,
+      "sha256": "e90010b70b8c73faf1e7db8bf26d8ce19b767906a224f3150266df77053b67ee"
+    },
+    {
+      "path": "session.jsonl",
+      "archived_path": "session.jsonl",
+      "bytes": 298069,
+      "sha256": "f8f445761fd9a999ad632744a283fca5dbb6c6e0ad0833ffa1827eb7cf6cb84e"
+    },
+    {
+      "path": "tool_results.jsonl",
+      "archived_path": "tool_results.jsonl",
+      "bytes": 150928,
+      "sha256": "9843522e9cf50ad91aacfb7d1c016cc275216e3f7ee7c977366c7c2f95106e68"
+    },
+    {
+      "path": "workspace.patch",
+      "archived_path": "workspace.patch",
+      "bytes": 981,
+      "sha256": "4e3de319d1ac12d0052cf4fce7e72f87ada26719ff559449e82a4d6c9dd45c17"
+    },
+    {
+      "path": "harness/deepseek-v4-pro.coding-agent-4e3de319d1ac-90f47bf47e4e.json",
+      "archived_path": "official-harness/aggregate-report.json",
+      "bytes": 867,
+      "sha256": "5877126e487cd60a0fbb1c65947631135f0d4f3c9e8c717f4bdb5942d0302978"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/run.json",
+      "archived_path": "official-harness/run.json",
+      "bytes": 214,
+      "sha256": "db77aafe5eccc7f64297863e2d7b957f8c537e1fea01e236cf0aaf20db260739"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/deepseek-v4-pro/pallets__flask-5014/eval.sh",
+      "archived_path": "official-harness/eval.sh",
+      "bytes": 1190,
+      "sha256": "ddbdee5ea6095a371b999d4d2613710c33ee3345790e82882538640c82f7ba1f"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/deepseek-v4-pro/pallets__flask-5014/patch.diff",
+      "archived_path": "official-harness/patch.diff",
+      "bytes": 981,
+      "sha256": "4e3de319d1ac12d0052cf4fce7e72f87ada26719ff559449e82a4d6c9dd45c17"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/deepseek-v4-pro/pallets__flask-5014/report.json",
+      "archived_path": "official-harness/report.json",
+      "bytes": 5805,
+      "sha256": "5b59dd095e5fd9be0967a99d88d41599e37a3572876c61db64ed33cbf2eee4c0"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/deepseek-v4-pro/pallets__flask-5014/run_instance.log",
+      "archived_path": "official-harness/run_instance.log",
+      "bytes": 7814,
+      "sha256": "c34d0f25b03a8e9f8f3f5801aa8818088a1a5b75658de7ff1f91dca311c81798"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-4e3de319d1ac-90f47bf47e4e/deepseek-v4-pro/pallets__flask-5014/test_output.txt",
+      "archived_path": "official-harness/test_output.txt",
+      "bytes": 19794,
+      "sha256": "c726b917012d6091fbb5e0dbb9f4357c6da6c870fd3f81dc50e1b3a6879dc6e9"
+    }
+  ],
+  "events": {
+    "archived_path": "events.lifecycle.jsonl",
+    "source_sha256": "b7c7c6926c3188bbb7ad32164a265a7a1300668e2987493d2f215d0f23f469ef",
+    "source_path": "events.jsonl",
+    "archived_lines": 536,
+    "source_bytes": 8178581,
+    "source_lines": 6669
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "instance_ids": [
+    "scikit-learn__scikit-learn-14141"
+  ],
+  "module": "swebench.harness.run_evaluation",
+  "prediction_sha256": "6235a03c5a1dd67755841949493d4897f002f32e96c243cea4a7261fefd3cb8f",
+  "run_id": "coding-agent-d55190afda9b-7649827f9cf9",
+  "split": "test",
+  "timeout": 1800.0
+}
