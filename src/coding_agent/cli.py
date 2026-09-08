@@ -19,7 +19,12 @@ from typing import Any
 
 import httpx
 
-from coding_agent.context import ContextInput, ContextPipeline, ContextSettings
+from coding_agent.context import (
+    DEFAULT_CONTEXT_MAX_CHARACTERS,
+    ContextInput,
+    ContextPipeline,
+    ContextSettings,
+)
 from coding_agent.control import RetryPolicy
 from coding_agent.deepseek import (
     DEEPSEEK_MODELS,
@@ -1697,8 +1702,11 @@ def _parser() -> argparse.ArgumentParser:
     swebench_run.add_argument(
         "--context-max-characters",
         type=int,
-        default=100_000,
-        help="Model Context character budget recorded in run artifacts",
+        default=DEFAULT_CONTEXT_MAX_CHARACTERS,
+        help=(
+            "Model Context character budget recorded in run artifacts "
+            f"(default: {DEFAULT_CONTEXT_MAX_CHARACTERS})"
+        ),
     )
     demo = commands.add_parser("demo", help="run deterministic local demonstrations")
     demos = demo.add_subparsers(dest="demo", required=True)

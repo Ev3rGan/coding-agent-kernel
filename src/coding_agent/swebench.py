@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol, cast
 
-from coding_agent.context import ContextSettings
+from coding_agent.context import DEFAULT_CONTEXT_MAX_CHARACTERS, ContextSettings
 from coding_agent.environment import (
     ChunkCallback,
     CommandTimeoutError,
@@ -702,7 +702,7 @@ class SWEbenchRunConfig:
     mode: PermissionMode
     agent_timeout_seconds: float
     harness_timeout_seconds: float
-    context_max_characters: int = 100_000
+    context_max_characters: int = DEFAULT_CONTEXT_MAX_CHARACTERS
 
 
 @dataclass(frozen=True, slots=True)

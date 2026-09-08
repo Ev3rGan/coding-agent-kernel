@@ -15,6 +15,17 @@
     "harness_version": "5.0.2",
     "official_contract_commit": "7a21e05772954cc81471ae19d56f436cecf43c54"
   },
+  "product_default": {
+    "context_max_characters": 20000,
+    "authoritative_setting": "coding_agent.context.DEFAULT_CONTEXT_MAX_CHARACTERS",
+    "applies_to": [
+      "ContextSettings",
+      "SWEbenchRunConfig",
+      "python -m coding_agent swebench run"
+    ],
+    "explicit_override_supported": true,
+    "real_acceptance_runs_used_same_explicit_value": true
+  },
   "runs": [
     {
       "artifact_id": "issue-33-815b166f-flask-5014-v1",

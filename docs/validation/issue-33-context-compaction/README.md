@@ -14,6 +14,8 @@
 
 成功运行均使用公开入口 `python -m coding_agent swebench run`、真实 `deepseek-v4-pro` Adapter 和官方 SWE-bench Harness，不使用 fake provider，也不以仓库内 pytest 代替外部验收。
 
+本 PR 的后续产品改动把 20,000 设为 Kernel 与 SWE-bench CLI 共用的默认字符窗口；`--context-max-characters` 仍可显式覆盖。由于真实运行先于该默认值改动完成，两个成功样本都显式传入了同一个 20,000 值：真实运行验证这个窗口下会发生压缩并通过双门，公开 CLI 回归测试则验证省略参数后 `config.json` 与 `manifest.json` 也会记录 20,000。
+
 ## 被验收的候选版本
 
 - `main` / PR #35 merge commit：`815b166f45627a17f5c5f7641e508497648ddba3`
@@ -24,6 +26,7 @@
 - SWE-bench：5.0.2
 - Verified dataset revision：`78f471bf655a3137b2e8a75af1501690ec009ec3`
 - 仓库内固定的 official contract commit：`7a21e05772954cc81471ae19d56f436cecf43c54`
+- 本证据 PR 的后续改动：将产品默认字符窗口从 100,000 调整为经上述真实运行验证的 20,000
 
 PR #35 合并前的单元、类型、格式和 wheel 门禁另见 [development-gates/pr-35.md](development-gates/pr-35.md)。这些门禁用于证明构建质量，但不替代本目录的真实 SWE-bench 验收。
 
@@ -49,13 +52,13 @@ checkpoint 位于 sequence 61，覆盖 37 条 message，将约 46,146 字符压�
 
 该样本的 coverage、唯一性、八段摘要结构与递归包装检查同样全部通过。
 
-### 5k 失败与 20k 配置热修复
+### 5k 失败与 20k 产品默认值热修复
 
 Flask 首次运行用 5,000 字符窗口强制高频压缩。它先成功持久化 8 条合法 v2 checkpoint，随后第 9 次模型摘要超过 2,500 字符的实际摘要预算，被契约校验以 `compaction_summary_invalid` 拒绝；Run 以 exit 4 停在 agent 阶段，没有伪造 Harness 结果。
 
-保留该失败而不是覆盖后，验收将窗口提高到 20,000。按照当前算法，有效摘要预算为 `min(max_summary_characters, max_characters / 2)`，因此从 2,500 提高到 10,000。两个成功样本仍实际触发压缩，说明 20k 没有绕过验收目标。
+保留该失败而不是覆盖后，验收通过公开 CLI 的显式参数将窗口提高到 20,000。按照当前算法，有效摘要预算为 `min(max_summary_characters, max_characters / 2)`，因此从 2,500 提高到 10,000。两个成功样本仍实际触发压缩，说明 20k 没有绕过验收目标。随后，本 PR 将同一个 20k 值提升为产品默认值，同时保留显式覆盖能力。
 
-这次结果支持把 20k 作为当前真实 Adapter 验收配置；它不证明任意更小窗口都应成功。未来可单独评估“模型摘要偶发超预算时有限重试或确定性收缩”是否值得实现。
+这次结果支持把 20k 作为当前产品默认值；它不证明任意更小窗口都应成功。未来可单独评估“模型摘要偶发超预算时有限重试或确定性收缩”是否值得实现。
 
 ## 证据文件说明
 
@@ -82,6 +85,7 @@ Flask 首次运行用 5,000 字符窗口强制高频压缩。它先成功持久�
 ## 目录索引
 
 - [机器可读的总验收结论](acceptance.json)
+- [20k 产品默认值补充门禁](development-gates/pr-36-default-window.md)
 - [Flask 5k 失败运行](runs/pallets__flask-5014/attempt-1-c5000-agent-failed/audit.json)
 - [Flask 20k 成功运行](runs/pallets__flask-5014/attempt-2-c20000-resolved/audit.json)
 - [scikit-learn 20k 成功运行](runs/scikit-learn__scikit-learn-14141/attempt-1-c20000-resolved/audit.json)

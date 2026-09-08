@@ -64,6 +64,7 @@ ASSEMBLY_ORDER: Final = (
     "injected_messages",
     "provider_request",
 )
+DEFAULT_CONTEXT_MAX_CHARACTERS: Final = 20_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +75,7 @@ class ContextSettings:
     tool_guidelines: str = "Use only the active tools described in this request."
     project_context: tuple[str, ...] = ()
     authoritative_resources: tuple[ContextResource, ...] = ()
-    max_characters: int = 100_000
+    max_characters: int = DEFAULT_CONTEXT_MAX_CHARACTERS
     max_summary_characters: int = 12_000
 
     def __post_init__(self) -> None:
