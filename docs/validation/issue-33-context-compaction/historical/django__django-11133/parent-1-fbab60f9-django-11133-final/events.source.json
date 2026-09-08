@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "source_artifact_id": "parent-1-fbab60f9-django-11133-final",
+  "source_file": "events.jsonl",
+  "source_bytes": 5013666,
+  "source_lines": 3535,
+  "source_sha256": "00e46cddd3e59eb46dec4a777ace0d4712fbc4d073efc9fab766d3d2a7a99236",
+  "archived_file": "events.lifecycle.jsonl",
+  "excluded_kinds": [
+    "message_update",
+    "tool_execution_update"
+  ],
+  "archived_lines": 234,
+  "archived_sha256": "c93714ccf02fa6c96bd9d6a0278f4a95f54d17ebff62a75ca0a9cdd3b30a0f71"
+}

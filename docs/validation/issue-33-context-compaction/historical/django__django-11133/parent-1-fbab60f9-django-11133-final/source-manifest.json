@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "source_artifact_id": "parent-1-fbab60f9-django-11133-final",
+  "sanitization": {
+    "excluded_event_kinds": [
+      "message_update",
+      "tool_execution_update"
+    ],
+    "excluded_directories": [
+      "workspace"
+    ],
+    "path_replacements": [
+      "<external-artifact-root>",
+      "<user-profile>"
+    ]
+  },
+  "source_files": [
+    {
+      "path": "config.json",
+      "archived_path": "config.json",
+      "bytes": 355,
+      "sha256": "e1158127b72f517ed0a854db1ba1633b2e90c1a9229569f77979340fa4c0a21e"
+    },
+    {
+      "path": "harness_argv.json",
+      "archived_path": "harness_argv.json",
+      "bytes": 1341,
+      "sha256": "7123a20cfd62060369a1a1129814d50a1346c1a84d92abe421e660ed4cc37865"
+    },
+    {
+      "path": "harness_instance_result.json",
+      "archived_path": "harness_instance_result.json",
+      "bytes": 5330,
+      "sha256": "e60cc099412a32d212bf04af34dc86986270c74aa70df23cd105fbf1ce22f929"
+    },
+    {
+      "path": "harness_invocation.json",
+      "archived_path": "harness_invocation.json",
+      "bytes": 332,
+      "sha256": "2ad98551e711290525c7f85673802a8aa756dc3e17212bdde6d7e3d3f73c3207"
+    },
+    {
+      "path": "harness_process.json",
+      "archived_path": "harness_process.json",
+      "bytes": 50,
+      "sha256": "0d65ebd8f925d0200642343bdd5b50e4aaf3e7f51114be11f29f5133940d2e4d"
+    },
+    {
+      "path": "harness_stderr.log",
+      "archived_path": "harness_stderr.log",
+      "bytes": 388,
+      "sha256": "50b721c21e2cc1dfd2963bddca2369352d6f749b24947a0f661fdfa4dbfb546c"
+    },
+    {
+      "path": "harness_stdout.log",
+      "archived_path": "harness_stdout.log",
+      "bytes": 457,
+      "sha256": "300f3e81492c4c49effcb2973b78acde935780d411e10b1b111745b43301c49c"
+    },
+    {
+      "path": "harness_summary.json",
+      "archived_path": "harness_summary.json",
+      "bytes": 768,
+      "sha256": "783806a864d1d8eddf75c8de62f133266a587844947d7733e5feaa180286f559"
+    },
+    {
+      "path": "kernel_configuration.json",
+      "archived_path": "kernel_configuration.json",
+      "bytes": 950,
+      "sha256": "5b032026b7c09ed7db1533f22aa61ad27d6b6cde2315c5315cc3d975034731cb"
+    },
+    {
+      "path": "manifest.json",
+      "archived_path": "manifest.json",
+      "bytes": 1379,
+      "sha256": "15b66313a570004f06dba9e90e012e46bc4fe75278694351dcc7680a258f4043"
+    },
+    {
+      "path": "official_instance.json",
+      "archived_path": "official_instance.json",
+      "bytes": 9324,
+      "sha256": "12a1e0697bfa6f9d923b2f264187c7e4a562802a357a40a2239fa2164cc2c175"
+    },
+    {
+      "path": "prediction.jsonl",
+      "archived_path": "prediction.jsonl",
+      "bytes": 1268,
+      "sha256": "adf31302e79cd3888f8cb68d4bdb4dddef0b2dd4d19a99eaf455509d1fa8eeb7"
+    },
+    {
+      "path": "provenance.json",
+      "archived_path": "provenance.json",
+      "bytes": 454,
+      "sha256": "a2287b7235889f71f2b86652c44e64b3f344d4a2b3f95caf7669f5e9cdc652f9"
+    },
+    {
+      "path": "session.jsonl",
+      "archived_path": "session.jsonl",
+      "bytes": 87371,
+      "sha256": "42cf6d19bbfba2614d1de07c0edeb7d8587de8ccaa5a2bd7f0211c9f648293d4"
+    },
+    {
+      "path": "tool_results.jsonl",
+      "archived_path": "tool_results.jsonl",
+      "bytes": 38525,
+      "sha256": "3bda19386647108fd6d8f188b6125c1832db08152beb6c5c4ff15bfe1ac7f92e"
+    },
+    {
+      "path": "workspace.patch",
+      "archived_path": "workspace.patch",
+      "bytes": 1145,
+      "sha256": "3f64666ae90cf3b14cab2fc5a474ff00875d3b9d2edfe81ad9134044adabad0b"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/report.json",
+      "archived_path": "official_harness_report.json",
+      "bytes": 6232,
+      "sha256": "629fc65ba64b24062f0c8d0563ba288c011ec25c6c95d2abf040d4b143481072"
+    },
+    {
+      "path": "harness/logs/run_evaluation/coding-agent-3f64666ae90c-dbf0febcdebe/deepseek-v4-pro/django__django-11133/run_instance.log",
+      "archived_path": "official_harness_run.log",
+      "bytes": 8572,
+      "sha256": "a5ed70276c1e1955dea1cd86bfd2178e9c4ed627d13aa10321d0ef7eeb525e84"
+    }
+  ],
+  "events": {
+    "source_bytes": 5013666,
+    "source_sha256": "00e46cddd3e59eb46dec4a777ace0d4712fbc4d073efc9fab766d3d2a7a99236",
+    "archived_lines": 234,
+    "archived_path": "events.lifecycle.jsonl",
+    "source_path": "events.jsonl",
+    "source_lines": 3535
+  }
+}

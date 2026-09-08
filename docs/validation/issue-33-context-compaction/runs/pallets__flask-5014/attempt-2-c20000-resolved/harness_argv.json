@@ -1,0 +1,36 @@
+{
+  "argv": [
+    "<external-artifact-root>\\issue-33-postmerge-runtime-815b166f\\venv\\Scripts\\python.exe",
+    "-c",
+    "\nimport pathlib\nimport runpy\n\n_original_write_text = pathlib.Path.write_text\n\n\ndef _write_text(self, data, encoding=None, errors=None, newline=\"\\n\"):\n    return _original_write_text(\n        self, data, encoding=encoding, errors=errors, newline=newline\n    )\n\n\npathlib.Path.write_text = _write_text\nrunpy.run_module(\"swebench.harness.run_evaluation\", run_name=\"__main__\")\n",
+    "--dataset_name",
+    "<external-artifact-root>\\issue-33-815b166f-flask-5014-v2-c20000\\official_instance.json",
+    "--split",
+    "test",
+    "--predictions_path",
+    "<external-artifact-root>\\issue-33-815b166f-flask-5014-v2-c20000\\prediction.jsonl",
+    "--max_workers",
+    "1",
+    "--run_id",
+    "coding-agent-4e3de319d1ac-90f47bf47e4e",
+    "--timeout",
+    "1800",
+    "--instance_ids",
+    "pallets__flask-5014"
+  ],
+  "cwd": "harness",
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "dataset_revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "environment_names": [
+    "APPDATA",
+    "COMSPEC",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR"
+  ]
+}

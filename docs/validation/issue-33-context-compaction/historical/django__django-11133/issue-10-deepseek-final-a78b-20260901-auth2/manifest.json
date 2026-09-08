@@ -1,0 +1,16 @@
+{
+  "artifacts": [
+    "config.json",
+    "events.jsonl",
+    "kernel_configuration.json",
+    "provenance.json",
+    "session.jsonl",
+    "tool_results.jsonl"
+  ],
+  "completed": true,
+  "diagnostic": "Agent Run failed: turn_limit: Agent Run exceeded 20 Turns.",
+  "exit_code": 4,
+  "stage": "agent",
+  "status": "agent_failed",
+  "version": 1
+}

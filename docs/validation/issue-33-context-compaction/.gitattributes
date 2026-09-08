@@ -1,0 +1,5 @@
+**/*.patch whitespace=-blank-at-eol
+**/patch.diff whitespace=-blank-at-eol
+**/eval.sh whitespace=-blank-at-eol
+**/*.log whitespace=-blank-at-eol
+**/test_output.txt whitespace=-blank-at-eol

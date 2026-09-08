@@ -1,0 +1,28 @@
+diff --git a/django/http/response.py b/django/http/response.py
+index 6a84e193ba..a113f68095 100644
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -234,6 +234,8 @@ class HttpResponseBase:
+         if isinstance(value, str):
+             return bytes(value.encode(self.charset))
+         # Handle non-string types.
++        if isinstance(value, memoryview):
++            return value.tobytes()
+         return str(value).encode(self.charset)
+ 
+     # These methods partially implement the file-like object interface.
+diff --git a/tests/responses/tests.py b/tests/responses/tests.py
+index 934e4dfe60..9354123ade 100644
+--- a/tests/responses/tests.py
++++ b/tests/responses/tests.py
+@@ -127,6 +127,10 @@ class HttpResponseTests(SimpleTestCase):
+         response = HttpResponse(iso_content, content_type='text/plain')
+         self.assertContains(response, iso_content)
+ 
++    def test_memoryview_content(self):
++        response = HttpResponse(memoryview(b'memoryview content'))
++        self.assertEqual(response.content, b'memoryview content')
++
+     def test_repr(self):
+         response = HttpResponse(content="Café :)".encode(UTF8), status=201)
+         expected = '<HttpResponse status_code=201, "text/html; charset=utf-8">'

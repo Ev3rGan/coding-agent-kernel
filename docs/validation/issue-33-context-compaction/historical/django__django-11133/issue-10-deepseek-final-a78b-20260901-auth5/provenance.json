@@ -1,0 +1,12 @@
+{
+  "base_commit": "879cc3da6249e920b8d54518a0ae06de835d7373",
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "dataset_revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "harness_version": "5.0.2",
+  "image": "swebench/sweb.eval.x86_64.django_1776_django-11133:latest",
+  "instance_id": "django__django-11133",
+  "official_contract_commit": "7a21e05772954cc81471ae19d56f436cecf43c54",
+  "repo": "django/django",
+  "split": "test",
+  "version": 1
+}

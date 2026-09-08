@@ -1,0 +1,33 @@
+{
+  "ambiguous_failure_ids": [],
+  "ambiguous_failure_instances": 0,
+  "completed_ids": [
+    "scikit-learn__scikit-learn-14141"
+  ],
+  "completed_instances": 1,
+  "empty_patch_ids": [],
+  "empty_patch_instances": 0,
+  "error_ids": [],
+  "error_instances": 0,
+  "failure_reasons": {},
+  "incomplete_ids": [],
+  "infra_failure_ids": [],
+  "infra_failure_instances": 0,
+  "resolved_ids": [
+    "scikit-learn__scikit-learn-14141"
+  ],
+  "resolved_instances": 1,
+  "schema_version": 2,
+  "submitted_ids": [
+    "scikit-learn__scikit-learn-14141"
+  ],
+  "submitted_instances": 1,
+  "total_instances": 1,
+  "unremoved_images": [
+    "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14141:latest"
+  ],
+  "unresolved_ids": [],
+  "unresolved_instances": 0,
+  "unstopped_containers": [],
+  "unstopped_instances": 0
+}

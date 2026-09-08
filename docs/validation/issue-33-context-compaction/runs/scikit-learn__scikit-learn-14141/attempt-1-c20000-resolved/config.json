@@ -1,0 +1,13 @@
+{
+  "agent_timeout_seconds": 1800.0,
+  "context_max_characters": 20000,
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "harness_timeout_seconds": 1800.0,
+  "instance_id": "scikit-learn__scikit-learn-14141",
+  "model": "deepseek-v4-pro",
+  "official_contract_commit": "7a21e05772954cc81471ae19d56f436cecf43c54",
+  "permission_mode": "full",
+  "provider": "deepseek",
+  "split": "test",
+  "version": 1
+}

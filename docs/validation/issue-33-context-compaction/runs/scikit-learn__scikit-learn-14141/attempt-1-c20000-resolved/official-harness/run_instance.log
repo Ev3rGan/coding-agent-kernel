@@ -1,0 +1,59 @@
+2026-09-09 01:37:05,641 - INFO - Creating container for scikit-learn__scikit-learn-14141...
+2026-09-09 01:37:05,731 - INFO - Container for scikit-learn__scikit-learn-14141 created: b489d26efcceed46c9f5fea617aa96fd566166cd94e8e68ac12f50e553c4c851
+2026-09-09 01:37:05,880 - INFO - Container for scikit-learn__scikit-learn-14141 started: b489d26efcceed46c9f5fea617aa96fd566166cd94e8e68ac12f50e553c4c851
+2026-09-09 01:37:05,881 - INFO - Intermediate patch for scikit-learn__scikit-learn-14141 written to logs\run_evaluation\coding-agent-d55190afda9b-7649827f9cf9\deepseek-v4-pro\scikit-learn__scikit-learn-14141\patch.diff, now applying to container...
+2026-09-09 01:37:05,996 - INFO - >>>>> Applied Patch:
+Checking patch sklearn/utils/_show_versions.py...
+Checking patch sklearn/utils/tests/test_show_versions.py...
+Applied patch sklearn/utils/_show_versions.py cleanly.
+Applied patch sklearn/utils/tests/test_show_versions.py cleanly.
+
+2026-09-09 01:37:06,149 - INFO - Git diff before:
+diff --git a/sklearn/utils/_show_versions.py b/sklearn/utils/_show_versions.py
+index e5d3141bf..ecba9ec68 100644
+--- a/sklearn/utils/_show_versions.py
++++ b/sklearn/utils/_show_versions.py
+@@ -48,6 +48,7 @@ def _get_deps_info():
+         "Cython",
+         "pandas",
+         "matplotlib",
++        "joblib",
+     ]
+ 
+     def get_version(module):
+diff --git a/sklearn/utils/tests/test_show_versions.py b/sklearn/utils/tests/test_show_versions.py
+index 31153c96c..b8ad843f7 100644
+--- a/sklearn/utils/tests/test_show_versions.py
++++ b/sklearn/utils/tests/test_show_versions.py
+@@ -23,6 +23,7 @@ def test_get_deps_info():
+     assert 'Cython' in deps_info
+     assert 'pandas' in deps_info
+     assert 'matplotlib' in deps_info
++    assert 'joblib' in deps_info
+ 
+ 
+ def test_show_versions_with_blas(capsys):
+2026-09-09 01:37:06,150 - INFO - Eval script for scikit-learn__scikit-learn-14141 written to logs\run_evaluation\coding-agent-d55190afda9b-7649827f9cf9\deepseek-v4-pro\scikit-learn__scikit-learn-14141\eval.sh; copying to container...
+2026-09-09 01:37:09,483 - INFO - Test runtime: 3.25 seconds
+2026-09-09 01:37:09,484 - INFO - Test output for scikit-learn__scikit-learn-14141 written to logs\run_evaluation\coding-agent-d55190afda9b-7649827f9cf9\deepseek-v4-pro\scikit-learn__scikit-learn-14141\test_output.txt
+2026-09-09 01:37:09,547 - INFO - Git diff after:
+diff --git a/sklearn/utils/_show_versions.py b/sklearn/utils/_show_versions.py
+index e5d3141bf..ecba9ec68 100644
+--- a/sklearn/utils/_show_versions.py
++++ b/sklearn/utils/_show_versions.py
+@@ -48,6 +48,7 @@ def _get_deps_info():
+         "Cython",
+         "pandas",
+         "matplotlib",
++        "joblib",
+     ]
+ 
+     def get_version(module):
+2026-09-09 01:37:09,548 - INFO - Git diff changed after running eval script
+2026-09-09 01:37:09,548 - INFO - Grading answer for scikit-learn__scikit-learn-14141...
+2026-09-09 01:37:09,550 - INFO - report: {'scikit-learn__scikit-learn-14141': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'infra_failure': False, 'tests_status': {'FAIL_TO_PASS': {'success': ['sklearn/utils/tests/test_show_versions.py::test_get_deps_info'], 'failure': []}, 'PASS_TO_PASS': {'success': ['sklearn/utils/tests/test_show_versions.py::test_get_sys_info', 'sklearn/utils/tests/test_show_versions.py::test_show_versions_with_blas'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for scikit-learn__scikit-learn-14141: resolved: True
+2026-09-09 01:37:09,551 - INFO - Attempting to stop container sweb.eval.scikit-learn__scikit-learn-14141.coding-agent-d55190afda9b-7649827f9cf9...
+2026-09-09 01:37:24,917 - INFO - Container sweb.eval.scikit-learn__scikit-learn-14141.coding-agent-d55190afda9b-7649827f9cf9 stopped successfully.
+2026-09-09 01:37:24,917 - INFO - Attempting to remove container sweb.eval.scikit-learn__scikit-learn-14141.coding-agent-d55190afda9b-7649827f9cf9...
+2026-09-09 01:37:25,147 - INFO - Container sweb.eval.scikit-learn__scikit-learn-14141.coding-agent-d55190afda9b-7649827f9cf9 removed successfully.

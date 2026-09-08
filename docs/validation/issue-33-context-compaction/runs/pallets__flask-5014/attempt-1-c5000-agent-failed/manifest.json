@@ -1,0 +1,17 @@
+{
+  "artifacts": [
+    "config.json",
+    "events.jsonl",
+    "kernel_configuration.json",
+    "provenance.json",
+    "session.jsonl",
+    "tool_results.jsonl"
+  ],
+  "completed": true,
+  "context_max_characters": 5000,
+  "diagnostic": "Agent Run failed: compaction_summary_invalid: Compaction summary summary exceeds its character budget.",
+  "exit_code": 4,
+  "stage": "agent",
+  "status": "agent_failed",
+  "version": 1
+}

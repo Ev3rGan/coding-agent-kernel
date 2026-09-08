@@ -1,0 +1,11 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "instance_ids": [
+    "django__django-11133"
+  ],
+  "module": "swebench.harness.run_evaluation",
+  "prediction_sha256": "1c99cae42cf825e0820ad15bc990057ec71a252a65169693f924a6e966d95106",
+  "run_id": "coding-agent-7529f272f97f-6c83521d3bd8",
+  "split": "test",
+  "timeout": 1800.0
+}

@@ -535,6 +535,46 @@ def test_swebench_cli_missing_key_fails_before_external_preparation(
     assert not artifacts.exists()
 
 
+def test_swebench_cli_uses_product_default_context_character_budget(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    run_config = SWEbenchRunConfig(
+        instance_id="synthetic__fixture-1",
+        model="deepseek-v4-pro",
+        mode=PermissionMode.FULL,
+        agent_timeout_seconds=10,
+        harness_timeout_seconds=10,
+    )
+    assert run_config.context_max_characters == 20_000
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only-swebench-provider-secret")
+    runner = _ScriptedCommandRunner(
+        CommandOutcome(0, "Docker version 29.7.2\n", "", False),
+        CommandOutcome(1, "", "Docker Desktop Linux daemon is unavailable", False),
+    )
+
+    exit_code = main(
+        [
+            "swebench",
+            "run",
+            "--instance",
+            "synthetic__fixture-1",
+            "--artifacts",
+            str(artifacts),
+        ],
+        swebench_command_runner=runner,
+    )
+
+    assert exit_code == 3
+    capsys.readouterr()
+    manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
+    configuration = json.loads((artifacts / "config.json").read_text(encoding="utf-8"))
+    assert manifest["context_max_characters"] == 20_000
+    assert configuration["context_max_characters"] == 20_000
+
+
 def test_swebench_cli_docker_daemon_failure_is_auditable_and_secret_free(
     tmp_path: Path,
     monkeypatch: Any,

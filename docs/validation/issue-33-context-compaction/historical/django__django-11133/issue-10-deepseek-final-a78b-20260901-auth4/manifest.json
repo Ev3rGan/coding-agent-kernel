@@ -1,0 +1,16 @@
+{
+  "artifacts": [
+    "config.json",
+    "events.jsonl",
+    "kernel_configuration.json",
+    "provenance.json",
+    "session.jsonl",
+    "tool_results.jsonl"
+  ],
+  "completed": true,
+  "diagnostic": "evaluator was cancelled",
+  "exit_code": 5,
+  "stage": "agent",
+  "status": "cancelled",
+  "version": 1
+}

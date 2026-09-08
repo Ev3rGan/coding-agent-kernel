@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "artifact_id": "issue-33-815b166f-scikit-learn-14141-v1-c20000",
+  "instance_id": "scikit-learn__scikit-learn-14141",
+  "model": "deepseek-v4-pro",
+  "permission_mode": "full",
+  "context_max_characters": 20000,
+  "run": {
+    "status": "success",
+    "stage": "complete",
+    "completed": true,
+    "exit_code": 0,
+    "diagnostic": "official Harness resolved the instance"
+  },
+  "session": {
+    "record_count": 63,
+    "message_count": 38,
+    "compaction_count": 1,
+    "all_checkpoint_contract_checks_pass": true,
+    "latest_checkpoint_has_raw_message_after": true,
+    "latest_checkpoint_messages_after": 1
+  },
+  "checkpoints": [
+    {
+      "sequence": 61,
+      "entry_id": "entry-af144964cec84b89af0fe25ebc0eb29f",
+      "version": 2,
+      "previous_checkpoint_id": null,
+      "previous_link_valid": true,
+      "coverage_extends_previous": true,
+      "covered_count": 37,
+      "covered_unique_count": 37,
+      "covered_missing_count": 0,
+      "first_kept_entry_id": null,
+      "summary_characters": 2868,
+      "summary_headings_valid": true,
+      "recursive_summary_wrapper_hits": 0,
+      "compaction_depth": 1,
+      "characters_before": 46146,
+      "characters_after": 5383,
+      "retained_count": 0,
+      "message_records_after": 1,
+      "roles_after": [
+        "assistant"
+      ]
+    }
+  ],
+  "events": {
+    "active_branch": 62,
+    "agent_end": 1,
+    "agent_start": 1,
+    "compaction_started": 1,
+    "compaction_succeeded": 1,
+    "message_end": 15,
+    "message_start": 15,
+    "run_settled": 1,
+    "session_configuration": 1,
+    "session_entry": 62,
+    "tool_execution_end": 22,
+    "tool_execution_start": 22,
+    "turn_end": 15,
+    "turn_start": 15
+  },
+  "harness": {
+    "instance_id": "scikit-learn__scikit-learn-14141",
+    "infra_failure": false,
+    "patch_exists": true,
+    "patch_successfully_applied": true,
+    "resolved": true,
+    "fail_to_pass_success_count": 1,
+    "fail_to_pass_failure_count": 0,
+    "pass_to_pass_success_count": 2,
+    "pass_to_pass_failure_count": 0
+  }
+}

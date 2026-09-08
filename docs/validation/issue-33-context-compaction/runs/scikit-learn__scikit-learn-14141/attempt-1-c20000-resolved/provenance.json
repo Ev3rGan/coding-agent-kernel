@@ -1,0 +1,12 @@
+{
+  "base_commit": "3d997697fdd166eff428ea9fd35734b6a8ba113e",
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "dataset_revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "harness_version": "5.0.2",
+  "image": "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14141:latest",
+  "instance_id": "scikit-learn__scikit-learn-14141",
+  "official_contract_commit": "7a21e05772954cc81471ae19d56f436cecf43c54",
+  "repo": "scikit-learn/scikit-learn",
+  "split": "test",
+  "version": 1
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "source_artifact_id": "issue-10-deepseek-final-a78b-20260901-auth2",
+  "source_file": "events.jsonl",
+  "source_bytes": 4785922,
+  "source_lines": 3522,
+  "source_sha256": "5cafb87a644bdd8c12ac574d5b1ce097ba3a2bfb76a0ced28a48d975ff08aa0e",
+  "archived_file": "events.lifecycle.jsonl",
+  "excluded_kinds": [
+    "message_update",
+    "tool_execution_update"
+  ],
+  "archived_lines": 260,
+  "archived_sha256": "92f247f41e9d6badd70eb7757df7c878f2db0a45785107ed1a7b63af64a96654"
+}

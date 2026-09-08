@@ -29,6 +29,10 @@ class _FailingSummarizer:
         raise RuntimeError("deterministic summary failure")
 
 
+def test_context_settings_default_to_20k_character_budget() -> None:
+    assert ContextSettings().max_characters == 20_000
+
+
 def test_context_pipeline_orders_inputs_and_excludes_sibling_and_pending_messages() -> None:
     ids = iter(("root", "sibling-user", "sibling-answer", "active-user"))
     session = Session.create(
