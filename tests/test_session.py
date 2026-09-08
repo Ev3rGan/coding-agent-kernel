@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import Callable
@@ -289,11 +290,13 @@ def test_compaction_checkpoint_reloads_as_summary_plus_entries_after_checkpoint(
     )
     session.record_user_message("old question " * 80)
     session.record_authoritative_message(AssistantMessage(text="old answer " * 80))
-    built = ContextPipeline().build(
-        ContextInput(
-            settings=ContextSettings(max_characters=500),
-            active_branch=session.active_branch,
-            injected_messages=(UserMessage(text="current"),),
+    built = asyncio.run(
+        ContextPipeline().build(
+            ContextInput(
+                settings=ContextSettings(max_characters=500),
+                active_branch=session.active_branch,
+                injected_messages=(UserMessage(text="current"),),
+            )
         )
     )
     assert built.compaction is not None
@@ -302,16 +305,14 @@ def test_compaction_checkpoint_reloads_as_summary_plus_entries_after_checkpoint(
     session.close()
 
     resumed = Session.resume(store, "session-checkpoint")
-    projected = (
-        ContextPipeline()
-        .build(
+    projected = asyncio.run(
+        ContextPipeline().build(
             ContextInput(
                 settings=ContextSettings(max_characters=2_000),
                 active_branch=resumed.active_branch,
             )
         )
-        .context.provider_request.messages
-    )
+    ).context.provider_request.messages
 
     assert [message.role for message in projected] == ["summary", "user"]
     assert getattr(projected[-1], "text", None) == "new after checkpoint"

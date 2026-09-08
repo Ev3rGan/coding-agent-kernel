@@ -74,6 +74,10 @@ _Avoid_: entire Session, all branches
 The messages, system prompt, and active tools projected for one model request.
 _Avoid_: Session, complete transcript
 
+**Context Resource**:
+A source-identified, revisioned instruction or runtime fact re-projected as current authority for one Model Context rather than summarized as conversation history.
+_Avoid_: SessionEntry, user message
+
 **Compaction**:
 A Session checkpoint that represents older Active Branch history with a summary while retaining newer entries.
 _Avoid_: alternate ContextBuilder, history deletion

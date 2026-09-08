@@ -9,10 +9,15 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast
+from typing import Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 from coding_agent.callout import dispose_awaitable, invoke_sync_callout
+from coding_agent.compaction import (
+    CompactionContractError,
+    CompactionPlan,
+    decode_v2_compaction_checkpoint,
+)
 from coding_agent.events import (
     AgentError,
     AgentSessionEvent,
@@ -23,9 +28,6 @@ from coding_agent.events import (
 )
 from coding_agent.json_contract import json_object_snapshot
 from coding_agent.permissions import PermissionDecision, validate_permission_decision_record
-
-if TYPE_CHECKING:
-    from coding_agent.context import CompactionPlan
 
 SESSION_SCHEMA = "coding-agent-session"
 SESSION_SCHEMA_VERSION = 1
@@ -344,6 +346,85 @@ def _validate_compaction_values(
         )
 
 
+def _validate_v2_compaction_payload(
+    payload: Mapping[str, object],
+    *,
+    branch: tuple[SessionEntry, ...],
+    checkpoint_label: str,
+) -> None:
+    message_ids = tuple(entry.entry_id for entry in branch if entry.kind == "message")
+    previous_checkpoint = next(
+        (entry for entry in reversed(branch) if entry.kind == "compaction"),
+        None,
+    )
+    previous_coverage: tuple[str, ...] = ()
+    expected_depth = 1
+    if previous_checkpoint is not None:
+        raw_previous_coverage = previous_checkpoint.payload.get("covered_entry_ids")
+        if isinstance(raw_previous_coverage, (list, tuple)):
+            previous_coverage = tuple(
+                entry_id for entry_id in raw_previous_coverage if entry_id in set(message_ids)
+            )
+        previous_metrics = previous_checkpoint.payload.get("metrics")
+        if previous_checkpoint.payload.get("version") == 2 and isinstance(previous_metrics, dict):
+            previous_depth = previous_metrics.get("compaction_depth")
+            if type(previous_depth) is int:
+                expected_depth = previous_depth + 1
+        else:
+            expected_depth = 2
+    try:
+        checkpoint = decode_v2_compaction_checkpoint(
+            checkpoint_label,
+            payload,
+            message_ids=message_ids,
+            previous_checkpoint_id=(
+                None if previous_checkpoint is None else previous_checkpoint.entry_id
+            ),
+            previous_coverage=previous_coverage,
+            expected_depth=expected_depth,
+        )
+    except CompactionContractError as exc:
+        raise SessionRelationError(f"Compaction checkpoint {checkpoint_label} {exc}.") from exc
+    covered_messages = tuple(entry for entry in branch if entry.kind == "message")[
+        : len(checkpoint.covered_entry_ids)
+    ]
+    retained_messages = tuple(entry for entry in branch if entry.kind == "message")[
+        len(checkpoint.covered_entry_ids) :
+    ]
+    covered_calls, covered_results = _session_tool_transaction_ids(covered_messages)
+    retained_calls, retained_results = _session_tool_transaction_ids(retained_messages)
+    if covered_calls.intersection(retained_results) or retained_calls.intersection(covered_results):
+        raise SessionRelationError(
+            f"Compaction checkpoint {checkpoint_label} splits a ToolCall/ToolResult transaction."
+        )
+
+
+def _session_tool_transaction_ids(
+    entries: tuple[SessionEntry, ...],
+) -> tuple[set[str], set[str]]:
+    calls: set[str] = set()
+    results: set[str] = set()
+    for entry in entries:
+        role = entry.payload.get("role")
+        if role == "assistant":
+            raw_calls = entry.payload.get("tool_calls")
+            if isinstance(raw_calls, list):
+                calls.update(
+                    call_id
+                    for item in raw_calls
+                    if isinstance(item, dict) and isinstance((call_id := item.get("call_id")), str)
+                )
+        elif role == "tool":
+            raw_results = entry.payload.get("results")
+            if isinstance(raw_results, list):
+                results.update(
+                    call_id
+                    for item in raw_results
+                    if isinstance(item, dict) and isinstance((call_id := item.get("call_id")), str)
+                )
+    return calls, results
+
+
 def _encode_record(record: PersistenceRecord) -> str:
     value: dict[str, object] = {
         "schema": SESSION_SCHEMA,
@@ -498,6 +579,7 @@ class Session:
         self._next_sequence = 1
         self._closed = False
         self._events: list[AgentSessionEvent] = []
+        self._compactions_in_progress: set[str | None] = set()
         self._entry_types: dict[str, SessionEntryValidator] = {}
         self.register_entry_types(entry_types or {})
 
@@ -722,11 +804,7 @@ class Session:
         self.validate_compaction(plan)
         entry = self._append_entry(
             "compaction",
-            {
-                "version": plan.version,
-                "covered_entry_ids": list(plan.covered_entry_ids),
-                "summary": plan.summary,
-            },
+            plan.record(),
             run_id=run_id,
         )
         self._events.append(
@@ -736,20 +814,41 @@ class Session:
                 run_id=run_id,
             )
         )
+        self._compactions_in_progress.discard(run_id)
         return entry
 
     def validate_compaction(self, plan: CompactionPlan) -> None:
         """Validate a checkpoint proposal without changing Session or Store state."""
 
-        expected = tuple(
-            entry.entry_id for entry in self.active_branch if entry.kind != "configuration"
-        )
-        _validate_compaction_values(
-            version=plan.version,
-            summary=plan.summary,
-            covered_entry_ids=plan.covered_entry_ids,
-            expected_entry_ids=expected,
+        payload = plan.record()
+        if plan.version == 1:
+            expected = tuple(
+                entry.entry_id for entry in self.active_branch if entry.kind != "configuration"
+            )
+            _validate_compaction_values(
+                version=plan.version,
+                summary=plan.summary,
+                covered_entry_ids=plan.covered_entry_ids,
+                expected_entry_ids=expected,
+                checkpoint_label="proposal",
+            )
+            return
+        _validate_v2_compaction_payload(
+            payload,
+            branch=self.active_branch,
             checkpoint_label="proposal",
+        )
+
+    def record_compaction_started(self, *, run_id: str | None = None) -> None:
+        """Queue the automatic compaction lifecycle boundary before summary generation."""
+
+        self._compactions_in_progress.add(run_id)
+        self._events.append(
+            AgentSessionEvent.from_compaction_started(
+                self.session_id,
+                tuple(entry.entry_id for entry in self.active_branch),
+                run_id=run_id,
+            )
         )
 
     def record_context_failure(
@@ -761,12 +860,15 @@ class Session:
     ) -> None:
         """Queue an observable failure without appending an invalid checkpoint."""
 
+        compaction_started = run_id in self._compactions_in_progress
+        self._compactions_in_progress.discard(run_id)
         self._events.append(
             AgentSessionEvent.from_context_failure(
                 self.session_id,
                 tuple(entry.entry_id for entry in self.active_branch),
                 error,
                 stage=stage,
+                compaction_started=compaction_started,
                 run_id=run_id,
             )
         )
@@ -925,18 +1027,20 @@ class Session:
         if entry.parent_id is None:
             raise SessionRelationError("Compaction checkpoint cannot be the Session root.")
         payload = entry.payload
-        raw_coverage = payload.get("covered_entry_ids")
-        summary = payload.get("summary")
-        expected = tuple(
-            item.entry_id
-            for item in self._branch_to(entry.parent_id)
-            if item.kind != "configuration"
-        )
-        _validate_compaction_values(
-            version=payload.get("version"),
-            summary=summary,
-            covered_entry_ids=raw_coverage,
-            expected_entry_ids=expected,
+        branch = self._branch_to(entry.parent_id)
+        if payload.get("version") == 1:
+            expected = tuple(item.entry_id for item in branch if item.kind != "configuration")
+            _validate_compaction_values(
+                version=payload.get("version"),
+                summary=payload.get("summary"),
+                covered_entry_ids=payload.get("covered_entry_ids"),
+                expected_entry_ids=expected,
+                checkpoint_label=repr(entry.entry_id),
+            )
+            return
+        _validate_v2_compaction_payload(
+            payload,
+            branch=branch,
             checkpoint_label=repr(entry.entry_id),
         )
 

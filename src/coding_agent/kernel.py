@@ -5,19 +5,21 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import replace
 from functools import partial
 from itertools import count
-from typing import Literal, TypeVar, cast
+from typing import Literal
 
 from coding_agent.callout import dispose_awaitable
+from coding_agent.compaction import CompactionPlan
 from coding_agent.context import (
-    CompactionPlan,
     ContextConstructionError,
     ContextInput,
     ContextPipeline,
     ContextSettings,
     ModelContext,
+    ProviderCompactionEngine,
     estimate_provider_request_characters,
 )
 from coding_agent.control import RetryPolicy, RunControl
@@ -63,95 +65,23 @@ from coding_agent.permissions import (
 )
 from coding_agent.provider import (
     BranchSummaryMessage,
+    ContextResource,
     ModelMessage,
     ModelProvider,
     ProviderRequest,
     ToolResultMessage,
     UserMessage,
+    isolated_provider_close,
+    isolated_provider_events,
+    isolated_provider_factory,
 )
 from coding_agent.run import AgentRun
-from coding_agent.session import Session, SessionEntry, SessionStore
+from coding_agent.session import Session, SessionEntry, SessionRelationError, SessionStore
 from coding_agent.tool_runtime import ToolRuntime
 
 
 async def _put_progress(queue: asyncio.Queue[ToolProgress], progress: ToolProgress) -> None:
     await queue.put(progress)
-
-
-class _ProviderOwnedCancellationError(RuntimeError):
-    pass
-
-
-T = TypeVar("T")
-
-
-async def _isolated_provider_operation(
-    operation: Callable[[], Awaitable[T]],
-    *,
-    cancellation_message: str,
-) -> T:
-    """Run one Provider-owned awaitable in a child task on the authoritative loop."""
-
-    async def invoke() -> T:
-        return await operation()
-
-    worker = asyncio.create_task(invoke())
-    try:
-        return await worker
-    except asyncio.CancelledError as exc:
-        current = asyncio.current_task()
-        if current is not None and current.cancelling():
-            raise
-        raise _ProviderOwnedCancellationError(cancellation_message) from exc
-    finally:
-        if not worker.done():
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
-
-
-async def _isolated_provider_events(
-    stream: AsyncIterator[object],
-) -> AsyncIterator[object]:
-    """Keep Provider-owned task cancellation distinct from Host Run cancellation."""
-
-    while True:
-
-        async def read_one() -> object:
-            return await anext(stream)
-
-        try:
-            yield await _isolated_provider_operation(
-                read_one,
-                cancellation_message="Provider cancelled its own stream task",
-            )
-        except StopAsyncIteration:
-            return
-
-
-async def _isolated_provider_close(close: Callable[[], object]) -> None:
-    async def close_one() -> None:
-        result = close()
-        if not inspect.isawaitable(result):
-            raise TypeError("Provider stream aclose must be awaitable")
-        await cast(Awaitable[object], result)
-
-    await _isolated_provider_operation(
-        close_one,
-        cancellation_message="Provider cancelled its own cleanup task",
-    )
-
-
-async def _isolated_provider_factory(
-    provider: ModelProvider,
-    request: ProviderRequest,
-) -> object:
-    async def create_provider_stream() -> object:
-        return provider.stream(request)
-
-    return await _isolated_provider_operation(
-        create_provider_stream,
-        cancellation_message="Provider stream factory attempted cancellation",
-    )
 
 
 def _provider_failure_events(
@@ -201,11 +131,13 @@ class AgentKernel:
     ) -> None:
         self._tool_runtime = tool_runtime
         self._session = session
-        self._context_pipeline = context_pipeline or ContextPipeline()
         self._context_settings = context_settings or ContextSettings()
         self._retry_policy = retry_policy or RetryPolicy()
         self._extension_runtime = _extension_runtime or ExtensionRuntime(extensions)
         self._provider = self._resolve_provider(provider, self._extension_runtime)
+        self._context_pipeline = context_pipeline or ContextPipeline(
+            ProviderCompactionEngine(self._provider)
+        )
         self._validate_extension_tools(self._extension_runtime, self._tool_runtime)
         if self._session is not None and self._extension_runtime.session_entry_types:
             try:
@@ -438,15 +370,6 @@ class AgentKernel:
                     "extension",
                 )
 
-        first_request: ProviderRequest | None = None
-        context_error: AgentError | None = None
-        if input_error is None:
-            try:
-                first_request = self._build_context((UserMessage(text=prompt),), run_id=run_id)
-                if self._session is not None:
-                    self._session.record_user_message(prompt, run_id=run_id)
-            except ContextConstructionError as exc:
-                context_error = self._record_context_failure(exc, run_id=run_id)
         initial_events = () if self._session is None else self.drain_session_events()
         return AgentRun(
             run_id,
@@ -458,8 +381,6 @@ class AgentKernel:
                         control=control,
                         run_id=run_id,
                         prompt=prompt,
-                        first_request=first_request,
-                        context_error=context_error,
                         permission_mode=selected_permission_mode,
                         max_turns=max_turns,
                     )
@@ -485,11 +406,24 @@ class AgentKernel:
         control: RunControl,
         run_id: str,
         prompt: str,
-        first_request: ProviderRequest | None,
-        context_error: AgentError | None,
         permission_mode: PermissionMode,
         max_turns: int | None,
     ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
+        first_request: ProviderRequest | None = None
+        context_error: AgentError | None = None
+        try:
+            first_request = await self._build_context(
+                (UserMessage(text=prompt),),
+                run_id=run_id,
+                permission_mode=permission_mode,
+            )
+            if self._session is not None:
+                self._session.record_user_message(prompt, run_id=run_id)
+        except ContextConstructionError as exc:
+            context_error = self._record_context_failure(exc, run_id=run_id)
+        if self._session is not None:
+            for session_event in self.drain_session_events():
+                yield session_event
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
         next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
@@ -528,15 +462,22 @@ class AgentKernel:
             else:
                 try:
                     injected = next_injected if self._session is not None else tuple(history)
-                    request = self._build_context(
+                    request = await self._build_context(
                         injected,
                         run_id=run_id,
+                        permission_mode=permission_mode,
                         pending_messages=control.pending_messages(),
                         active_branch=next_active_branch,
                     )
                     next_active_branch = None
+                    if self._session is not None:
+                        for session_event in self.drain_session_events():
+                            yield session_event
                 except ContextConstructionError as exc:
                     context_failure = self._record_context_failure(exc, run_id=run_id)
+                    if self._session is not None:
+                        for session_event in self.drain_session_events():
+                            yield session_event
                     yield AgentEvent(
                         kind=AgentEventKind.ERROR,
                         run_id=run_id,
@@ -550,34 +491,7 @@ class AgentKernel:
                     return
             failure: ProviderError | None = None
             failure_source: Literal["provider", "extension"] = "provider"
-            try:
-                authoritative_request = self._extension_runtime.transform_provider_request(
-                    request,
-                    max_characters=self._context_settings.max_characters,
-                )
-            except ExtensionBlockedError as exc:
-                failure_source = "extension"
-                failure = ProviderError(
-                    code="extension_provider_blocked",
-                    message=f"{exc.code}: {exc}",
-                )
-            except ExtensionDispatchError as exc:
-                failure_source = "extension"
-                failure = ProviderError(
-                    code="extension_provider_rejected",
-                    message=str(exc),
-                )
-            if failure is not None:
-                for failure_event in _provider_failure_events(
-                    run_id=run_id,
-                    turn_id=turn_id,
-                    message_id=message_id,
-                    message=message,
-                    provider_error=failure,
-                    source=failure_source,
-                ):
-                    yield failure_event
-                return
+            authoritative_request = request
 
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 accumulator = AssistantMessageAccumulator()
@@ -589,7 +503,7 @@ class AgentKernel:
                 transformed_by: list[str] = []
                 tool_transformers: dict[int, list[str]] = {}
                 try:
-                    provider_stream_candidate = await _isolated_provider_factory(
+                    provider_stream_candidate = await isolated_provider_factory(
                         self._provider,
                         copy.deepcopy(authoritative_request),
                     )
@@ -601,7 +515,7 @@ class AgentKernel:
                     provider_stream = provider_stream_candidate
                     close_provider_stream = getattr(provider_stream, "aclose", None)
                     try:
-                        async for raw_provider_event in _isolated_provider_events(provider_stream):
+                        async for raw_provider_event in isolated_provider_events(provider_stream):
                             # Validate the provider's own stream independently so a
                             # later raw fault is never attributed to an earlier,
                             # harmless Extension transform.
@@ -675,7 +589,7 @@ class AgentKernel:
                     except BaseException:
                         if callable(close_provider_stream):
                             try:
-                                await _isolated_provider_close(close_provider_stream)
+                                await isolated_provider_close(close_provider_stream)
                             except BaseException as close_error:
                                 self._extension_runtime.record_provider_cleanup_failure(close_error)
                                 # Preserve the authoritative dispatch/cancel failure.
@@ -684,7 +598,7 @@ class AgentKernel:
                     else:
                         if callable(close_provider_stream):
                             try:
-                                await _isolated_provider_close(close_provider_stream)
+                                await isolated_provider_close(close_provider_stream)
                             except BaseException as close_error:
                                 self._extension_runtime.record_provider_cleanup_failure(close_error)
                                 if failure is None:
@@ -1035,31 +949,70 @@ class AgentKernel:
         ):
             yield failure_event
 
-    def _build_context(
+    async def _build_context(
         self,
         injected_messages: tuple[ModelMessage, ...],
         *,
         run_id: str,
+        permission_mode: PermissionMode,
         pending_messages: tuple[ModelMessage, ...] = (),
         active_branch: tuple[SessionEntry, ...] | None = None,
     ) -> ProviderRequest:
-        result = self._context_pipeline.build(
-            ContextInput(
-                settings=self._context_settings,
-                active_branch=(
-                    ()
-                    if self._session is None
-                    else self._session.active_branch
-                    if active_branch is None
-                    else active_branch
-                ),
-                active_tools=self._tool_schemas(),
-                injected_messages=injected_messages,
-                pending_messages=pending_messages,
+        session = self._session
+        base_resources = (
+            ContextResource(
+                source="agent-run",
+                authority="runtime",
+                resource_id="permission-mode",
+                revision=permission_mode.value,
+                content=f"Current run Permission Mode: {permission_mode.value}",
+            ),
+        )
+        try:
+            authoritative_resources = self._extension_runtime.supplement_context_resources(
+                base_resources,
+                run_id=run_id,
+                session_id=None if session is None else session.session_id,
+                current_messages=injected_messages,
             )
+        except ExtensionBlockedError as exc:
+            raise ContextConstructionError(
+                "extension_context_resource_blocked",
+                f"{exc.code}: {exc}",
+                stage="context",
+            ) from exc
+        except ExtensionDispatchError as exc:
+            raise ContextConstructionError(
+                "extension_context_resource_rejected",
+                str(exc),
+                stage="context",
+            ) from exc
+        context_input = ContextInput(
+            settings=self._context_settings,
+            active_branch=(
+                ()
+                if self._session is None
+                else self._session.active_branch
+                if active_branch is None
+                else active_branch
+            ),
+            active_tools=self._tool_schemas(),
+            authoritative_resources=authoritative_resources,
+            injected_messages=injected_messages,
+            pending_messages=pending_messages,
+        )
+        result = await self._context_pipeline.build(
+            context_input,
+            on_compaction_start=(
+                None
+                if session is None
+                else lambda: session.record_compaction_started(run_id=run_id)
+            ),
         )
         context = result.context
         compaction = None
+        canonical_compaction_messages: tuple[ModelMessage, ...] | None = None
+        canonical_covered_messages: tuple[ModelMessage, ...] = ()
         if result.compaction is not None:
             if self._session is None:  # pragma: no cover - no branch can produce a plan
                 raise RuntimeError("Compaction requires a durable Session.")
@@ -1083,7 +1036,13 @@ class AgentKernel:
                     str(exc),
                     stage="compaction",
                 ) from exc
-            context = self._context_with_compaction(context, compaction)
+            reprojected = self._context_pipeline.reproject_compaction(context_input, compaction)
+            if reprojected.compaction is None:  # pragma: no cover - construction invariant
+                raise RuntimeError("Compaction reprojection returned no validated plan.")
+            context = reprojected.context
+            compaction = reprojected.compaction
+            canonical_compaction_messages = context.provider_request.messages
+            canonical_covered_messages = reprojected.covered_messages
         try:
             context = self._extension_runtime.transform_context(context)
         except ExtensionBlockedError as exc:
@@ -1098,43 +1057,82 @@ class AgentKernel:
                 str(exc),
                 stage="context",
             ) from exc
+        try:
+            transformed_request = self._extension_runtime.transform_provider_request(
+                context.provider_request,
+                max_characters=self._context_settings.max_characters,
+            )
+        except ExtensionBlockedError as exc:
+            raise ContextConstructionError(
+                "extension_provider_blocked",
+                f"{exc.code}: {exc}",
+                stage="provider_request",
+            ) from exc
+        except ExtensionDispatchError as exc:
+            raise ContextConstructionError(
+                "extension_provider_rejected",
+                str(exc),
+                stage="provider_request",
+            ) from exc
+        context = ModelContext(
+            provider_request=transformed_request,
+            estimated_characters=estimate_provider_request_characters(transformed_request),
+            max_characters=context.max_characters,
+            assembly_order=context.assembly_order,
+        )
+        if compaction is not None:
+            compaction = replace(
+                compaction,
+                metrics=replace(
+                    compaction.metrics,
+                    final_characters=context.estimated_characters,
+                ),
+            )
+            try:
+                self._require_session().validate_compaction(compaction)
+            except SessionRelationError as exc:  # defensive final atomicity gate
+                raise ContextConstructionError(
+                    "extension_context_rejected",
+                    f"Final Context does not match the validated compaction plan: {exc}",
+                    stage="context",
+                ) from exc
+            if canonical_compaction_messages is None:  # pragma: no cover - construction invariant
+                raise RuntimeError("Compaction projection has no canonical message snapshot.")
+            self._validate_compaction_projection(
+                context,
+                compaction,
+                canonical_messages=canonical_compaction_messages,
+                covered_messages=canonical_covered_messages,
+            )
         if compaction is not None:
             self._require_session().record_compaction(compaction, run_id=run_id)
         self._model_contexts.append(context)
         return context.provider_request
 
     @staticmethod
-    def _context_with_compaction(
+    def _validate_compaction_projection(
         context: ModelContext,
         compaction: CompactionPlan,
-    ) -> ModelContext:
-        request = context.provider_request
-        if not request.messages or not isinstance(request.messages[0], BranchSummaryMessage):
+        *,
+        canonical_messages: tuple[ModelMessage, ...],
+        covered_messages: tuple[ModelMessage, ...],
+    ) -> None:
+        messages = context.provider_request.messages
+        supplemental_messages = messages[len(canonical_messages) :]
+        if (
+            len(messages) < len(canonical_messages)
+            or not isinstance(messages[0], BranchSummaryMessage)
+            or messages[0].text != compaction.summary
+            or messages[: len(canonical_messages)] != canonical_messages
+            or sum(isinstance(message, BranchSummaryMessage) for message in messages) != 1
+            or any(message in covered_messages for message in supplemental_messages)
+        ):
             raise ContextConstructionError(
-                "extension_compaction_rejected",
-                "Compaction transform has no canonical summary message to replace.",
-                stage="compaction",
+                "extension_context_rejected",
+                "Context and Provider request handlers must preserve the canonical checkpoint "
+                "message projection without restoring covered raw history.",
+                stage="context",
             )
-        transformed_request = ProviderRequest(
-            messages=(BranchSummaryMessage(text=compaction.summary), *request.messages[1:]),
-            tools=request.tools,
-            system_prompt=request.system_prompt,
-            tool_guidelines=request.tool_guidelines,
-            project_context=request.project_context,
-        )
-        estimated = estimate_provider_request_characters(transformed_request)
-        if estimated > context.max_characters:
-            raise ContextConstructionError(
-                "extension_compaction_rejected",
-                "Transformed compaction summary exceeds the canonical Context budget.",
-                stage="compaction",
-            )
-        return ModelContext(
-            provider_request=transformed_request,
-            estimated_characters=estimated,
-            max_characters=context.max_characters,
-            assembly_order=context.assembly_order,
-        )
 
     async def _inject_messages(
         self, run_id: str, messages: tuple[PendingMessage, ...]

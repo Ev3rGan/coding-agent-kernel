@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from coding_agent import (
@@ -41,31 +43,34 @@ def test_context_pipeline_orders_inputs_and_excludes_sibling_and_pending_message
     session.fork(root)
     session.record_user_message("ACTIVE_MARKER")
 
-    result = ContextPipeline().build(
-        ContextInput(
-            settings=ContextSettings(
-                system_prompt="SYSTEM_MARKER",
-                tool_guidelines="TOOL_GUIDELINE_MARKER",
-                project_context=("PROJECT_MARKER",),
-                max_characters=2_000,
-            ),
-            active_branch=session.active_branch,
-            active_tools=(
-                {
-                    "name": "read",
-                    "description": "Read a file",
-                    "schema": {"type": "object"},
-                    "mode": "parallel",
-                },
-            ),
-            injected_messages=(UserMessage(text="INJECTED_MARKER"),),
-            pending_messages=(UserMessage(text="PENDING_MARKER"),),
+    result = asyncio.run(
+        ContextPipeline().build(
+            ContextInput(
+                settings=ContextSettings(
+                    system_prompt="SYSTEM_MARKER",
+                    tool_guidelines="TOOL_GUIDELINE_MARKER",
+                    project_context=("PROJECT_MARKER",),
+                    max_characters=2_000,
+                ),
+                active_branch=session.active_branch,
+                active_tools=(
+                    {
+                        "name": "read",
+                        "description": "Read a file",
+                        "schema": {"type": "object"},
+                        "mode": "parallel",
+                    },
+                ),
+                injected_messages=(UserMessage(text="INJECTED_MARKER"),),
+                pending_messages=(UserMessage(text="PENDING_MARKER"),),
+            )
         )
     )
 
     assert result.context.assembly_order == (
         "system_prompt",
         "active_tools",
+        "authoritative_resources",
         "project_context",
         "active_branch",
         "injected_messages",
@@ -99,11 +104,13 @@ def test_over_budget_context_persists_a_bounded_compaction_without_deleting_hist
     session.record_authoritative_message(AssistantMessage(text="old answer " * 80))
     original_ids = tuple(entry.entry_id for entry in session.active_branch)
 
-    result = ContextPipeline().build(
-        ContextInput(
-            settings=ContextSettings(max_characters=500),
-            active_branch=session.active_branch,
-            injected_messages=(UserMessage(text="current request"),),
+    result = asyncio.run(
+        ContextPipeline().build(
+            ContextInput(
+                settings=ContextSettings(max_characters=500),
+                active_branch=session.active_branch,
+                injected_messages=(UserMessage(text="current request"),),
+            )
         )
     )
 
@@ -136,15 +143,14 @@ def test_kernel_uses_context_pipeline_and_emits_persisted_compaction_event() -> 
     kernel = AgentKernel(
         provider,
         session=session,
-        context_settings=ContextSettings(max_characters=500),
+        context_pipeline=ContextPipeline(),
+        context_settings=ContextSettings(max_characters=800),
     )
 
     async def collect() -> tuple[list[AgentSessionEvent], AgentRunResult]:
         run = kernel.create_run("CURRENT_INJECTED_MARKER")
         events = [event async for event in run]
         return events, await run.result()
-
-    import asyncio
 
     events, result = asyncio.run(collect())
 
@@ -186,8 +192,6 @@ def test_summary_failure_prevents_provider_call_and_preserves_recoverable_sessio
         run = kernel.create_run("CURRENT_INJECTED_MARKER")
         events = [event async for event in run]
         return events, await run.result()
-
-    import asyncio
 
     events, result = asyncio.run(collect())
 
@@ -256,10 +260,12 @@ def test_context_pipeline_rejects_checkpoint_covering_a_different_branch() -> No
     )
 
     with pytest.raises(ContextConstructionError, match="checkpoint.*invalid") as raised:
-        ContextPipeline().build(
-            ContextInput(
-                settings=ContextSettings(),
-                active_branch=branch,
+        asyncio.run(
+            ContextPipeline().build(
+                ContextInput(
+                    settings=ContextSettings(),
+                    active_branch=branch,
+                )
             )
         )
 

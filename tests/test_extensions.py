@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,6 +25,7 @@ from coding_agent import (
     CompactionPlan,
     ContextHookInput,
     ContextPipeline,
+    ContextResourceHookInput,
     ContextSettings,
     ContextSupplement,
     ExtensionEventKind,
@@ -128,6 +130,7 @@ def test_fixed_hook_policies_publish_the_complete_result_algebra() -> None:
     expected = {
         Hook.INPUT: mutable,
         Hook.BEFORE_AGENT_START: ("observe", "block"),
+        Hook.CONTEXT_RESOURCE: ("observe", "block", "supplement"),
         Hook.CONTEXT: supplementable,
         Hook.PROVIDER_REQUEST: supplementable,
         Hook.PROVIDER_RESPONSE: mutable,
@@ -159,6 +162,7 @@ def test_fixed_hook_policies_publish_the_complete_result_algebra() -> None:
     ("hook", "expected_error"),
     [
         (Hook.INPUT, "extension_input_blocked"),
+        (Hook.CONTEXT_RESOURCE, "extension_context_resource_blocked"),
         (Hook.CONTEXT, "extension_context_blocked"),
         (Hook.PROVIDER_REQUEST, "extension_provider_blocked"),
         (Hook.PROVIDER_RESPONSE, "extension_provider_blocked"),
@@ -1187,10 +1191,9 @@ class _CompactionTransformExtension:
     def _transform(self, hook_input: CompactionHookInput) -> Transform[CompactionPlan]:
         assert hook_input.plan is not None
         return Transform(
-            CompactionPlan(
-                hook_input.plan.covered_entry_ids,
-                f"{hook_input.plan.summary} [extension]",
-                hook_input.plan.version,
+            replace(
+                hook_input.plan,
+                summary=f"{hook_input.plan.summary} [extension]",
             )
         )
 
@@ -2141,6 +2144,7 @@ def test_fixed_hook_set_dispatches_on_authoritative_runtime_paths(tmp_path: Path
         "hook-trace",
         entry_id_factory=lambda: next(new_ids),
         tool_runtime=ToolRuntime(LocalCodingEnvironment(tmp_path)),
+        context_pipeline=ContextPipeline(),
         context_settings=ContextSettings(max_characters=2_500),
         extensions=(_ToolExtension(), trace),
     )
@@ -2162,6 +2166,7 @@ def test_fixed_hook_set_dispatches_on_authoritative_runtime_paths(tmp_path: Path
     expected_input_types = {
         Hook.INPUT: InputHookInput,
         Hook.BEFORE_AGENT_START: BeforeAgentStartHookInput,
+        Hook.CONTEXT_RESOURCE: ContextResourceHookInput,
         Hook.CONTEXT: ContextHookInput,
         Hook.PROVIDER_REQUEST: ProviderRequestHookInput,
         Hook.PROVIDER_RESPONSE: ProviderResponseHookInput,
@@ -2200,14 +2205,15 @@ def test_fixed_hook_set_dispatches_on_authoritative_runtime_paths(tmp_path: Path
         Hook.SESSION_TREE,
         Hook.INPUT,
         Hook.BEFORE_AGENT_START,
+        Hook.CONTEXT_RESOURCE,
         Hook.COMPACTION_START,
         Hook.CONTEXT,
+        Hook.PROVIDER_REQUEST,
         Hook.SESSION_ENTRY,
         Hook.COMPACTION_END,
         Hook.AGENT_START,
         Hook.TURN_START,
         Hook.MESSAGE_START,
-        Hook.PROVIDER_REQUEST,
         Hook.PROVIDER_RESPONSE,
         Hook.MESSAGE_UPDATE,
         Hook.MESSAGE_END,
@@ -2355,6 +2361,7 @@ def test_compaction_transform_is_shared_by_current_request_and_persisted_checkpo
         store,
         "compaction-transform",
         entry_id_factory=lambda: next(new_ids),
+        context_pipeline=ContextPipeline(),
         context_settings=ContextSettings(max_characters=2_500),
         extensions=(_CompactionTransformExtension(),),
     )
@@ -2389,6 +2396,7 @@ def test_compaction_block_prevents_provider_call_and_checkpoint_persistence() ->
     kernel = AgentKernel(
         provider,
         session=session,
+        context_pipeline=ContextPipeline(),
         context_settings=ContextSettings(max_characters=2_500),
         extensions=(_BlockingHookExtension(Hook.COMPACTION_START),),
     )

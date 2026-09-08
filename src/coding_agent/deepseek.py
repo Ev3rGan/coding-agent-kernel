@@ -169,6 +169,15 @@ def _request_body(request: ProviderRequest, model: str) -> dict[str, object]:
         system_parts.append(f"Tool guidelines:\n{request.tool_guidelines}")
     if request.project_context:
         system_parts.append("Project context:\n" + "\n".join(request.project_context))
+    if request.resources:
+        rendered_resources = "\n\n".join(
+            (
+                f"[{resource.authority}] {resource.resource_id} "
+                f"(source={resource.source}, revision={resource.revision})\n{resource.content}"
+            )
+            for resource in request.resources
+        )
+        system_parts.append("Current authoritative resources:\n" + rendered_resources)
     system_content = "\n\n".join(part for part in system_parts if part)
     if system_content:
         messages.append({"role": "system", "content": system_content})

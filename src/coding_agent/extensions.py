@@ -18,8 +18,8 @@ from coding_agent.callout import (
     dispose_awaitable,
     invoke_sync_callout,
 )
+from coding_agent.compaction import CompactionPlan
 from coding_agent.context import (
-    CompactionPlan,
     ContextHookInput,
     ModelContext,
     estimate_provider_request_characters,
@@ -46,6 +46,7 @@ from coding_agent.events import (
 from coding_agent.json_contract import json_object_snapshot
 from coding_agent.provider import (
     BranchSummaryMessage,
+    ContextResource,
     ModelMessage,
     ModelProvider,
     ProviderRequest,
@@ -61,6 +62,7 @@ class Hook(StrEnum):
 
     INPUT = "input"
     BEFORE_AGENT_START = "before_agent_start"
+    CONTEXT_RESOURCE = "context_resource"
     CONTEXT = "context"
     PROVIDER_REQUEST = "provider_request"
     PROVIDER_RESPONSE = "provider_response"
@@ -101,6 +103,7 @@ _HOOK_POLICIES = MappingProxyType(
     {
         Hook.INPUT: HookPolicy(("observe", "transform", "block")),
         Hook.BEFORE_AGENT_START: HookPolicy(("observe", "block")),
+        Hook.CONTEXT_RESOURCE: HookPolicy(("observe", "block", "supplement")),
         Hook.CONTEXT: HookPolicy(("observe", "transform", "block", "supplement")),
         Hook.PROVIDER_REQUEST: HookPolicy(("observe", "transform", "block", "supplement")),
         Hook.PROVIDER_RESPONSE: HookPolicy(("observe", "transform", "block")),
@@ -190,6 +193,23 @@ class ContextSupplement:
 
     project_context: tuple[str, ...] = ()
     messages: tuple[ModelMessage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ContextResourceHookInput:
+    """Current authority snapshot before conversation-budget allocation."""
+
+    run_id: str
+    session_id: str | None
+    current_messages: tuple[ModelMessage, ...]
+    resources: tuple[ContextResource, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextResourceSupplement:
+    """Extension-owned authority to re-project before Context compaction."""
+
+    resources: tuple[ContextResource, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,6 +744,7 @@ class ExtensionRuntime:
     def transform_context(self, context: ModelContext) -> ModelContext:
         canonical_max_characters = context.max_characters
         canonical_assembly_order = context.assembly_order
+        canonical_resources = context.provider_request.resources
         value = self._validate_context(
             context,
             max_characters=canonical_max_characters,
@@ -768,6 +789,25 @@ class ExtensionRuntime:
                     max_characters=canonical_max_characters,
                     assembly_order=canonical_assembly_order,
                 )
+                if not value.provider_request.resources and canonical_resources:
+                    restored_request = self._provider_request_with_resources(
+                        value.provider_request,
+                        canonical_resources,
+                    )
+                    value = self._validate_context(
+                        ModelContext(
+                            restored_request,
+                            estimated_characters=0,
+                            max_characters=value.max_characters,
+                            assembly_order=value.assembly_order,
+                        ),
+                        max_characters=canonical_max_characters,
+                        assembly_order=canonical_assembly_order,
+                    )
+                elif value.provider_request.resources != canonical_resources:
+                    raise ExtensionDispatchError(
+                        "context handlers must load authority through context_resource"
+                    )
             except ExtensionBlockedError:
                 raise
             except Exception as exc:
@@ -795,6 +835,75 @@ class ExtensionRuntime:
         self._emit(ExtensionEventKind.DISPATCH_COMPLETED, hook=Hook.CONTEXT)
         return value
 
+    def supplement_context_resources(
+        self,
+        resources: tuple[ContextResource, ...],
+        *,
+        run_id: str,
+        session_id: str | None,
+        current_messages: tuple[ModelMessage, ...],
+    ) -> tuple[ContextResource, ...]:
+        """Load current Extension authority before allocating conversation budget."""
+
+        value = self._validate_context_resources(resources)
+        self._emit(ExtensionEventKind.DISPATCH_STARTED, hook=Hook.CONTEXT_RESOURCE)
+        for registered in self._handlers[Hook.CONTEXT_RESOURCE]:
+            try:
+                outcome = self._invoke_handler(
+                    registered,
+                    ContextResourceHookInput(
+                        run_id,
+                        session_id,
+                        copy.deepcopy(current_messages),
+                        copy.deepcopy(value),
+                    ),
+                )
+            except Exception as exc:
+                self._handler_failed(registered, Hook.CONTEXT_RESOURCE, exc)
+            if isinstance(outcome, Observe):
+                self._handler_outcome(registered, Hook.CONTEXT_RESOURCE, "observe")
+                continue
+            try:
+                if isinstance(outcome, Supplement):
+                    supplement = outcome.value
+                    if not isinstance(supplement, ContextResourceSupplement):
+                        raise ExtensionDispatchError(
+                            "context_resource supplement must produce ContextResourceSupplement"
+                        )
+                    value = self._validate_context_resources((*value, *supplement.resources))
+                    outcome_name = "supplement"
+                elif isinstance(outcome, Block):
+                    self._block(registered, Hook.CONTEXT_RESOURCE, outcome)
+                else:
+                    raise ExtensionDispatchError(
+                        "context_resource Hook permits only Observe, Supplement, or Block"
+                    )
+            except ExtensionBlockedError:
+                raise
+            except Exception as exc:
+                rejected = (
+                    exc
+                    if isinstance(exc, ExtensionDispatchError)
+                    else ExtensionDispatchError(f"context_resource revalidation failed: {exc}")
+                )
+                self._emit(
+                    ExtensionEventKind.OUTCOME_REJECTED,
+                    extension_name=registered.extension_name,
+                    hook=Hook.CONTEXT_RESOURCE,
+                    outcome=("supplement" if isinstance(outcome, Supplement) else None),
+                    code=rejected.code,
+                    message=str(rejected),
+                )
+                raise rejected from exc
+            self._handler_outcome(
+                registered,
+                Hook.CONTEXT_RESOURCE,
+                outcome_name,
+                revalidated=True,
+            )
+        self._emit(ExtensionEventKind.DISPATCH_COMPLETED, hook=Hook.CONTEXT_RESOURCE)
+        return value
+
     def transform_provider_request(
         self,
         request: ProviderRequest,
@@ -802,6 +911,7 @@ class ExtensionRuntime:
         max_characters: int,
     ) -> ProviderRequest:
         value = self._validate_provider_request(request, max_characters=max_characters)
+        canonical_resources = value.resources
         self._emit(ExtensionEventKind.DISPATCH_STARTED, hook=Hook.PROVIDER_REQUEST)
         for registered in self._handlers[Hook.PROVIDER_REQUEST]:
             try:
@@ -830,6 +940,7 @@ class ExtensionRuntime:
                         system_prompt=value.system_prompt,
                         tool_guidelines=value.tool_guidelines,
                         project_context=(*value.project_context, *supplement.project_context),
+                        resources=value.resources,
                     )
                     outcome_name = "supplement"
                 elif isinstance(outcome, Block):
@@ -842,6 +953,15 @@ class ExtensionRuntime:
                     candidate,
                     max_characters=max_characters,
                 )
+                if not value.resources and canonical_resources:
+                    value = self._validate_provider_request(
+                        self._provider_request_with_resources(value, canonical_resources),
+                        max_characters=max_characters,
+                    )
+                elif value.resources != canonical_resources:
+                    raise ExtensionDispatchError(
+                        "provider_request handlers must load authority through context_resource"
+                    )
             except ExtensionBlockedError:
                 raise
             except Exception as exc:
@@ -1127,6 +1247,14 @@ class ExtensionRuntime:
                         "compaction_start Hook permits Observe, Transform, or Block"
                     ),
                 )
+            if outcome.value.version != plan.version:
+                self._reject_outcome(
+                    registered,
+                    Hook.COMPACTION_START,
+                    ExtensionDispatchError(
+                        "compaction_start handlers cannot change the checkpoint schema version"
+                    ),
+                )
             try:
                 validator(outcome.value)
             except Exception as exc:
@@ -1347,12 +1475,27 @@ class ExtensionRuntime:
             system_prompt=request.system_prompt,
             tool_guidelines=request.tool_guidelines,
             project_context=(*request.project_context, *supplement.project_context),
+            resources=request.resources,
         )
         return ModelContext(
             provider_request=supplemented,
             estimated_characters=0,
             max_characters=context.max_characters,
             assembly_order=context.assembly_order,
+        )
+
+    @staticmethod
+    def _provider_request_with_resources(
+        request: ProviderRequest,
+        resources: tuple[ContextResource, ...],
+    ) -> ProviderRequest:
+        return ProviderRequest(
+            messages=request.messages,
+            tools=request.tools,
+            system_prompt=request.system_prompt,
+            tool_guidelines=request.tool_guidelines,
+            project_context=request.project_context,
+            resources=resources,
         )
 
     @staticmethod
@@ -1386,6 +1529,19 @@ class ExtensionRuntime:
         )
 
     @staticmethod
+    def _validate_context_resources(value: object) -> tuple[ContextResource, ...]:
+        if not isinstance(value, tuple) or not all(
+            isinstance(resource, ContextResource) for resource in value
+        ):
+            raise ExtensionDispatchError("Context resources must be ContextResource tuples")
+        identities = [
+            (resource.authority, resource.source, resource.resource_id) for resource in value
+        ]
+        if len(set(identities)) != len(identities):
+            raise ExtensionDispatchError("Context resource identities must be unique")
+        return value
+
+    @staticmethod
     def _validate_provider_request(
         value: object,
         *,
@@ -1415,12 +1571,17 @@ class ExtensionRuntime:
             raise ExtensionDispatchError("ProviderRequest project resources must be a tuple")
         if not all(isinstance(item, str) for item in value.project_context):
             raise ExtensionDispatchError("ProviderRequest project resources must be strings")
+        if not isinstance(value.resources, tuple) or not all(
+            isinstance(item, ContextResource) for item in value.resources
+        ):
+            raise ExtensionDispatchError("ProviderRequest resources must be ContextResource values")
         snapshot = ProviderRequest(
             messages=messages,
             tools=tools,
             system_prompt=value.system_prompt,
             tool_guidelines=value.tool_guidelines,
             project_context=value.project_context,
+            resources=value.resources,
         )
         try:
             estimated = estimate_provider_request_characters(snapshot)
