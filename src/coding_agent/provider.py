@@ -38,6 +38,26 @@ class BranchSummaryMessage:
     text: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ContextResource:
+    """A current authoritative resource re-projected for one Provider request."""
+
+    source: str
+    authority: Literal["kernel", "runtime", "project", "extension"]
+    resource_id: str
+    revision: str
+    content: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value
+            for value in (self.source, self.resource_id, self.revision, self.content)
+        ):
+            raise ValueError("ContextResource fields must be non-empty strings")
+        if self.authority not in {"kernel", "runtime", "project", "extension"}:
+            raise ValueError("ContextResource authority is invalid")
+
+
 ModelMessage: TypeAlias = UserMessage | AssistantMessage | ToolResultMessage | BranchSummaryMessage
 
 
@@ -48,6 +68,7 @@ class ProviderRequest:
     system_prompt: str = ""
     tool_guidelines: str = ""
     project_context: tuple[str, ...] = ()
+    resources: tuple[ContextResource, ...] = ()
 
 
 class ModelProvider(Protocol):

@@ -6,18 +6,20 @@ import asyncio
 import copy
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import replace
 from functools import partial
 from itertools import count
 from typing import Literal, TypeVar, cast
 
 from coding_agent.callout import dispose_awaitable
+from coding_agent.compaction import CompactionPlan
 from coding_agent.context import (
-    CompactionPlan,
     ContextConstructionError,
     ContextInput,
     ContextPipeline,
     ContextSettings,
     ModelContext,
+    ProviderCompactionEngine,
     estimate_provider_request_characters,
 )
 from coding_agent.control import RetryPolicy, RunControl
@@ -63,6 +65,7 @@ from coding_agent.permissions import (
 )
 from coding_agent.provider import (
     BranchSummaryMessage,
+    ContextResource,
     ModelMessage,
     ModelProvider,
     ProviderRequest,
@@ -70,7 +73,7 @@ from coding_agent.provider import (
     UserMessage,
 )
 from coding_agent.run import AgentRun
-from coding_agent.session import Session, SessionEntry, SessionStore
+from coding_agent.session import Session, SessionEntry, SessionRelationError, SessionStore
 from coding_agent.tool_runtime import ToolRuntime
 
 
@@ -201,11 +204,13 @@ class AgentKernel:
     ) -> None:
         self._tool_runtime = tool_runtime
         self._session = session
-        self._context_pipeline = context_pipeline or ContextPipeline()
         self._context_settings = context_settings or ContextSettings()
         self._retry_policy = retry_policy or RetryPolicy()
         self._extension_runtime = _extension_runtime or ExtensionRuntime(extensions)
         self._provider = self._resolve_provider(provider, self._extension_runtime)
+        self._context_pipeline = context_pipeline or ContextPipeline(
+            ProviderCompactionEngine(self._provider)
+        )
         self._validate_extension_tools(self._extension_runtime, self._tool_runtime)
         if self._session is not None and self._extension_runtime.session_entry_types:
             try:
@@ -438,15 +443,6 @@ class AgentKernel:
                     "extension",
                 )
 
-        first_request: ProviderRequest | None = None
-        context_error: AgentError | None = None
-        if input_error is None:
-            try:
-                first_request = self._build_context((UserMessage(text=prompt),), run_id=run_id)
-                if self._session is not None:
-                    self._session.record_user_message(prompt, run_id=run_id)
-            except ContextConstructionError as exc:
-                context_error = self._record_context_failure(exc, run_id=run_id)
         initial_events = () if self._session is None else self.drain_session_events()
         return AgentRun(
             run_id,
@@ -458,8 +454,6 @@ class AgentKernel:
                         control=control,
                         run_id=run_id,
                         prompt=prompt,
-                        first_request=first_request,
-                        context_error=context_error,
                         permission_mode=selected_permission_mode,
                         max_turns=max_turns,
                     )
@@ -485,11 +479,24 @@ class AgentKernel:
         control: RunControl,
         run_id: str,
         prompt: str,
-        first_request: ProviderRequest | None,
-        context_error: AgentError | None,
         permission_mode: PermissionMode,
         max_turns: int | None,
     ) -> AsyncIterator[AgentEvent | AgentSessionEvent]:
+        first_request: ProviderRequest | None = None
+        context_error: AgentError | None = None
+        try:
+            first_request = await self._build_context(
+                (UserMessage(text=prompt),),
+                run_id=run_id,
+                permission_mode=permission_mode,
+            )
+            if self._session is not None:
+                self._session.record_user_message(prompt, run_id=run_id)
+        except ContextConstructionError as exc:
+            context_error = self._record_context_failure(exc, run_id=run_id)
+        if self._session is not None:
+            for session_event in self.drain_session_events():
+                yield session_event
         yield AgentEvent(kind=AgentEventKind.AGENT_START, run_id=run_id)
         history: list[ModelMessage] = [UserMessage(text=prompt)]
         next_injected: tuple[ModelMessage, ...] = (UserMessage(text=prompt),)
@@ -528,15 +535,22 @@ class AgentKernel:
             else:
                 try:
                     injected = next_injected if self._session is not None else tuple(history)
-                    request = self._build_context(
+                    request = await self._build_context(
                         injected,
                         run_id=run_id,
+                        permission_mode=permission_mode,
                         pending_messages=control.pending_messages(),
                         active_branch=next_active_branch,
                     )
                     next_active_branch = None
+                    if self._session is not None:
+                        for session_event in self.drain_session_events():
+                            yield session_event
                 except ContextConstructionError as exc:
                     context_failure = self._record_context_failure(exc, run_id=run_id)
+                    if self._session is not None:
+                        for session_event in self.drain_session_events():
+                            yield session_event
                     yield AgentEvent(
                         kind=AgentEventKind.ERROR,
                         run_id=run_id,
@@ -550,34 +564,7 @@ class AgentKernel:
                     return
             failure: ProviderError | None = None
             failure_source: Literal["provider", "extension"] = "provider"
-            try:
-                authoritative_request = self._extension_runtime.transform_provider_request(
-                    request,
-                    max_characters=self._context_settings.max_characters,
-                )
-            except ExtensionBlockedError as exc:
-                failure_source = "extension"
-                failure = ProviderError(
-                    code="extension_provider_blocked",
-                    message=f"{exc.code}: {exc}",
-                )
-            except ExtensionDispatchError as exc:
-                failure_source = "extension"
-                failure = ProviderError(
-                    code="extension_provider_rejected",
-                    message=str(exc),
-                )
-            if failure is not None:
-                for failure_event in _provider_failure_events(
-                    run_id=run_id,
-                    turn_id=turn_id,
-                    message_id=message_id,
-                    message=message,
-                    provider_error=failure,
-                    source=failure_source,
-                ):
-                    yield failure_event
-                return
+            authoritative_request = request
 
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 accumulator = AssistantMessageAccumulator()
@@ -1035,15 +1022,45 @@ class AgentKernel:
         ):
             yield failure_event
 
-    def _build_context(
+    async def _build_context(
         self,
         injected_messages: tuple[ModelMessage, ...],
         *,
         run_id: str,
+        permission_mode: PermissionMode,
         pending_messages: tuple[ModelMessage, ...] = (),
         active_branch: tuple[SessionEntry, ...] | None = None,
     ) -> ProviderRequest:
-        result = self._context_pipeline.build(
+        session = self._session
+        base_resources = (
+            ContextResource(
+                source="agent-run",
+                authority="runtime",
+                resource_id="permission-mode",
+                revision=permission_mode.value,
+                content=f"Current run Permission Mode: {permission_mode.value}",
+            ),
+        )
+        try:
+            authoritative_resources = self._extension_runtime.supplement_context_resources(
+                base_resources,
+                run_id=run_id,
+                session_id=None if session is None else session.session_id,
+                current_messages=injected_messages,
+            )
+        except ExtensionBlockedError as exc:
+            raise ContextConstructionError(
+                "extension_context_resource_blocked",
+                f"{exc.code}: {exc}",
+                stage="context",
+            ) from exc
+        except ExtensionDispatchError as exc:
+            raise ContextConstructionError(
+                "extension_context_resource_rejected",
+                str(exc),
+                stage="context",
+            ) from exc
+        result = await self._context_pipeline.build(
             ContextInput(
                 settings=self._context_settings,
                 active_branch=(
@@ -1054,9 +1071,15 @@ class AgentKernel:
                     else active_branch
                 ),
                 active_tools=self._tool_schemas(),
+                authoritative_resources=authoritative_resources,
                 injected_messages=injected_messages,
                 pending_messages=pending_messages,
-            )
+            ),
+            on_compaction_start=(
+                None
+                if session is None
+                else lambda: session.record_compaction_started(run_id=run_id)
+            ),
         )
         context = result.context
         compaction = None
@@ -1098,6 +1121,46 @@ class AgentKernel:
                 str(exc),
                 stage="context",
             ) from exc
+        try:
+            transformed_request = self._extension_runtime.transform_provider_request(
+                context.provider_request,
+                max_characters=self._context_settings.max_characters,
+            )
+        except ExtensionBlockedError as exc:
+            raise ContextConstructionError(
+                "extension_provider_blocked",
+                f"{exc.code}: {exc}",
+                stage="provider_request",
+            ) from exc
+        except ExtensionDispatchError as exc:
+            raise ContextConstructionError(
+                "extension_provider_rejected",
+                str(exc),
+                stage="provider_request",
+            ) from exc
+        context = ModelContext(
+            provider_request=transformed_request,
+            estimated_characters=estimate_provider_request_characters(transformed_request),
+            max_characters=context.max_characters,
+            assembly_order=context.assembly_order,
+        )
+        if compaction is not None:
+            compaction = replace(
+                compaction,
+                metrics=replace(
+                    compaction.metrics,
+                    characters_after=context.estimated_characters,
+                ),
+            )
+            try:
+                self._require_session().validate_compaction(compaction)
+            except SessionRelationError as exc:  # defensive final atomicity gate
+                raise ContextConstructionError(
+                    "extension_context_rejected",
+                    f"Final Context does not match the validated compaction plan: {exc}",
+                    stage="context",
+                ) from exc
+            self._validate_compaction_projection(context, compaction)
         if compaction is not None:
             self._require_session().record_compaction(compaction, run_id=run_id)
         self._model_contexts.append(context)
@@ -1121,6 +1184,7 @@ class AgentKernel:
             system_prompt=request.system_prompt,
             tool_guidelines=request.tool_guidelines,
             project_context=request.project_context,
+            resources=request.resources,
         )
         estimated = estimate_provider_request_characters(transformed_request)
         if estimated > context.max_characters:
@@ -1135,6 +1199,24 @@ class AgentKernel:
             max_characters=context.max_characters,
             assembly_order=context.assembly_order,
         )
+
+    @staticmethod
+    def _validate_compaction_projection(
+        context: ModelContext,
+        compaction: CompactionPlan,
+    ) -> None:
+        messages = context.provider_request.messages
+        if (
+            not messages
+            or not isinstance(messages[0], BranchSummaryMessage)
+            or messages[0].text != compaction.summary
+        ):
+            raise ContextConstructionError(
+                "extension_context_rejected",
+                "Context and Provider request handlers must preserve the validated checkpoint "
+                "summary projection.",
+                stage="context",
+            )
 
     async def _inject_messages(
         self, run_id: str, messages: tuple[PendingMessage, ...]

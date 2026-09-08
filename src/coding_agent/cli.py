@@ -359,18 +359,39 @@ def _swebench_run(
             )
         )
         return 2
+    if args.context_max_characters <= 0:
+        _print_record(
+            _swebench_record(
+                "configuration",
+                "prediction_invalid",
+                "context character budget must be a positive integer",
+                None,
+            )
+        )
+        return 2
     try:
         provider = DeepSeekProvider(model=args.model, transport=transport)
     except DeepSeekConfigurationError as exc:
         _print_record(_swebench_record("provider_configuration", "agent_failed", str(exc), None))
         return 2
+    run_config = SWEbenchRunConfig(
+        instance_id=args.instance,
+        model=args.model,
+        mode=PermissionMode(args.mode),
+        agent_timeout_seconds=args.timeout,
+        harness_timeout_seconds=args.harness_timeout,
+        context_max_characters=args.context_max_characters,
+    )
     if command_runner is None:
         command_runner = SubprocessCommandRunner()
     inherited_api_key = os.environ.pop("DEEPSEEK_API_KEY", None)
     try:
         artifacts_path = Path(args.artifacts or default_artifacts_path(args.instance))
         try:
-            bundle = ArtifactBundle.create(artifacts_path)
+            bundle = ArtifactBundle.create(
+                artifacts_path,
+                run_config=run_config,
+            )
         except OSError as exc:
             _print_record(
                 _swebench_record(
@@ -385,14 +406,15 @@ def _swebench_run(
             "config.json",
             {
                 "version": 1,
-                "instance_id": args.instance,
+                "instance_id": run_config.instance_id,
                 "dataset": SWE_BENCH_DATASET,
                 "split": SWE_BENCH_SPLIT,
                 "provider": "deepseek",
-                "model": args.model,
-                "permission_mode": args.mode,
-                "agent_timeout_seconds": args.timeout,
-                "harness_timeout_seconds": args.harness_timeout,
+                "model": run_config.model,
+                "permission_mode": run_config.mode.value,
+                "agent_timeout_seconds": run_config.agent_timeout_seconds,
+                "harness_timeout_seconds": run_config.harness_timeout_seconds,
+                "context_max_characters": run_config.context_max_characters,
                 "official_contract_commit": SWE_BENCH_CONTRACT_COMMIT,
             },
         )
@@ -442,13 +464,7 @@ def _swebench_run(
         try:
             execution = asyncio.run(
                 evaluator.run(
-                    SWEbenchRunConfig(
-                        instance_id=args.instance,
-                        model=args.model,
-                        mode=PermissionMode(args.mode),
-                        agent_timeout_seconds=args.timeout,
-                        harness_timeout_seconds=args.harness_timeout,
-                    ),
+                    run_config,
                     bundle,
                     permission_resolver=_read_permission_decision,
                     on_status=render_status,
@@ -1513,8 +1529,7 @@ async def _context_compaction_demo(case: str) -> int:
         injected = UserMessage(text="INJECTED_MARKER")
         pending = UserMessage(text="PENDING_MARKER")
         before = (
-            ContextPipeline()
-            .build(
+            await ContextPipeline().build(
                 ContextInput(
                     settings=ContextSettings(max_characters=100_000),
                     active_branch=session.active_branch,
@@ -1522,8 +1537,7 @@ async def _context_compaction_demo(case: str) -> int:
                     pending_messages=(pending,),
                 )
             )
-            .context
-        )
+        ).context
         _print_record(
             {
                 "context_before": _context_record(
@@ -1679,6 +1693,12 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=1800.0,
         help="official Harness per-instance timeout seconds",
+    )
+    swebench_run.add_argument(
+        "--context-max-characters",
+        type=int,
+        default=100_000,
+        help="Model Context character budget recorded in run artifacts",
     )
     demo = commands.add_parser("demo", help="run deterministic local demonstrations")
     demos = demo.add_subparsers(dest="demo", required=True)

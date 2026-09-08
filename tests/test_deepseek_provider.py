@@ -36,6 +36,7 @@ from coding_agent.kernel import AgentKernel
 from coding_agent.permissions import PermissionMode
 from coding_agent.provider import (
     BranchSummaryMessage,
+    ContextResource,
     ProviderRequest,
     ToolResultMessage,
     UserMessage,
@@ -187,6 +188,15 @@ def test_provider_maps_complete_request_and_normalizes_stream_across_byte_bounda
         system_prompt="system",
         tool_guidelines="use tools safely",
         project_context=("project A", "project B"),
+        resources=(
+            ContextResource(
+                source="skill-loader",
+                authority="extension",
+                resource_id="skill:current",
+                revision="sha256:abc",
+                content="CURRENT_SKILL_RULE",
+            ),
+        ),
         tools=(
             {
                 "name": "read",
@@ -249,7 +259,10 @@ def test_provider_maps_complete_request_and_normalizes_stream_across_byte_bounda
             "role": "system",
             "content": (
                 "system\n\nTool guidelines:\nuse tools safely\n\n"
-                "Project context:\nproject A\nproject B"
+                "Project context:\nproject A\nproject B\n\n"
+                "Current authoritative resources:\n"
+                "[extension] skill:current (source=skill-loader, revision=sha256:abc)\n"
+                "CURRENT_SKILL_RULE"
             ),
         },
         {"role": "system", "content": "Active branch summary:\nolder branch summary"},

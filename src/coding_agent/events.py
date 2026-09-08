@@ -570,6 +570,7 @@ class AgentSessionEventKind(StrEnum):
     ACTIVE_BRANCH = "active_branch"
     SESSION_RESUMED = "session_resumed"
     SESSION_CONFIGURATION = "session_configuration"
+    COMPACTION_STARTED = "compaction_started"
     COMPACTION_SUCCEEDED = "compaction_succeeded"
     COMPACTION_FAILED = "compaction_failed"
     CONTEXT_FAILED = "context_failed"
@@ -592,6 +593,7 @@ _SESSION_EVENT_KINDS = {
     AgentSessionEventKind.ACTIVE_BRANCH,
     AgentSessionEventKind.SESSION_RESUMED,
     AgentSessionEventKind.SESSION_CONFIGURATION,
+    AgentSessionEventKind.COMPACTION_STARTED,
     AgentSessionEventKind.COMPACTION_SUCCEEDED,
     AgentSessionEventKind.COMPACTION_FAILED,
     AgentSessionEventKind.CONTEXT_FAILED,
@@ -686,6 +688,7 @@ class AgentSessionEvent:
                 self.kind
                 in {
                     AgentSessionEventKind.ACTIVE_BRANCH,
+                    AgentSessionEventKind.COMPACTION_STARTED,
                     AgentSessionEventKind.COMPACTION_SUCCEEDED,
                 }
                 and self.active_branch is None
@@ -841,6 +844,21 @@ class AgentSessionEvent:
             run_id=run_id,
             session_id=entry.session_id,
             session_entry=entry,
+            active_branch=active_branch,
+        )
+
+    @classmethod
+    def from_compaction_started(
+        cls,
+        session_id: str,
+        active_branch: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+    ) -> AgentSessionEvent:
+        return cls(
+            kind=AgentSessionEventKind.COMPACTION_STARTED,
+            run_id=run_id,
+            session_id=session_id,
             active_branch=active_branch,
         )
 

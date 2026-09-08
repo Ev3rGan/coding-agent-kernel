@@ -556,6 +556,8 @@ def test_swebench_cli_docker_daemon_failure_is_auditable_and_secret_free(
             "synthetic__fixture-1",
             "--artifacts",
             str(artifacts),
+            "--context-max-characters",
+            "4096",
         ],
         swebench_command_runner=runner,
     )
@@ -583,12 +585,40 @@ def test_swebench_cli_docker_daemon_failure_is_auditable_and_secret_free(
     assert manifest["status"] == "environment_preparation_failed"
     assert manifest["completed"] is True
     assert manifest["stage"] == "environment_preparation"
+    assert manifest["context_max_characters"] == 4096
+    configuration = json.loads((artifacts / "config.json").read_text(encoding="utf-8"))
+    assert configuration["context_max_characters"] == 4096
     serialized = "".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in artifacts.rglob("*")
         if path.is_file()
     )
     assert secret not in serialized
+
+
+def test_swebench_cli_rejects_non_positive_context_character_budget(capsys: Any) -> None:
+    exit_code = main(
+        [
+            "swebench",
+            "run",
+            "--instance",
+            "synthetic__fixture-1",
+            "--context-max-characters",
+            "0",
+        ]
+    )
+
+    assert exit_code == 2
+    assert _records(capsys.readouterr().out) == [
+        {
+            "swebench": {
+                "stage": "configuration",
+                "status": "prediction_invalid",
+                "diagnostic": "context character budget must be a positive integer",
+                "artifacts": None,
+            }
+        }
+    ]
 
 
 def test_swebench_cli_finalizes_artifacts_when_instance_metadata_is_invalid(
@@ -1201,6 +1231,7 @@ def test_evaluator_never_invokes_harness_without_a_valid_git_prediction(
                 mode=PermissionMode.FULL,
                 agent_timeout_seconds=10,
                 harness_timeout_seconds=10,
+                context_max_characters=4_321,
             ),
             artifacts,
             permission_resolver=deny,
@@ -1216,6 +1247,7 @@ def test_evaluator_never_invokes_harness_without_a_valid_git_prediction(
     manifest = json.loads((artifacts.root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed"] is True
     assert manifest["status"] == expected_status
+    assert manifest["context_max_characters"] == 4_321
 
 
 @pytest.mark.parametrize(

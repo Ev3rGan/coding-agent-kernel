@@ -270,14 +270,25 @@ def sanitized_subprocess_environment(
 class ArtifactBundle:
     """Own one append-only evaluator run directory and its atomic manifest."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        run_config: SWEbenchRunConfig | None = None,
+    ) -> None:
         self.root = root.resolve()
+        self._run_config = run_config
 
     @classmethod
-    def create(cls, root: Path) -> ArtifactBundle:
+    def create(
+        cls,
+        root: Path,
+        *,
+        run_config: SWEbenchRunConfig | None = None,
+    ) -> ArtifactBundle:
         resolved = root.resolve()
         resolved.mkdir(parents=True, exist_ok=False)
-        bundle = cls(resolved)
+        bundle = cls(resolved, run_config=run_config)
         bundle.write_json(
             "manifest.json",
             {
@@ -287,10 +298,26 @@ class ArtifactBundle:
                 "completed": False,
                 "exit_code": None,
                 "diagnostic": "run artifact ownership established",
+                "context_max_characters": (
+                    None if run_config is None else run_config.context_max_characters
+                ),
                 "artifacts": [],
             },
         )
         return bundle
+
+    def bind_run_config(self, config: SWEbenchRunConfig) -> None:
+        """Bind the exact evaluator configuration as manifest authority."""
+
+        if self._run_config is not None and self._run_config != config:
+            raise SWEbenchConfigurationError(
+                "artifact manifest configuration does not match the evaluator run"
+            )
+        self._run_config = config
+        manifest_path = self.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["context_max_characters"] = config.context_max_characters
+        self.write_json("manifest.json", manifest)
 
     def _target(self, relative: str) -> Path:
         target = (self.root / relative).resolve()
@@ -358,6 +385,9 @@ class ArtifactBundle:
                 "completed": True,
                 "exit_code": exit_code,
                 "diagnostic": diagnostic,
+                "context_max_characters": (
+                    None if self._run_config is None else self._run_config.context_max_characters
+                ),
                 "artifacts": artifacts,
             },
         )
@@ -672,6 +702,7 @@ class SWEbenchRunConfig:
     mode: PermissionMode
     agent_timeout_seconds: float
     harness_timeout_seconds: float
+    context_max_characters: int = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -1460,6 +1491,7 @@ class SWEbenchEvaluator:
         permission_resolver: PermissionResolver,
         on_status: StatusCallback | None = None,
     ) -> SWEbenchExecution:
+        artifacts.bind_run_config(config)
         prepared: PreparedWorkspace | None = None
         kernel: AgentKernel | None = None
         agent_run: AgentRun | None = None
@@ -1605,6 +1637,7 @@ class SWEbenchEvaluator:
                     "commands after their result is already known."
                 ),
                 project_context=(f"Workspace root: {instance.container_workdir}",),
+                max_characters=config.context_max_characters,
             )
             try:
                 kernel_distribution_version = importlib.metadata.version("coding-agent-kernel")
