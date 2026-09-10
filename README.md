@@ -1,411 +1,104 @@
-# Coding Agent Kernel
+<h1 align="center">Coding Agent Kernel</h1>
 
-An independently implemented, headless Python Coding Agent Kernel for observable Agent Runs,
-Tool Execution, durable Sessions, deterministic Model Context, and Host-controlled Permission
-Modes.
+<p align="center"><strong>一个可观察、可恢复、权限受控的 Headless Python Coding Agent Kernel。</strong></p>
 
-> **Status:** experimental `0.x` software under active development. Public interfaces and
-> persisted formats may change before `1.0`; this project does not claim production sandboxing
-> or guaranteed SWE-bench outcomes.
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
 
-## Installation
+<p align="center">
+  <a href="https://github.com/Ev3rGan/coding-agent-kernel/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Ev3rGan/coding-agent-kernel/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <a href="LICENSE"><img alt="Apache-2.0 License" src="https://img.shields.io/badge/License-Apache--2.0-2F6FEB"></a>
+</p>
 
-Python 3.11 or newer is required. From a source checkout:
+Coding Agent Kernel 是一个独立实现的 Python 运行时：它把模型流式调用、Tool Execution、
+持久化 Session、Model Context、运行时控制与 Host 权限决策收敛到同一套公开接口中。
+Terminal CLI、SWE-bench evaluator 和未来的 Host 集成都通过同一个 `AgentKernel` / `AgentRun`
+边界驱动内核。
+
+> [!IMPORTANT]
+> 当前版本是实验性 `0.x` 软件。公开接口和持久化格式在 `1.0` 前仍可能变化；项目不宣称
+> 提供生产级 Sandbox，也不保证任意 SWE-bench 任务或模型调用都能成功。
+
+## ✨ 为什么做这个 Kernel
+
+许多 Coding Agent 示例止步于“调用模型 API 并执行一个命令”。本项目进一步实现并验证了
+一条完整、可解释的运行路径：
+
+- **Headless by design**：Kernel 不绑定 IDE、TUI 或产品 Shell，Host 只依赖稳定运行接口。
+- **Observable by default**：模型增量、ToolCall、ToolResult、权限请求、Session 和唯一终态均可观察。
+- **Recoverable state**：Session 是持久化、可恢复、可分支的 append-only tree，而不是临时聊天记录。
+- **Controlled authority**：模型与 Extension 都不能自行提升权限，最终决定由 Host 持有。
+- **Evidence over claims**：确定性故障场景、质量门禁和真实 SWE-bench Harness 结果均可复查。
+
+项目以 Pi 的 Kernel 行为作为选定范围内的技术基线，但代码、Python 表达、公开接口、
+持久化格式和 Permission Policy 均为独立实现。设计边界记录在
+[ADR 0001](docs/adr/0001-pi-baseline-independent-python-kernel.md) 和
+[Canonical Spec](docs/specs/coding-agent-kernel.md) 中。
+
+## 🧭 核心能力
+
+| 能力 | 对外保证 |
+| --- | --- |
+| Observable Agent Run | `AgentRun` 是事件迭代、steering、follow-up、取消、权限响应和最终结果的统一入口 |
+| Model–tool–model loop | Provider 流事件被规范化；Tool 按显式调度规则执行，结果按原始 ToolCall 顺序返回 |
+| Durable Session | 权威消息持久化为可恢复、可分支的 Session tree，支持内存与 JSONL Store |
+| Deterministic Context | 每次 Provider 请求只投影当前 Active Branch、当前权威资源和已经注入的消息 |
+| Semantic Compaction | 旧历史以可追溯 checkpoint 表示，近期完整 turns 和原始 Session 记录继续保留 |
+| Host permissions | `plan`、`ask`、`auto`、`full` 四种 run-scoped 模式约束 Tool Execution |
+| Fixed Extensions | Tool、Provider、SessionEntry type 与 Hook 通过固定 registry 显式注册并逐次重验证 |
+
+## 🚀 60 秒快速开始
+
+需要 Python 3.11 或更高版本。从源码 checkout 安装：
 
 ```console
 python -m pip install .
-python -m coding_agent --help
 ```
 
-Use `python -m pip install -e ".[dev]"` for development. The SWE-bench evaluator is an
-optional, heavier install: `python -m pip install -e ".[swebench]"`.
+先运行不需要 API key、不会访问外网的确定性演示：
 
-## Navigation
+```console
+python -m coding_agent demo streamed-run
+python -m coding_agent demo tool-loop
+```
 
-- [Run a real local coding path with DeepSeek](#用-deepseek-运行真实本地编码路径)
-- [Run one SWE-bench Verified instance](#运行一个-swe-bench-verified-实例)
-- [Inspect deterministic local demos](#observable-headless-agent-run)
-- [Understand Host permission modes](#host-permission-modes)
-- [Contribute](CONTRIBUTING.md), [report a vulnerability](SECURITY.md), or read the
-  [Code of Conduct](CODE_OF_CONDUCT.md) and [license](LICENSE)
+第一条命令输出完整的 JSON Lines 运行生命周期；第二条命令在临时 workspace 中执行
+`read`、`edit` 和 `bash`，再把有序 ToolResults 送回 Fake Provider。更多成功与失败场景见
+[确定性演示指南](docs/guides/demos.md)。
 
-## 用 DeepSeek 运行真实本地编码路径
+## 🤖 运行真实编码任务
 
-先在进程环境中设置 `DEEPSEEK_API_KEY`，再对 disposable 或明确授权的 workspace
-运行同一条公开 Kernel 路径：
+把 DeepSeek API key 只注入当前 Host 进程环境：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "<YOUR_API_KEY>"
+```
+
+```bash
+export DEEPSEEK_API_KEY="<YOUR_API_KEY>"
+```
+
+然后对 disposable 或明确授权的 workspace 运行：
 
 ```console
 python -m coding_agent run --provider deepseek --workspace <workspace> --mode ask "<coding-task>"
 ```
 
-CLI 使用固定的官方 `https://api.deepseek.com/chat/completions` endpoint，默认模型是
-`deepseek-v4-pro`，也只允许当前明确支持的 `deepseek-v4-pro` 和
-`deepseek-v4-flash` 标识。凭据不接受命令行参数或配置文件，只从当前进程环境读取；
-缺失时命令在创建 Session 或发起网络请求前以 `deepseek_api_key_missing` 退出。
-CLI 在 Provider 捕获凭据后，会在 Agent Run 期间从可被 Tool 子进程继承的环境中移除它，
-结束后再恢复 Host 进程环境。不要把 API key 写入 task、workspace、Session 或 shell history。
-CLI 不会自动读取或解析 `.env`。可信 Host 可以从受保护的 secret store 或本地 `.env`
-加载凭据，并只注入新建 `coding-agent` 子进程的环境；不要把该文件或其内容暴露给
-workspace、Tool 或日志。
+CLI 持续输出 `AgentSessionEvent` JSON Lines，并在结束时给出权威结果、Session 信息、
+changed paths 和 patch。`ask` 模式会在写入或其他受控操作前等待 Host 的一次性决定。
 
-每次新运行会创建 append-only JSONL Session，并在最终记录中打印 Session ID 和文件
-路径。authoritative assistant messages 与对应的 ToolResults 都会按活动分支持久化，使恢复
-后的 Provider history 继续保持完整的 assistant/tool 配对。使用同一个 store 恢复已关闭的
-Session：
+> [!WARNING]
+> 不要把 API key 写入 task、workspace、Session、配置文件或 shell history。`full` 会跳过
+> Kernel approval 与 workspace containment，只应用于明确可信且可丢弃的运行环境。
 
-```console
-python -m coding_agent run --provider deepseek --workspace <workspace> --mode ask \
-  --session-file <sessions.jsonl> --resume <session-id> "<next-coding-task>"
-```
+凭据生命周期、Session resume、Provider 协议和失败语义见
+[DeepSeek 运行指南](docs/guides/deepseek.md)。
 
-Host 持续把 `AgentSessionEvent` 渲染成 JSON Lines。`ask` 模式在
-`permission_requested` 后从 stdin 接受一次 `approve` 或 `deny`；空输入和其他输入
-默认拒绝。最终输出包含 authoritative result、Session 信息、changed paths、文本 patch
-和单独列出的 binary paths。workspace snapshot 忽略 `.git`、symlink 和位于 workspace
-内的 Session 文件，不会为了生成 patch 修改仓库。
+## 🧩 Python API
 
-Adapter 的协议依据是 DeepSeek 官方
-[Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)、
-[Thinking Mode](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)、
-[Tool Calls](https://api-docs.deepseek.com/guides/tool_calls/) 与
-[Error Codes](https://api-docs.deepseek.com/quick_start/error_codes/)。请求使用 Bearer auth、
-`stream=true` 和 `stream_options.include_usage=true`；SSE 可跨任意 byte boundary，
-`reasoning_content`、`content`、增量 `tool_calls`、usage、finish reason 与 `[DONE]`
-分别规范化到既有 Provider event contract。最终 ToolCall arguments 仍由 Kernel 的
-`AssistantMessageAccumulator` 组装并验证，然后经过 Extension Hook、最终参数重验证和
-Host permission resolution，Adapter 不执行 Tool 或复制 AgentLoop。
-
-HTTP 429、500/503、timeout/transport interruption 映射到既有有限 retry 分类；格式、
-认证、余额、API error 和 malformed stream 产生不可泄露 server body 或 key 的结构化
-失败。确定性测试使用注入的 HTTP transport，不会访问 DeepSeek 或产生费用。限界的真实
-凭据验收也已在 disposable workspace 完成：同一公共 CLI 的完整编码 run 依次执行
-read/inspect、批准后的 edit、bash 测试与最终说明，并另行验证 JSONL Session 关闭和无
-Tool 的 resume；凭据未进入 CLI JSON、Session 或 workspace。常规测试仍使用注入
-transport，不依赖外网或真实凭据。
-
-本能力借鉴 Pi 的 Provider normalization；简化为 DeepSeek + Fake 两个 Adapter；深化点
-是把同一 Python Kernel seam 用于真实 CLI、权限和恢复。这个本地运行入口本身不引入
-Provider 生态、模型比较、provider-specific prompt 优化或生产级 TUI/sandbox。
-
-## 运行一个 SWE-bench Verified 实例
-
-Host 必须已安装可执行的 `git`，用于验证 base commit 并生成最终 prediction patch。随后安装
-官方 Harness optional dependency，并在 Host 环境中设置 `DEEPSEEK_API_KEY`：
-
-```console
-python -m pip install -e ".[swebench]"
-python -m coding_agent swebench run --instance <verified-instance> \
-  --artifacts <new-run-artifact-directory> --mode auto \
-  --timeout 1800 --harness-timeout 1800
-```
-
-`--mode auto` 会在 elevated Tool Execution 前通过 stdin 请求 Host 审批；非交互环境的 EOF
-按 deny 处理。若要在隔离、一次性且已明确授权的环境中无人值守运行，可显式选择
-`--mode full`；这会扩大 Tool authority，应由调用者承担该授权决定。
-
-该入口固定使用官方 `SWE-bench/SWE-bench_Verified` 的 `test` split。instance metadata
-按代码记录的 dataset revision 加载，prediction 是一行 JSONL，字段严格为
-`instance_id`、`model_name_or_path` 和 `model_patch`。evaluator 会把该固定 revision 的单条
-instance snapshot 写成本地 JSON，再让官方 Harness 读取同一 snapshot。patch 来自
-evaluator-owned workspace 相对官方 `base_commit` 的真实 `git diff --binary`，因此包含
-working tree、index 和 agent commit；无 patch、非法 diff 或越界路径不会进入 Harness。
-
-运行前必须由用户手动启动 Docker Desktop Linux daemon，并用官方 SWE-bench 工具预先
-准备该 instance 的官方镜像。此命令只执行 `docker image inspect`，不会自动 pull/build
-大型镜像；镜像缺失时会给出 `environment_preparation_failed`。Adapter 把镜像中的
-`/testbed` 复制到新 artifact directory 所拥有的 workspace，验证 `base_commit` 与 clean
-状态，再以 `--network none` bind mount 给单一 agent container。文件 Tool 只操作该
-workspace，`bash` 只通过严格 argv 的 `docker exec` 运行；Provider key 和 Host secret
-不会进入 container、Tool subprocess 或 Harness subprocess。
-
-Windows Host 还必须使用 Docker Desktop 的 Linux containers，并在准备镜像或运行前启用
-Windows Developer Mode，使官方 instance repository 中的符号链接可以被正确创建和保留。
-缺少这些前置条件时应先修复环境，不要把降级的 checkout 当作有效评测 workspace。
-
-artifact bundle 保存 sanitized `config.json`、精确 `provenance.json` 与
-`kernel_configuration.json`、固定 revision 的 `official_instance.json`、append-only
-`session.jsonl`、`events.jsonl`、`tool_results.jsonl`、`workspace.patch`、
-`prediction.jsonl`、Harness argv/provenance、stdout/stderr、官方 summary、per-instance
-`report.json` 副本与最终 `manifest.json`。manifest 区分
-`environment_preparation_failed`、`agent_failed`、`timed_out`、`cancelled`、`no_patch`、
-`prediction_invalid`、`harness_invocation_failed`、`harness_rejected`、`harness_failed`
-和 `success`；未运行或未产出一致官方结果的 Harness 永远不会显示为通过。
-
-Pi Kernel 机制继续复用；SWE-bench CodingEnvironment 与输出契约是项目必要差异；结果证明能力但不反向扩大 Kernel 范围。
-该入口不包含排行榜、批量评测、模型比较、最低分数、
-prompt/Kernel benchmark 特化、费用决策、生产调度或自动启动 Docker Desktop。
-
-## 固定 Extension 合约
-
-`AgentKernel` 接受调用方按顺序显式构造的普通 Python Extension 实例。Extension
-只能通过固定 registry 注册 Tool、Provider、custom `SessionEntry` type 与 Hook
-handler；没有目录扫描、entry point、自动发现或热重载。Hook 只接收不可变的类型化
-快照，合法的 transform/supplement 会在交给下一 handler 前由 Kernel 重新验证。
-Extension Tool 继续使用既有 `ToolRuntime` 的 schema、调度、取消与 structured
-`ToolResult` 路径；custom entry 继续使用 append-only Session/Store 路径。
-
-当前 system prompt、Tool guideline 与 project context 都从 `ContextSettings` 在每次
-请求重新投影，active Tool schema 则从当前 Tool runtime/Extension registry 重新投影；
-额外的 runtime/Extension authority 以带 source、resource ID 与 revision 的
-`ContextResource` 表示。Extension 必须在 `CONTEXT_RESOURCE` Hook 提供这类资源，使其
-在 conversation budget 分配和 Compaction 前可见；后置
-`context`/`provider_request` Hook 不能替换当前权威资源。
-为兼容在新增 `resources` 字段前就存在、通过构造新 `ModelContext` 或
-`ProviderRequest` 返回结果的 Extension，空资源元组按“未携带该新字段”处理并恢复
-canonical resources；任何非空替换仍会被拒绝。
-
-### 同步 callout 与线程契约
-
-Extension 的 `register()`、Hook handler 和 custom `SessionEntry` validator 都是同步
-callout，并在独立 worker thread 中运行。它们必须在有限时间内同步返回，且必须线程
-安全：不得 `await`、不得访问或操作绑定到 Host event loop 的 asyncio 对象，也不得
-在没有自行同步的情况下读写与 Host 或其他 callback 共享的可变状态。推荐只读取
-Kernel 提供的 owned snapshot，并通过明确的 outcome 返回候选值。
-
-Kernel 会把可检测的违规确定性转换为 registration/dispatch/validation failure：返回
-awaitable、抛出 `CancelledError`、访问当前 running loop 或返回非法 outcome 都不会
-取得 Host Task 的取消权，其中 handler cancellation 使用独立的
-`handler_cancelled` 诊断码。Python thread 无法被宿主安全强制终止，因此 callback
-死锁、无限阻塞和未同步 data race 不能由该合约自动修复；callout timeout 与 process
-isolation 是后续 Host/plugin sandbox 的职责，不属于当前 Kernel 合约。
-
-### `ToolResult` 权威与快照成本
-
-`tool_result` handler 可以把已成功执行的输出降级为 `error`，用于在结果反馈给
-Provider 前执行内容或策略校验；这不会回滚 Tool 已经发生的副作用。非成功结果不能
-升级为 `success`，而 `cancelled` 是取消来源事实，handler 既不能引入也不能擦除该
-状态。
-
-为阻止别名逃逸，每个接收 Provider stream event 的 handler 都获得 request 与 event
-的独立深快照；没有对应 handler 时不会复制 request。时间和临时内存开销因此随
-`request size × handler count × event count` 线性增长。面向高频或大 Context 的 Host
-应使用代表性 payload 做容量基准；在没有明确吞吐目标前，Kernel 优先保留所有权隔离，
-不通过共享可变 request 来投机优化。
-
-运行三个确定性场景：
-
-```console
-python -m coding_agent demo extensions
-python -m coding_agent demo extensions --case ordering
-python -m coding_agent demo extensions --case invalid-mutation
-```
-
-默认场景显式加载示例 Extension，执行自定义 Tool、向 canonical Model Context
-补充资源、确定性阻断一个 ToolCall，并持久化已注册的 custom SessionEntry。
-`ordering` 展示两个 Extension 按实例顺序和 handler 顺序组合，以及每次改变后的
-revalidation；`invalid-mutation` 将 handler 异常转换为明确失败，不调用 Provider、
-不污染 Session，也不打印 traceback。
-
-`ExtensionEvent` 通过 `AgentKernel.drain_extension_events()` 独立消费；它记录
-registration、dispatch、outcome/revalidation、block/rejection/failure，但绝不会自动
-混入 `AgentRun` 的公开 `AgentSessionEvent` Event Stream。本能力借鉴 Pi/Tau 的
-registration 与 Hook 思路，简化自动发现、TUI 与热重载，并深化固定状态所有权、
-确定性组合和逐次重验证规则。
-
-## 可恢复、可分支的 Session
-
-Kernel 现在提供持久化的 append-only Session tree。每个不可变
-`SessionEntry` 都有稳定 ID 和 parent；当前 `Active Branch` 是从根到所选
-leaf 的可恢复路径。`InMemorySessionStore` 与 `JsonlSessionStore` 共享同一
-契约，JSONL 使用本项目独立且显式版本化的 schema。
-
-运行确定性的本地演示：
-
-```console
-python -m coding_agent demo session-tree
-python -m coding_agent demo session-tree --case invalid-entry
-```
-
-成功场景实际创建 Session，在权威 `message_end` 后持久化消息，关闭并通过新
-store 实例重新加载，从旧 entry fork，再展示两条 sibling branch、当前
-Active Branch 和可检查的 JSONL 路径及记录。失败场景以结构化错误拒绝非法
-parent，退出码为 1，不静默改写历史或选择其他 branch。
-
-Session 是持久、权威的树；Agent Run 是一次活跃执行；Active Branch 是当前
-选择的可恢复历史；Model Context 是为单次 Provider 请求构造的有界投影。
-本实现借鉴 Pi 的 tree 与确定性投影语义，但使用独立 Python 文件格式，并通过
-双 SessionStore seam 强化恢复性与可测性。
-
-## Model Context 与语义 Compaction
-
-每次 Provider 调用都经过唯一的 Context pipeline，固定按 system prompt、active
-Tool 描述/guideline、项目资源、Active Branch 投影、当前 injected messages 和
-ProviderRequest conversion 组装。`ModelContext` 是不可变值，不持有完整 Session
-或 mutable queue。sibling branch 与尚未注入的 pending message 不进入请求。
-
-`ContextPipeline.build()` 是异步 API；从旧同步 pipeline 迁移的直接调用方必须
-`await pipeline.build(...)`。这是生产 Compaction 通过现有异步 `ModelProvider`
-生成语义 checkpoint 所必需的调用约定变化，`AgentKernel` 与 CLI 已封装该迁移。
-
-运行成功与确定性摘要失败场景：
-
-```console
-python -m coding_agent demo context-compaction
-python -m coding_agent demo context-compaction --case summary-error
-```
-
-成功场景展示 compaction 前后以 canonical JSON characters 计量的预算（不是精确
-token 数）、持久化 checkpoint、`compaction_succeeded` 事件、两条 sibling
-branches、pending/injected 排除与包含证据，以及仍保留的原始 entries。Active
-Branch 使用最近有效 checkpoint 的 summary 加 retained recent turns；checkpoint
-记录 v2 summary schema、累计 coverage、first-kept boundary、lineage、typed evidence、
-strategy 和 metrics，不删除旧历史。重复压缩只输入 previous checkpoint state 与新增
-covered span。若真实摘要的 JSON 编码使初选 retained window 超预算，pipeline 会按完整
-turn 缩小窗口并重新生成摘要；Provider usage 按所有尝试累计。
-
-`characters_before` 与 `characters_after` 是 canonical pipeline 在 Compaction 前后的
-同阶段估计；`final_characters` 是所有 Context/ProviderRequest Hook 完成后的实际请求
-估计。低收益但已经 bounded 的重复压缩会持久化 `thrashing_detected=true` 并继续当前
-Run；只有仍超预算且没有新 span 可压缩时才产生 `compaction_thrashing` 失败。当前公开
-入口只产生 `trigger=automatic`，wire contract 为未来 Host-driven manual trigger 保留
-`manual` 值，但 #33 不增加 manual CLI。
-
-失败场景在 Provider 调用前发出结构化 `compaction_failed`，退出码为 1；它不写入
-无效 checkpoint、不删除或改写原始 entries，也不会降级到第二套 builder。Session
-仍可关闭、恢复和导航。retained recent entries 直接以原始 message 进入最终
-ProviderRequest，默认 semantic summary prompt 不重复发送这些内容。这里借鉴 Pi 的
-确定性投影与 compaction 语义，简化 provider-specific prompt 优化，并深化为可观察的
-Python Context seam。长期记忆与向量检索仍不在本能力内。
-
-## 控制进行中的 Agent Run
-
-`AgentRun` 是 steering、follow-up、cancel、result/wait 与 Event Stream 的唯一公开
-入口。Steering Message 与 Follow-up Message 使用两个独立的 run-scoped FIFO queue：
-steering 在完整 Tool batch 之后、下一次 Context/Provider request 之前注入；follow-up
-在当前 agent work 自然结束且 steering 已清空后启动后续工作。pending message 不是
-Session history，只有实际 injection 才产生权威 user `SessionEntry`。
-
-```console
-python -m coding_agent demo run-control --case steering
-python -m coding_agent demo run-control --case follow-up
-python -m coding_agent demo run-control --case cancel
-python -m coding_agent demo run-control --case retry-success
-python -m coding_agent demo run-control --case retry-failure
-```
-
-JSON Lines 会显示 queue、injection/drop、Provider retry、Session 和唯一终态证据。
-取消传播到 Provider、Tool Execution 与 retry wait，并丢弃尚未注入的消息。有限 retry
-只处理明确分类为 retryable 的 Provider failure，复用同一 ProviderRequest，失败 attempt
-的 partial delta 不会成为权威 Session message。本实现直接借鉴 Pi 的 inner steering、
-outer follow-up 与 settled 语义，以统一 Python `AgentRun` interface 表达；不增加 Step、
-第二 AgentLoop、多 Agent 或长期后台服务。
-
-## Host 权限模式
-
-每次 `AgentRun` 都由 Host 选择 `plan`、`ask`、`auto` 或 `full`，默认是 `auto`。
-Host 必须持续消费 `AgentRun` Event Stream；收到 `permission_requested` 后，只能通过
-`AgentRun.resolve_permission()` 对该次请求批准或拒绝。若 Host 既不处理请求也不取消或
-关闭 run，run 会继续等待决策，不会由 Kernel 猜测超时或自动提升权限。`ask` 会自动
-允许 workspace read；`ask/auto` 对 outside、network、unknown 和没有 target contract
-的 custom Tool 请求一次性确认。
-
-从早期无限制 shell 行为迁移的可信集成，应实现上述请求处理；只有在一次明确可信、
-可丢弃的运行中才显式选择 `full`。`full` 仅跳过 Kernel approval/containment，仍受 OS
-权限、取消、timeout 与进程生命周期约束；它不是生产级 sandbox 或 OS 提权。
-`ToolRuntime.execute_batch()` 是供已完成授权的 Host adapter 使用的历史低层 seam；
-产品权限边界是 `AgentKernel` 经最终参数重验证后调用 guarded runtime 的路径。
-
-## English
-
-An independently implemented Python kernel for coding agents, focused on
-runtime semantics, tool execution, sessions, and observable event streams.
-
-## Fixed Extension contract
-
-Callers pass explicitly constructed Python Extension instances to `AgentKernel` in a
-defined order. The fixed registry accepts Tools, Providers, custom SessionEntry types,
-and Hook handlers only. Every transform or supplement is revalidated before the next
-handler, custom Tools remain inside ToolRuntime, and custom entries remain inside the
-append-only Session/Store path. `ExtensionEvent` is drained independently from the
-Kernel and is never inserted into the public AgentSessionEvent stream.
-
-The system prompt, Tool guidelines, and project context are rebuilt from
-`ContextSettings` on every request, while active Tool schemas are re-projected from
-the current Tool runtime and Extension registry. Additional runtime and Extension
-authority is represented by source-identified, revisioned `ContextResource` values.
-Extensions add such authority through the pre-budget `CONTEXT_RESOURCE` Hook; later
-Context and Provider-request Hooks cannot replace it. For compatibility with
-Extensions written before the `resources` field, an empty tuple on a reconstructed
-value is treated as omission and the canonical resources are restored, while any
-non-empty replacement is rejected.
-
-Run `python -m coding_agent demo extensions`, then use `--case ordering` and
-`--case invalid-mutation` to inspect successful capability use, deterministic
-composition, and explicit rejection without state damage. The design borrows the
-registration and Hook ideas from Pi/Tau, omits discovery/TUI/hot reload, and deepens
-Kernel-owned state and deterministic revalidation.
-
-The Kernel now provides a deterministic, observable model-tool-model loop. A
-thin Terminal CLI drives the same public `AgentKernel`/`AgentRun` seam that
-later Hosts will reuse.
-
-## Development setup
-
-Python 3.11 or newer is required.
-
-```console
-python -m pip install -e ".[dev]"
-```
-
-## Observable Headless Agent Run
-
-Run the successful scripted Fake Provider case:
-
-```console
-python -m coding_agent demo streamed-run
-```
-
-The CLI prints JSON Lines in lifecycle order. Provider increments appear as
-`message_update` events containing both the cumulative `AssistantMessage` and
-the current Provider Stream Event. The later `message_end` contains the
-authoritative message, followed by one `run_settled` terminal event and a final
-result record.
-
-Run the deterministic failure case:
-
-```console
-python -m coding_agent demo streamed-run --case provider-error
-```
-
-This case prints the provider's incremental error, a normalized Agent error,
-and one `run_failed` terminal event. It exits with status 1 without an unhandled
-exception or traceback.
-
-## Model-tool-model loop
-
-Run the disposable coding task:
-
-```console
-python -m coding_agent demo tool-loop
-```
-
-The Fake Provider incrementally constructs `read`, `edit`, and `bash`
-ToolCalls. The core ToolRuntime executes them in a temporary
-LocalCodingEnvironment, sends ordered ToolResults into the next Turn, and the
-Provider summarizes the result. JSON Lines expose Provider events, Tool
-Execution events, the authoritative final message, and a workspace
-before/after/diff record.
-
-Two additional deterministic cases expose scheduling and failure behavior:
-
-```console
-python -m coding_agent demo tool-loop --case mixed-batch
-python -m coding_agent demo tool-loop --case failure
-```
-
-`mixed-batch` demonstrates a pure parallel read batch followed by a mixed batch
-that runs entirely sequentially. `failure` normalizes an unknown Tool, invalid
-arguments, and a non-zero command into ToolResults before the next Turn ends
-normally.
-
-The built-in Tool set is `read`, `write`, `edit`, `bash`, `grep`, `find`, and
-`ls`. The first four are enabled by default; search and listing Tools require
-explicit opt-in. LocalCodingEnvironment normalizes workspace paths and manages
-local processes, incremental stdout/stderr, exit status, timeout, and
-cancellation. It is not a production sandbox and makes no security promise for
-malicious workspaces.
-
-## Public runtime seam
+CLI 和 evaluator 使用的也是下面这条公开 seam：
 
 ```python
 from coding_agent import AgentKernel, FakeProvider
@@ -421,82 +114,84 @@ async def observe_run() -> None:
     result = await run.result()
 ```
 
-`AgentRun.state` is one of `active`, `settled`, `cancelled`, or `failed`.
-`AgentRun.cancel()` cancels active Provider or Tool Execution work. Model
-Providers remain later-ticket work.
-The implemented Context pipeline projects only the selected Active Branch and
-explicitly injected messages before every Provider call.
+`AgentRun` 的终态只能是 `settled`、`cancelled` 或 `failed`；最终结果由
+`await run.result()` 返回。完整责任边界见[架构说明](docs/architecture.md)。
 
-The Run/Turn and layered event semantics follow the selected Pi behavioral
-baseline. This project keeps only a thin CLI product shell, while the
-asynchronously iterable `AgentRun` facade is the Python-facing public boundary.
+## 🏗️ 架构
 
-## Host permission modes
+```mermaid
+flowchart LR
+    Host["Host<br/>CLI · Evaluator · Integration"] --> Kernel["AgentKernel"]
+    Kernel --> Run["AgentRun"]
+    Run --> Context["ContextPipeline"]
+    Context --> Provider["ModelProvider"]
+    Provider --> Run
+    Run --> Tools["ToolRuntime<br/>CodingEnvironment"]
+    Tools --> Run
+    Run --> Session[("SessionStore")]
+```
 
-The Host selects `plan`, `ask`, `auto`, or `full` for every `AgentRun`; the
-default is `auto`. A Host must keep consuming the run's Event Stream and resolve
-each `permission_requested` event only through `AgentRun.resolve_permission()`.
-If it neither resolves, cancels, nor closes the run, the run waits instead of
-guessing a timeout or elevating itself. `ask` automatically allows workspace
-reads; `ask/auto` request one-time confirmation for outside, network, unknown,
-and custom Tools without a target contract.
+- `AgentKernel` 组装 Provider、ToolRuntime、Session、Context、Permission 与 Extension 能力。
+- `AgentRun` 拥有单次运行的控制面、Event Stream 和唯一最终结果。
+- `ContextPipeline` 从 Active Branch 和当前权威资源构造一次 Provider 请求。
+- `ToolRuntime` 在最终参数验证和 Permission Policy 决策之后执行 ToolCall。
+- `SessionStore` 保存权威记录；流式 delta、进度事件和 pending message 不冒充历史事实。
 
-Trusted integrations migrating from earlier unrestricted shell behavior should
-handle those requests. Select `full` only for an explicitly trusted disposable
-run. `full` skips Kernel approval and containment, but not OS authority,
-cancellation, timeouts, or process-lifecycle controls; it is not a production
-sandbox or OS elevation. `ToolRuntime.execute_batch()` is the historical
-low-level seam for a Host adapter that has already authorized a batch. The
-product permission boundary is the guarded path from `AgentKernel` after final
-argument revalidation.
+规范术语见 [CONTEXT.md](CONTEXT.md)，不可逆设计选择见 [docs/adr/](docs/adr/)。
 
-## Recoverable, branching Sessions
+## ✅ 真实验证
 
-`python -m coding_agent demo session-tree` creates a versioned JSONL Session,
-persists only authoritative messages after `message_end`, closes and reloads it,
-forks from an old entry, and prints both sibling branches plus the selected
-Active Branch. The `--case invalid-entry` case rejects an illegal parent with a
-structured error. Session is durable authoritative history; Agent Run is one
-active execution; Active Branch is one recoverable root-to-leaf path; Model
-Context is one bounded Provider projection. The design borrows Pi's tree
-semantics, uses an independent Python persistence format, and deepens
-recoverability and testability through matching in-memory and JSONL store
-seams.
+仓库保存了真实 DeepSeek Adapter、官方 SWE-bench Verified 数据和官方 Harness 产生的
+可审计证据，而不是用仓库内单元测试替代外部验收：
 
-## Model Context and semantic Compaction
+| Instance | Context window | v2 checkpoints | Official Harness |
+| --- | ---: | ---: | --- |
+| `pallets__flask-5014` | 20,000 characters | 3 | resolved |
+| `scikit-learn__scikit-learn-14141` | 20,000 characters | 1 | resolved |
 
-`python -m coding_agent demo context-compaction` shows the single Context
-pipeline, a character-count budget, a persisted v2 semantic checkpoint, two
-sibling branches, pending-message exclusion, explicit injection, and preserved
-raw history. The final Fake Provider request contains only the bounded Active
-Branch projection. The `--case summary-error` case fails before the Provider,
-emits a structured compaction failure, writes no invalid checkpoint, and leaves
-the Session resumable. The estimator counts canonical JSON characters and does
-not claim tokenizer-exact token counts.
+这些结果证明对应固定候选版本和实例的完整运行结果，不代表排行榜成绩或未来任务保证。
+运行配置、失败样本、Session、patch 和 Harness 报告见
+[Issue #33 验收档案](docs/validation/issue-33-context-compaction/README.md)。运行自己的实例见
+[SWE-bench 指南](docs/guides/swebench.md)。
 
-`ContextPipeline.build()` is asynchronous; direct callers migrating from the
-former synchronous pipeline must use `await pipeline.build(...)`. Repeated
-compaction retains complete recent turns and retries with a smaller turn window
-when the real JSON-encoded summary does not fit. `characters_before` and
-`characters_after` compare the canonical pipeline before and after compaction;
-`final_characters` records the validated request after all Context and
-Provider-request Hooks. A bounded low-reduction checkpoint records
-`thrashing_detected=true` and continues; `compaction_thrashing` is reserved for
-an over-budget Context with no new span to compact.
+## 🛡️ 范围与成熟度
 
-## Controlling an active Agent Run
+| 当前包含 | 当前不宣称 |
+| --- | --- |
+| DeepSeek 与确定性 Fake Provider Adapter | 完整 Provider 生态或模型比较平台 |
+| Headless Kernel、薄 CLI 与 SWE-bench evaluator | IDE、TUI 或完整 Coding Agent 产品 |
+| Host-controlled Permission Policy | 生产级 OS Sandbox 或操作系统提权 |
+| 可恢复 Session、Context 与语义 Compaction | 长期记忆、向量检索或无限 Context |
+| 显式 Extension registry 与固定 Hooks | 自动发现、热重载或任意插件生命周期 |
+| 可审计的单实例 SWE-bench 执行 | 排行榜、批量调度或承诺通过率 |
 
-`python -m coding_agent demo run-control --case <case>` exposes five deterministic
-steering, follow-up, cancellation, retry-recovery, and retry-exhaustion scenarios.
-The thin CLI observes the public Event Stream and invokes only `AgentRun` controls.
-Pending messages stay in two run-scoped FIFO queues and enter Session history only
-when injected at their authoritative drain point. Cancellation drops uninjected
-messages and converges Provider, Tool, and retry work on one terminal result.
+## 📚 文档导航
 
-## Community and governance
+- [文档总览](docs/README.md)：按使用、架构、验证和贡献组织的入口。
+- [架构说明](docs/architecture.md)：组件职责、运行时间线和权威边界。
+- [DeepSeek 运行指南](docs/guides/deepseek.md)：真实运行、恢复、凭据与 Provider 行为。
+- [确定性演示](docs/guides/demos.md)：成功、失败、取消、权限和 Extension 场景。
+- [SWE-bench 指南](docs/guides/swebench.md)：环境准备、执行边界、artifact 与结果解释。
+- [Canonical Spec](docs/specs/coding-agent-kernel.md)：完整范围、决策和验收定义。
+- [ADRs](docs/adr/)：行为基线、Headless seam、Extension 与权限决策。
 
-Contributions are welcome through the process in [CONTRIBUTING.md](CONTRIBUTING.md).
-Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security concerns privately
-as described in [SECURITY.md](SECURITY.md), not in a public issue.
+## 🛠️ 开发与贡献
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+安装开发依赖并运行与 CI 相同的质量门禁：
+
+```console
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy
+python -m pytest
+python -m build
+```
+
+贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，社区行为准则见
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。安全问题请按照 [SECURITY.md](SECURITY.md)
+私下报告，不要创建公开 Issue。
+
+## 📄 License
+
+本项目采用 [Apache License 2.0](LICENSE)。
