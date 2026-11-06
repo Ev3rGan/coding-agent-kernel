@@ -239,6 +239,45 @@ def test_permission_policy_rejects_nul_in_normalized_path_inputs(
         PermissionPolicy(tmp_path).evaluate(PermissionMode.AUTO, call)
 
 
+def test_path_alias_maps_container_targets_into_the_bound_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = PermissionPolicy(workspace, path_aliases={"/testbed": workspace})
+
+    read = policy.evaluate(
+        PermissionMode.AUTO,
+        ToolCall("read-container", "read", {"path": "/testbed/src/app.py"}),
+    )
+    bash = policy.evaluate(
+        PermissionMode.AUTO,
+        ToolCall(
+            "bash-container",
+            "bash",
+            {"command": "cat src/app.py", "cwd": "/testbed"},
+        ),
+    )
+
+    assert read.action is PermissionAction.ALLOW
+    assert read.intent.scope is TargetScope.WORKSPACE
+    assert read.intent.targets == (str((workspace / "src" / "app.py").resolve()),)
+    assert bash.action is PermissionAction.ALLOW
+    assert bash.intent.scope is TargetScope.WORKSPACE
+
+
+def test_path_alias_keeps_escaping_container_targets_outside(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = PermissionPolicy(workspace, path_aliases={"/testbed": workspace})
+
+    evaluation = policy.evaluate(
+        PermissionMode.AUTO,
+        ToolCall("read-escape", "read", {"path": "/testbed/../outside.txt"}),
+    )
+
+    assert evaluation.intent.scope is TargetScope.OUTSIDE
+    assert evaluation.action is PermissionAction.ASK
+
+
 def test_plan_allows_shell_only_when_the_environment_guarantees_read_only(
     tmp_path: Path,
 ) -> None:

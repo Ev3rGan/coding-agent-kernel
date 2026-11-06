@@ -485,11 +485,26 @@ class ContainerCodingEnvironment(LocalCodingEnvironment):
         self._command_runner = command_runner
         self._container_workdir = container_workdir.rstrip("/") or "/"
 
+    @property
+    def path_aliases(self) -> dict[str, Path]:
+        """Report the container workdir as an alias of the bound Host workspace."""
+
+        return {self._container_workdir: self.workspace}
+
+    def _map_container_path(self, path: str) -> str:
+        if path == self._container_workdir:
+            return str(self.workspace)
+        prefix = f"{self._container_workdir}/"
+        if path.startswith(prefix):
+            return str(self.workspace / path[len(prefix) :])
+        return path
+
     def resolve_path(self, path: str) -> Path:
         """Keep adapter containment even when Kernel approval is bypassed in full mode."""
 
         if "\0" in path:
             raise WorkspacePathError("path target contains NUL")
+        path = self._map_container_path(path)
         candidate = (self.workspace / path).resolve()
         if candidate != self.workspace and self.workspace not in candidate.parents:
             raise WorkspacePathError(f"path escapes workspace: {path}")

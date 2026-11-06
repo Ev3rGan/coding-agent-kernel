@@ -22,6 +22,7 @@ from coding_agent import (
     CompactionInput,
     CompactionMetrics,
     CompactionPlan,
+    ContextConstructionError,
     ContextHookInput,
     ContextInput,
     ContextPipeline,
@@ -345,6 +346,52 @@ def _record_turn(session: Session, user: str, assistant: str) -> tuple[SessionEn
         session.record_user_message(user),
         session.record_authoritative_message(AssistantMessage(text=assistant)),
     )
+
+
+def test_v2_compaction_retries_one_invalid_summary() -> None:
+    session = _session_with_ids(
+        "root", "old-user", "old-answer", "new-user", "new-answer", "checkpoint"
+    )
+    _record_turn(session, "old question " * 90, "old answer " * 90)
+    _record_turn(session, "current diagnosis", "current result")
+    invalid = "## Goal\nnot a complete structured summary"
+    engine = _RecordingCompactionEngine((invalid, _summary("retried")))
+
+    built = _build(
+        ContextPipeline(engine),
+        ContextInput(
+            settings=ContextSettings(max_characters=1_500, max_summary_characters=900),
+            active_branch=session.active_branch,
+            injected_messages=(UserMessage(text="continue"),),
+        ),
+    )
+
+    assert built.compaction is not None
+    assert "retried" in built.compaction.summary
+    assert [attempt.retry_attempt for attempt in engine.inputs] == [0, 1]
+    assert built.compaction.metrics.summary_usage == TokenUsage(34, 18)
+
+
+def test_v2_compaction_stops_after_two_invalid_summaries() -> None:
+    session = _session_with_ids(
+        "root", "old-user", "old-answer", "new-user", "new-answer", "checkpoint"
+    )
+    _record_turn(session, "old question " * 90, "old answer " * 90)
+    _record_turn(session, "current diagnosis", "current result")
+    invalid = "## Goal\nnot a complete structured summary"
+    engine = _RecordingCompactionEngine((invalid, invalid, _summary("never")))
+
+    with pytest.raises(ContextConstructionError, match="invalid summary structure"):
+        _build(
+            ContextPipeline(engine),
+            ContextInput(
+                settings=ContextSettings(max_characters=1_500, max_summary_characters=900),
+                active_branch=session.active_branch,
+                injected_messages=(UserMessage(text="continue"),),
+            ),
+        )
+
+    assert [attempt.retry_attempt for attempt in engine.inputs] == [0, 1]
 
 
 def test_v2_compaction_keeps_a_recent_complete_turn_and_reprojects_authority() -> None:

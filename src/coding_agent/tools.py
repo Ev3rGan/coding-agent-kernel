@@ -243,7 +243,10 @@ class GrepTool:
         for path in candidates:
             raise_if_cancelled(cancel_event)
             display_path = _display_path(path, environment)
-            content = await environment.read_text(str(path), cancel_event)
+            try:
+                content = await environment.read_text(str(path), cancel_event)
+            except UnicodeDecodeError:
+                continue
             for line_number, line in enumerate(content.splitlines(), 1):
                 raise_if_cancelled(cancel_event)
                 if pattern.search(line):

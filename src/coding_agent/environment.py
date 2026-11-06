@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -89,6 +89,12 @@ class LocalCodingEnvironment:
         """Whether this environment enforces read-only shell execution itself."""
 
         return False
+
+    @property
+    def path_aliases(self) -> Mapping[str, Path]:
+        """Map container-side POSIX prefixes onto concrete workspace paths."""
+
+        return {}
 
     def resolve_path(self, path: str) -> Path:
         if "\0" in path:
