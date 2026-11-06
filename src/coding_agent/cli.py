@@ -1684,8 +1684,11 @@ def _parser() -> argparse.ArgumentParser:
     swebench_run.add_argument(
         "--mode",
         choices=tuple(mode.value for mode in PermissionMode),
-        default=PermissionMode.AUTO.value,
-        help="Host-selected run-scoped Permission Mode",
+        default=PermissionMode.FULL.value,
+        help=(
+            "Host-selected run-scoped Permission Mode (default: full, because the "
+            "evaluator already runs in an isolated disposable container)"
+        ),
     )
     swebench_run.add_argument(
         "--timeout",

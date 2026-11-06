@@ -30,16 +30,17 @@ Windows Developer Mode，使官方实例仓库中的 symlink 可以正确创建�
 ## 运行一个实例
 
 ```console
-python -m coding_agent swebench run --instance <verified-instance> --artifacts <new-run-artifact-directory> --mode auto --timeout 1800 --harness-timeout 1800
+python -m coding_agent swebench run --instance <verified-instance> --artifacts <new-run-artifact-directory> --timeout 1800 --harness-timeout 1800
 ```
 
 `--artifacts` 必须指向新的 run artifact directory。入口固定使用官方
 `SWE-bench/SWE-bench_Verified` 的 `test` split，并按代码中固定的 dataset revision 加载
 instance metadata。
 
-`--mode auto` 会在 elevated Tool Execution 前通过 stdin 请求 Host 审批，非交互环境的 EOF
-按 deny 处理。如果在隔离、一次性且已明确授权的环境中需要无人值守运行，可以显式选择
-`--mode full`；扩大 authority 是调用方的决定。
+默认 Permission Mode 是 `full`：evaluator 已经把工作区放进隔离、一次性、无网络的容器，
+无人值守运行时 `auto` 的审批请求会因 stdin EOF 被按 deny 处理，反而阻断正常开发命令。
+需要验证审批矩阵时，可以显式选择 `--mode auto`、`--mode ask` 或 `--mode plan`；扩大
+authority 仍是调用方的决定。
 
 ## 执行边界
 

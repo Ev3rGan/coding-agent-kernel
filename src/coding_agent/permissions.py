@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -246,9 +247,22 @@ def _canonical_permission_actions(
 class PermissionPolicy:
     """Classify final arguments and apply the canonical Host permission matrix."""
 
-    def __init__(self, workspace: Path, *, read_only_shell_guaranteed: bool = False) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        read_only_shell_guaranteed: bool = False,
+        path_aliases: Mapping[str, Path] | None = None,
+    ) -> None:
         self._workspace = workspace.resolve()
         self._read_only_shell_guaranteed = read_only_shell_guaranteed
+        aliases: list[tuple[str, Path]] = []
+        for alias, target in (path_aliases or {}).items():
+            normalized = alias.rstrip("/")
+            if not normalized.startswith("/"):
+                raise ValueError(f"path alias must be an absolute POSIX prefix: {alias!r}")
+            aliases.append((normalized, Path(target).resolve()))
+        self._path_aliases = tuple(sorted(aliases, key=lambda item: len(item[0]), reverse=True))
 
     def evaluate(self, mode: PermissionMode | str, call: ToolCallLike) -> PermissionEvaluation:
         try:
@@ -407,9 +421,21 @@ class PermissionPolicy:
                 return True
         return quote is not None
 
+    def _apply_path_aliases(self, raw: str) -> str:
+        """Translate a container-side absolute path to its Host workspace path."""
+
+        for alias, target in self._path_aliases:
+            if raw == alias:
+                return str(target)
+            prefix = f"{alias}/"
+            if raw.startswith(prefix):
+                return str(target / raw[len(prefix) :])
+        return raw
+
     def _normalize_target(self, raw: str, *, cwd: Path | None = None) -> Path:
         if "\0" in raw:
             raise PermissionClassificationError("path target contains NUL")
+        raw = self._apply_path_aliases(raw)
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = (self._workspace if cwd is None else cwd) / candidate

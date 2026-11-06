@@ -117,6 +117,7 @@ class ToolRuntime:
         self._permission_policy = PermissionPolicy(
             environment.workspace,
             read_only_shell_guaranteed=environment.read_only_shell_guaranteed,
+            path_aliases=environment.path_aliases,
         )
         self._tools: dict[str, _RegisteredTool] = {}
         for tool in builtin_tools():

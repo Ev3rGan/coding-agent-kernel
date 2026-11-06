@@ -18,6 +18,9 @@ CodingAgent 优化的输入。
 3. **P1 压缩摘要契约不稳定**：`--mode full` 下首次压缩即因摘要标题结构不匹配失败，
    Run 以 `compaction_summary_invalid` 结束，且没有 checkpoint 落盘可供取证。
 
+同日的 P0 修复与回归见下文[回归验证](#回归验证同日)。结论是：路径映射与默认 `full`
+均已生效，但 P1 压缩失败成为当前首要阻塞。
+
 ## 运行矩阵
 
 | 实例 | 模式 | 结果 | 退出码 | 耗时 | 轮次 | 工具调用 | 输入/输出 token | 审批拒绝 | 压缩 | 官方 Harness |
@@ -119,15 +122,51 @@ CodingAgent 优化的输入。
 - **成功未自测**：`scikit-learn__scikit-learn-14141` 的 `resolved` 只证明补丁通过官方测试，
   不证明模型在运行中验证过；这与 P0-2 直接相关。
 
+## 回归验证（同日）
+
+P0 修复包括：容器路径别名（`/testbed` → workspace）在 `PermissionPolicy` 与
+`ContainerCodingEnvironment` 两层生效，`bash` 的 `cwd` 同步映射；`swebench run` 的
+默认 Permission Mode 改为 `full`，`auto` 仍可显式选择。
+
+用同样的两个实例重跑：
+
+| 实例 | 模式 | 结果 | 轮次 | 工具调用 | 输入/输出 token | 审批拒绝 | 压缩 | 官方 Harness |
+| --- | --- | --- | ---: | ---: | --- | ---: | --- | --- |
+| `scikit-learn__scikit-learn-14141` | full（新默认） | agent_failed | 12 | 20 | 35,326 / 2,098 | 0 / 20 | started 1，succeeded 0 | 未运行 |
+| `scikit-learn__scikit-learn-14141` | auto | success | 17 | 26 | 55,317 / 3,391 | 3 / 26 | 1/1 | resolved（F2P 1/1，P2P 2/2） |
+| `pallets__flask-5014` | auto | agent_failed | 15 | 19 | 43,526 / 2,446 | 2 / 19 | started 1，succeeded 0 | 未运行 |
+
+### 已修复
+
+- **路径映射生效**：`/testbed` 文件工具与 `bash` cwd 不再被判为 `outside`。flask auto 的
+  outside 拒绝从 9 次降为 0；scikit full 的 20 次权限决策全部 approved；两次运行都没有
+  出现 `path escapes workspace`。scikit auto 因此恢复 `resolved`。
+- **默认 full 生效**：不传 `--mode` 时 `config.json` 记录 `permission_mode: full`，运行中
+  不再出现 permission prompt。
+
+### 仍阻塞
+
+- **P1 压缩摘要契约**：三次未成功运行都在首次压缩时 `compaction_summary_invalid`。默认
+  `full` 放行了更多探索与大输出，压缩路径成为当前首要瓶颈；`scikit-learn-14141` 的 auto
+  运行是唯一成功压缩（1/1）的样本。
+- **P2 grep 非 UTF-8 文件**：scikit full 运行中 `grep` 对含非 UTF-8 字节的文件抛出
+  `UnicodeDecodeError`，整个调用失败，而不是跳过该文件。建议捕获解码错误并按文件跳过。
+
+### 回归结论
+
+P0 两项修复达到预期：路径不再误判，非交互默认 `full` 可用。当前阻止 SWE-bench 稳定
+resolved 的不是权限或路径，而是压缩摘要失败；下一步应优先处理 P1。
+
 ## 优化优先级
 
-| 优先级 | 动作 | 涉及位置 | 验证方式 |
-| --- | --- | --- | --- |
-| P0 | 容器路径映射（文件工具、权限分类、`bash` cwd） | `swebench.py`、`permissions.py` | 重跑 flask-5014 auto，`/testbed` 不再出现 `outside` 拒绝 |
-| P0 | 非交互入口默认 `full` 或提供预授权 | `cli.py`、`docs/guides/swebench.md` | 重跑 flask-5014，无审批拒绝且产生 patch |
-| P1 | 压缩摘要失败重试/降级 + 失败事件 | `compaction.py`、`context.py` | 重跑 flask-5014 full，失败可取证或成功压缩 |
-| P1 | 组合 shell 命令拆段分类与只读白名单 | `permissions.py` | 单元测试覆盖 `&&`、`|`、`;`、`$()` |
-| P2 | 结构化失败证据与事件裁剪 | `swebench.py`、`events.py` | artifact 体积下降，失败可复盘 |
+| 优先级 | 动作 | 状态 | 涉及位置 | 验证方式 |
+| --- | --- | --- | --- | --- |
+| P0 | 容器路径映射（文件工具、权限分类、`bash` cwd） | 已完成 | `swebench.py`、`permissions.py`、`environment.py` | 回归中 `/testbed` 不再出现 `outside` 拒绝 |
+| P0 | 非交互入口默认 `full` | 已完成 | `cli.py`、`docs/guides/swebench.md` | 回归中无 permission prompt |
+| P1 | 压缩摘要失败重试/降级 + 失败事件 | 下一步 | `compaction.py`、`context.py` | 重跑 flask-5014 full，失败可取证或成功压缩 |
+| P1 | 组合 shell 命令拆段分类与只读白名单 | 待办 | `permissions.py` | 单元测试覆盖 `&&`、`|`、`;`、`$()` |
+| P2 | grep 跳过非 UTF-8 文件 | 待办 | `tools.py` | 含二进制文件的目录不再整体失败 |
+| P2 | 结构化失败证据与事件裁剪 | 待办 | `swebench.py`、`events.py` | artifact 体积下降，失败可复盘 |
 
 ## 复现
 
@@ -135,17 +174,17 @@ CodingAgent 优化的输入。
 python -m coding_agent swebench run \
   --instance pallets__flask-5014 \
   --artifacts <new-artifact-dir> \
-  --mode full \
   --timeout 1800 \
   --harness-timeout 1800
 ```
 
-`auto` 模式需要交互式 Host 审批；在无人值守环境会按 deny 处理。
+默认 Permission Mode 是 `full`；需要验证审批矩阵时显式传 `--mode auto`，但非交互环境
+遇到审批请求会按 deny 处理。
 
 ## 清理与脱敏
 
-- 运行结束后容器由 evaluator 关闭；本次的三个 artifact 目录在提取摘要后删除，原始
-  `session.jsonl`、`events.jsonl` 未提交。
+- 运行结束后容器由 evaluator 关闭；本次共 6 个 artifact 目录（3 次冒烟 + 3 次回归）在
+  提取摘要后删除，原始 `session.jsonl`、`events.jsonl` 未提交。
 - 报告与 `runs.json` 不含 API key、宿主绝对路径或容器 ID；路径统一以 `<artifact-dir>` 表示。
 - 本地 SWE-bench 镜像保留，便于后续补跑；如需释放空间可另行删除。
 

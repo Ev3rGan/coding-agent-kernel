@@ -2051,6 +2051,45 @@ def test_container_environment_contains_files_and_runs_bash_with_strict_docker_a
     assert not (tmp_path / "escape.txt").exists()
 
 
+def test_container_environment_maps_container_absolute_paths_to_the_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "pkg").mkdir(parents=True)
+    (workspace / "pkg" / "value.txt").write_bytes(b"before\n")
+    runner = _ScriptedCommandRunner(CommandOutcome(0, "", "", False))
+    environment = ContainerCodingEnvironment(
+        workspace,
+        container_name="sweb-agent-synthetic-fixture-1",
+        command_runner=runner,
+        container_workdir="/testbed",
+    )
+
+    async def exercise() -> None:
+        assert (
+            environment.resolve_path("/testbed/pkg/value.txt")
+            == (workspace / "pkg" / "value.txt").resolve()
+        )
+        assert await environment.read_text("/testbed/pkg/value.txt") == "before\n"
+        await environment.write_text("/testbed/pkg/new.txt", "mapped\n")
+        await environment.run_command("ls", cwd="/testbed/pkg", timeout_seconds=5)
+        with pytest.raises(WorkspacePathError):
+            environment.resolve_path("/testbed/../escape.txt")
+
+    asyncio.run(exercise())
+
+    argv, _ = runner.calls[0]
+    assert argv[3] == "/testbed/pkg"
+    assert (workspace / "pkg" / "new.txt").read_bytes() == b"mapped\n"
+
+
+def test_swebench_cli_default_mode_is_full() -> None:
+    from coding_agent.cli import _parser
+
+    args = _parser().parse_args(["swebench", "run", "--instance", "synthetic__fixture-1"])
+    assert args.mode == "full"
+
+
 def test_cancelled_container_write_preserves_target_and_cleans_temporary_file(
     tmp_path: Path,
     monkeypatch: Any,
