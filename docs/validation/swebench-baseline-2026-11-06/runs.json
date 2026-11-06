@@ -189,6 +189,80 @@
       "compaction_started": 1,
       "compaction_succeeded": 0,
       "harness_verdict": null
+    },
+    {
+      "phase": "retry",
+      "run": "sk14141-retry-full",
+      "instance": "scikit-learn__scikit-learn-14141",
+      "model": "deepseek-v4-pro",
+      "permission_mode": "full",
+      "context_max_characters": 20000,
+      "status": "success",
+      "stage": "complete",
+      "exit_code": 0,
+      "diagnostic": "official Harness resolved the instance",
+      "duration_minutes": 6.8,
+      "turns": 35,
+      "tool_calls": 41,
+      "input_tokens": 124416,
+      "output_tokens": 4612,
+      "permission_decisions": 41,
+      "denied": 0,
+      "denied_by_tool_kind_scope": {},
+      "compaction_checkpoints": 2,
+      "compaction_started": 2,
+      "compaction_succeeded": 2,
+      "harness_verdict": {
+        "instance": "scikit-learn__scikit-learn-14141",
+        "resolved": true,
+        "fail_to_pass": [
+          1,
+          1
+        ],
+        "pass_to_pass": [
+          2,
+          2
+        ],
+        "patch_successfully_applied": true
+      }
+    },
+    {
+      "phase": "retry",
+      "run": "flask5014-retry-auto",
+      "instance": "pallets__flask-5014",
+      "model": "deepseek-v4-pro",
+      "permission_mode": "auto",
+      "context_max_characters": 20000,
+      "status": "success",
+      "stage": "complete",
+      "exit_code": 0,
+      "diagnostic": "official Harness resolved the instance",
+      "duration_minutes": 8.2,
+      "turns": 33,
+      "tool_calls": 50,
+      "input_tokens": 107466,
+      "output_tokens": 8971,
+      "permission_decisions": 50,
+      "denied": 7,
+      "denied_by_tool_kind_scope": {
+        "bash/unknown/unknown": 7
+      },
+      "compaction_checkpoints": 3,
+      "compaction_started": 3,
+      "compaction_succeeded": 3,
+      "harness_verdict": {
+        "instance": "pallets__flask-5014",
+        "resolved": true,
+        "fail_to_pass": [
+          1,
+          1
+        ],
+        "pass_to_pass": [
+          59,
+          59
+        ],
+        "patch_successfully_applied": true
+      }
     }
   ]
 }

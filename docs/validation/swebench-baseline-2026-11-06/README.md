@@ -18,8 +18,9 @@ CodingAgent 优化的输入。
 3. **P1 压缩摘要契约不稳定**：`--mode full` 下首次压缩即因摘要标题结构不匹配失败，
    Run 以 `compaction_summary_invalid` 结束，且没有 checkpoint 落盘可供取证。
 
-同日的 P0 修复与回归见下文[回归验证](#回归验证同日)。结论是：路径映射与默认 `full`
-均已生效，但 P1 压缩失败成为当前首要阻塞。
+同日的 P0/P1 修复与两次回归见下文[回归验证](#回归验证同日)。结论是：路径映射与默认
+`full` 已生效，压缩失败重试后两次回归均 `resolved`；剩余待办是组合 shell 命令分类与
+失败取证。
 
 ## 运行矩阵
 
@@ -157,15 +158,43 @@ P0 修复包括：容器路径别名（`/testbed` → workspace）在 `Permissio
 P0 两项修复达到预期：路径不再误判，非交互默认 `full` 可用。当前阻止 SWE-bench 稳定
 resolved 的不是权限或路径，而是压缩摘要失败；下一步应优先处理 P1。
 
+## P1/P2 修复与第二次回归（同日）
+
+在上一轮回归之后继续处理两项：
+
+- **压缩摘要重试**：第一次摘要因标题结构无效时，最多再请求一次；第二次在 system prompt
+  与 prompt 中都强化“只返回八个二级标题、顺序一致、不要额外标题或正文”。两次尝试的
+  token 用量都累计进 `summary_usage`。
+- **grep 跳过非 UTF-8 文件**：读取文件时捕获 `UnicodeDecodeError` 并继续扫描，不再让整个
+  调用失败。
+
+用同样两个实例再次回归：
+
+| 实例 | 模式 | 结果 | 轮次 | 工具调用 | 输入/输出 token | 审批拒绝 | 压缩 | 官方 Harness |
+| --- | --- | --- | ---: | ---: | --- | ---: | --- | --- |
+| `scikit-learn__scikit-learn-14141` | full（默认） | success | 35 | 41 | 124,416 / 4,612 | 0 / 41 | 2/2 | resolved（F2P 1/1，P2P 2/2） |
+| `pallets__flask-5014` | auto | success | 33 | 50 | 107,466 / 8,971 | 7 / 50 | 3/3 | resolved（F2P 1/1，P2P 59/59） |
+
+### 第二次回归结论
+
+- 两次运行都由官方 Harness 判为 `resolved`。flask-5014 从上一轮的 `no_patch` / 压缩失败
+  恢复；scikit-learn 的默认 `full` 运行从压缩失败恢复。
+- 两次运行共完成 5 次压缩，全部成功，没有再出现 `compaction_summary_invalid`；本次没有
+  观察到重试被触发的证据，但重试为同类失败提供了兜底。
+- flask auto 的 7 次拒绝全部是 `bash/unknown`（`head`、`sed`、`python -c` 等组合命令），
+  不再包含任何路径类拒绝，也没有阻止最终 `resolved`。
+- 组合 shell 命令的分类仍是 P1 待办：它降低了 auto 模式的成功率与效率，但在文件工具可用
+  之后不再是硬阻断。
+
 ## 优化优先级
 
 | 优先级 | 动作 | 状态 | 涉及位置 | 验证方式 |
 | --- | --- | --- | --- | --- |
 | P0 | 容器路径映射（文件工具、权限分类、`bash` cwd） | 已完成 | `swebench.py`、`permissions.py`、`environment.py` | 回归中 `/testbed` 不再出现 `outside` 拒绝 |
 | P0 | 非交互入口默认 `full` | 已完成 | `cli.py`、`docs/guides/swebench.md` | 回归中无 permission prompt |
-| P1 | 压缩摘要失败重试/降级 + 失败事件 | 下一步 | `compaction.py`、`context.py` | 重跑 flask-5014 full，失败可取证或成功压缩 |
+| P1 | 压缩摘要失败一次重试 + 提示强化 | 已完成 | `context.py` | 两次回归共 5 次压缩全部成功 |
 | P1 | 组合 shell 命令拆段分类与只读白名单 | 待办 | `permissions.py` | 单元测试覆盖 `&&`、`|`、`;`、`$()` |
-| P2 | grep 跳过非 UTF-8 文件 | 待办 | `tools.py` | 含二进制文件的目录不再整体失败 |
+| P2 | grep 跳过非 UTF-8 文件 | 已完成 | `tools.py` | 含二进制文件的目录不再整体失败 |
 | P2 | 结构化失败证据与事件裁剪 | 待办 | `swebench.py`、`events.py` | artifact 体积下降，失败可复盘 |
 
 ## 复现
@@ -183,8 +212,8 @@ python -m coding_agent swebench run \
 
 ## 清理与脱敏
 
-- 运行结束后容器由 evaluator 关闭；本次共 6 个 artifact 目录（3 次冒烟 + 3 次回归）在
-  提取摘要后删除，原始 `session.jsonl`、`events.jsonl` 未提交。
+- 运行结束后容器由 evaluator 关闭；本次共 8 个 artifact 目录（3 次冒烟 + 5 次回归/重试）
+  在提取摘要后删除，原始 `session.jsonl`、`events.jsonl` 未提交。
 - 报告与 `runs.json` 不含 API key、宿主绝对路径或容器 ID；路径统一以 `<artifact-dir>` 表示。
 - 本地 SWE-bench 镜像保留，便于后续补跑；如需释放空间可另行删除。
 

@@ -105,6 +105,7 @@ class CompactionInput:
     authoritative_resources: tuple[ContextResource, ...]
     max_summary_characters: int
     focus: str | None = None
+    retry_attempt: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +194,11 @@ Next steps. Update or remove superseded facts. Do not copy role prefixes or crea
 summary wrappers. Treat the supplied authoritative-resource metadata as current context, not
 conversation facts. Do not call tools."""
 
+_COMPACTION_RETRY_INSTRUCTION: Final = (
+    "The previous summary was rejected by the structural validator. Return exactly the eight "
+    "level-2 headings listed above, in that order, with no extra headings or prose outside them."
+)
+
 
 def _structured_summary(content: str) -> str:
     sections = []
@@ -226,10 +232,13 @@ class ProviderCompactionEngine:
 
     async def compact(self, compaction_input: CompactionInput) -> CompactionDraft:
         prompt = _compaction_prompt(compaction_input)
+        system_prompt = _COMPACTION_SYSTEM_PROMPT
+        if compaction_input.retry_attempt > 0:
+            system_prompt = f"{system_prompt}\n\n{_COMPACTION_RETRY_INSTRUCTION}"
         request = ProviderRequest(
             messages=(UserMessage(text=prompt),),
             tools=(),
-            system_prompt=_COMPACTION_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
         )
         text_parts: list[str] = []
         usage: TokenUsage | None = None
@@ -343,6 +352,8 @@ def _compaction_prompt(compaction_input: CompactionInput) -> str:
         "focus": compaction_input.focus,
         "max_summary_characters": compaction_input.max_summary_characters,
     }
+    if compaction_input.retry_attempt > 0:
+        value["retry_attempt"] = compaction_input.retry_attempt
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -633,18 +644,30 @@ class ContextPipeline:
                 ),
                 max_summary_characters=summary_budget,
             )
-            try:
-                draft = await self._engine.compact(compaction_input)
-            except ContextConstructionError:
-                raise
-            except Exception as exc:
-                raise ContextConstructionError(
-                    "compaction_summary_failed",
-                    f"Compaction summary failed: {type(exc).__name__}: {exc}",
-                    stage="compaction",
-                ) from exc
-            _validate_summary(draft.summary, summary_budget)
-            summary_usage = _add_token_usage(summary_usage, draft.usage)
+            attempt = 0
+            while True:
+                try:
+                    draft = await self._engine.compact(
+                        compaction_input
+                        if attempt == 0
+                        else replace(compaction_input, retry_attempt=attempt)
+                    )
+                except ContextConstructionError:
+                    raise
+                except Exception as exc:
+                    raise ContextConstructionError(
+                        "compaction_summary_failed",
+                        f"Compaction summary failed: {type(exc).__name__}: {exc}",
+                        stage="compaction",
+                    ) from exc
+                summary_usage = _add_token_usage(summary_usage, draft.usage)
+                try:
+                    _validate_summary(draft.summary, summary_budget)
+                    break
+                except ContextConstructionError:
+                    if attempt >= 1:
+                        raise
+                    attempt += 1
 
             compacted_request: ProviderRequest | None = None
             characters_after = 0

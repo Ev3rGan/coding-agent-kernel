@@ -202,6 +202,20 @@ def test_opt_in_search_tools_execute_against_workspace(tmp_path: Path) -> None:
     }
 
 
+def test_grep_skips_files_that_are_not_utf8(tmp_path: Path) -> None:
+    (tmp_path / "text.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "binary.bin").write_bytes(b"\xff\xfe\x00needle")
+    runtime = ToolRuntime(LocalCodingEnvironment(tmp_path))
+    runtime.enable("grep")
+
+    batch = asyncio.run(runtime.execute_batch((ToolCall("grep", "grep", {"pattern": "needle"}),)))
+
+    assert batch.results[0].status == "success"
+    assert batch.results[0].output == {
+        "matches": [{"path": "text.txt", "line": 1, "text": "needle"}]
+    }
+
+
 def test_search_tool_observes_cancellation_while_scanning(tmp_path: Path) -> None:
     for index in range(200):
         (tmp_path / f"file-{index}.txt").write_text("content\n" * 20, encoding="utf-8")
