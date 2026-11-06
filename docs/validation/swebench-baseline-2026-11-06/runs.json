@@ -1,0 +1,103 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "dataset_revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "harness_version": "5.0.2",
+  "kernel_version": "0.1.0",
+  "python_version": "3.12",
+  "runs": [
+    {
+      "run": "sk14141-baseline",
+      "instance": "scikit-learn__scikit-learn-14141",
+      "model": "deepseek-v4-pro",
+      "permission_mode": "auto",
+      "context_max_characters": 20000,
+      "status": "success",
+      "stage": "complete",
+      "exit_code": 0,
+      "diagnostic": "official Harness resolved the instance",
+      "duration_minutes": 4.6,
+      "turns": 27,
+      "tool_calls": 29,
+      "input_tokens": 69547,
+      "output_tokens": 3326,
+      "permission_decisions": 29,
+      "denied": 6,
+      "denied_by_tool_kind_scope": {
+        "bash/unknown/unknown": 3,
+        "ls/read/outside": 1,
+        "grep/read/outside": 1,
+        "read/read/outside": 1
+      },
+      "compaction_checkpoints": 1,
+      "compaction_started": 1,
+      "compaction_succeeded": 1,
+      "harness_verdict": {
+        "instance": "scikit-learn__scikit-learn-14141",
+        "resolved": true,
+        "fail_to_pass": [
+          1,
+          1
+        ],
+        "pass_to_pass": [
+          2,
+          2
+        ],
+        "patch_successfully_applied": true
+      }
+    },
+    {
+      "run": "flask5014-baseline",
+      "instance": "pallets__flask-5014",
+      "model": "deepseek-v4-pro",
+      "permission_mode": "auto",
+      "context_max_characters": 20000,
+      "status": "no_patch",
+      "stage": "prediction",
+      "exit_code": 6,
+      "diagnostic": "workspace produced no git patch",
+      "duration_minutes": 8.7,
+      "turns": 37,
+      "tool_calls": 47,
+      "input_tokens": 111334,
+      "output_tokens": 7993,
+      "permission_decisions": 47,
+      "denied": 25,
+      "denied_by_tool_kind_scope": {
+        "bash/unknown/unknown": 13,
+        "ls/read/outside": 3,
+        "find/read/outside": 1,
+        "read/read/outside": 4,
+        "grep/read/outside": 2,
+        "bash/shell/outside": 1,
+        "edit/write/outside": 1
+      },
+      "compaction_checkpoints": 2,
+      "compaction_started": 2,
+      "compaction_succeeded": 2,
+      "harness_verdict": null
+    },
+    {
+      "run": "flask5014-full",
+      "instance": "pallets__flask-5014",
+      "model": "deepseek-v4-pro",
+      "permission_mode": "full",
+      "context_max_characters": 20000,
+      "status": "agent_failed",
+      "stage": "agent",
+      "exit_code": 4,
+      "diagnostic": "Agent Run failed: compaction_summary_invalid: Compaction summary has an invalid summary structure.",
+      "duration_minutes": 2.6,
+      "turns": 17,
+      "tool_calls": 16,
+      "input_tokens": 43703,
+      "output_tokens": 2106,
+      "permission_decisions": 16,
+      "denied": 0,
+      "denied_by_tool_kind_scope": {},
+      "compaction_checkpoints": 0,
+      "compaction_started": 1,
+      "compaction_succeeded": 0,
+      "harness_verdict": null
+    }
+  ]
+}
